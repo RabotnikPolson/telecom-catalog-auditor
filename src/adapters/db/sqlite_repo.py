@@ -234,3 +234,66 @@ class SQLiteProductRepository:
             cursor = conn.execute("PRAGMA journal_mode;")
             mode = cursor.fetchone()[0]
             return str(mode).lower() == "wal"
+
+    def update_crawler_state(
+        self,
+        category_key: str,
+        last_page: int,
+        total_pages: int,
+        is_completed: bool = False,
+    ) -> None:
+        sql = """
+        INSERT INTO crawler_state (category_key, last_page, total_pages, is_completed, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(category_key) DO UPDATE SET
+            last_page = excluded.last_page,
+            total_pages = excluded.total_pages,
+            is_completed = excluded.is_completed,
+            updated_at = excluded.updated_at;
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with get_sqlite_connection(self.db_path) as conn:
+            conn.execute(
+                sql,
+                (category_key, last_page, total_pages, 1 if is_completed else 0, now),
+            )
+            conn.commit()
+
+    def get_crawler_state(self, category_key: str) -> dict | None:
+        sql = "SELECT * FROM crawler_state WHERE category_key = ?;"
+        with get_sqlite_connection(self.db_path) as conn:
+            cursor = conn.execute(sql, (category_key,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "category_key": row["category_key"],
+                "last_page": row["last_page"],
+                "total_pages": row["total_pages"],
+                "is_completed": bool(row["is_completed"]),
+                "updated_at": row["updated_at"],
+            }
+
+    def reset_crawler_state(self, category_key: str | None = None) -> None:
+        with get_sqlite_connection(self.db_path) as conn:
+            if category_key:
+                conn.execute("DELETE FROM crawler_state WHERE category_key = ?;", (category_key,))
+            else:
+                conn.execute("DELETE FROM crawler_state;")
+            conn.commit()
+
+    def get_all_crawler_states(self) -> list[dict]:
+        sql = "SELECT * FROM crawler_state ORDER BY updated_at DESC;"
+        with get_sqlite_connection(self.db_path) as conn:
+            cursor = conn.execute(sql)
+            return [
+                {
+                    "category_key": row["category_key"],
+                    "last_page": row["last_page"],
+                    "total_pages": row["total_pages"],
+                    "is_completed": bool(row["is_completed"]),
+                    "updated_at": row["updated_at"],
+                }
+                for row in cursor.fetchall()
+            ]
+

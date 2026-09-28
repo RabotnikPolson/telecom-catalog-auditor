@@ -58,6 +58,16 @@ CREATE TABLE IF NOT EXISTS audit_results (
 
 CREATE INDEX IF NOT EXISTS idx_audit_results_product ON audit_results(product_id);
 CREATE INDEX IF NOT EXISTS idx_audit_results_status ON audit_results(status);
+
+CREATE TABLE IF NOT EXISTS crawler_state (
+    category_key TEXT PRIMARY KEY,
+    last_page INTEGER NOT NULL DEFAULT 1,
+    total_pages INTEGER NOT NULL DEFAULT 1,
+    is_completed INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_crawler_state_completed ON crawler_state(is_completed);
 """
 
 
