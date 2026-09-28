@@ -6,8 +6,13 @@ __pycache__/
 *.db-wal
 *.db-shm
 .env
+.env.*
+!.env.example
 .venv/
 venv/
+ENV/
 .idea/
 .vscode/
 *.log
+.DS_Store
+Thumbs.db
