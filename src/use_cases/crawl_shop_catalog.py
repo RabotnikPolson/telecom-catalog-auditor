@@ -179,6 +179,7 @@ class CrawlShopCatalogUseCase:
         vendor_sku = details.vendor_sku if details and details.vendor_sku else preview.vendor_sku
         manufacturer_sku = details.manufacturer_sku if details else None
         vendor_name = details.vendor_name if details else None
+        barcode = details.barcode if details else None
 
         calculated_hash = Product.compute_content_hash(title, specs)
 
@@ -191,6 +192,7 @@ class CrawlShopCatalogUseCase:
 
             existing.title = title
             existing.current_specs = specs
+            existing.barcode = barcode or existing.barcode
             existing.vendor_name = vendor_name or existing.vendor_name
             existing.vendor_sku = vendor_sku or existing.vendor_sku
             existing.manufacturer_sku = manufacturer_sku or existing.manufacturer_sku
@@ -202,6 +204,7 @@ class CrawlShopCatalogUseCase:
         new_product = Product(
             product_id=preview.product_id,
             title=title,
+            barcode=barcode,
             vendor_name=vendor_name,
             vendor_sku=vendor_sku,
             manufacturer_sku=manufacturer_sku,

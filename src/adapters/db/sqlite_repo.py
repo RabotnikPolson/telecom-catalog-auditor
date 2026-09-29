@@ -25,10 +25,12 @@ class SQLiteProductRepository:
             if row["updated_at"]
             else datetime.now(timezone.utc)
         )
+        barcode = row["barcode"] if "barcode" in row.keys() else None
 
         return Product(
             product_id=row["product_id"],
             title=row["title"],
+            barcode=barcode,
             vendor_name=row["vendor_name"],
             vendor_sku=row["vendor_sku"],
             manufacturer_sku=row["manufacturer_sku"],
@@ -45,16 +47,17 @@ class SQLiteProductRepository:
     def save_product(self, product: Product) -> Product:
         sql = """
         INSERT INTO products (
-            product_id, title, vendor_name, vendor_sku, manufacturer_sku,
+            product_id, title, barcode, vendor_name, vendor_sku, manufacturer_sku,
             current_specs, content_hash, parent_sku, master_key, is_master,
             status, created_at, updated_at
         ) VALUES (
-            :product_id, :title, :vendor_name, :vendor_sku, :manufacturer_sku,
+            :product_id, :title, :barcode, :vendor_name, :vendor_sku, :manufacturer_sku,
             :current_specs, :content_hash, :parent_sku, :master_key, :is_master,
             :status, :created_at, :updated_at
         )
         ON CONFLICT(product_id) DO UPDATE SET
             title = excluded.title,
+            barcode = excluded.barcode,
             vendor_name = excluded.vendor_name,
             vendor_sku = excluded.vendor_sku,
             manufacturer_sku = excluded.manufacturer_sku,
@@ -69,6 +72,7 @@ class SQLiteProductRepository:
         payload = {
             "product_id": product.product_id,
             "title": product.title,
+            "barcode": product.barcode,
             "vendor_name": product.vendor_name,
             "vendor_sku": product.vendor_sku,
             "manufacturer_sku": product.manufacturer_sku,
@@ -94,16 +98,17 @@ class SQLiteProductRepository:
 
         sql = """
         INSERT INTO products (
-            product_id, title, vendor_name, vendor_sku, manufacturer_sku,
+            product_id, title, barcode, vendor_name, vendor_sku, manufacturer_sku,
             current_specs, content_hash, parent_sku, master_key, is_master,
             status, created_at, updated_at
         ) VALUES (
-            :product_id, :title, :vendor_name, :vendor_sku, :manufacturer_sku,
+            :product_id, :title, :barcode, :vendor_name, :vendor_sku, :manufacturer_sku,
             :current_specs, :content_hash, :parent_sku, :master_key, :is_master,
             :status, :created_at, :updated_at
         )
         ON CONFLICT(product_id) DO UPDATE SET
             title = excluded.title,
+            barcode = excluded.barcode,
             vendor_name = excluded.vendor_name,
             vendor_sku = excluded.vendor_sku,
             manufacturer_sku = excluded.manufacturer_sku,
@@ -120,6 +125,7 @@ class SQLiteProductRepository:
             {
                 "product_id": p.product_id,
                 "title": p.title,
+                "barcode": p.barcode,
                 "vendor_name": p.vendor_name,
                 "vendor_sku": p.vendor_sku,
                 "manufacturer_sku": p.manufacturer_sku,
@@ -154,6 +160,14 @@ class SQLiteProductRepository:
             cursor = conn.execute(sql, (content_hash,))
             row = cursor.fetchone()
             return self._row_to_product(row) if row else None
+
+    def get_by_barcode(self, barcode: str) -> Product | None:
+        sql = "SELECT * FROM products WHERE barcode = ? LIMIT 1;"
+        with get_sqlite_connection(self.db_path) as conn:
+            cursor = conn.execute(sql, (barcode,))
+            row = cursor.fetchone()
+            return self._row_to_product(row) if row else None
+
 
     def get_by_master_key(self, master_key: str) -> list[Product]:
         sql = "SELECT * FROM products WHERE master_key = ? ORDER BY is_master DESC, product_id ASC;"

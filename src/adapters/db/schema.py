@@ -6,6 +6,7 @@ SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS products (
     product_id INTEGER PRIMARY KEY,
     title TEXT NOT NULL,
+    barcode TEXT,
     vendor_name TEXT,
     vendor_sku TEXT,
     manufacturer_sku TEXT,
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS products (
     updated_at TEXT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode);
 CREATE INDEX IF NOT EXISTS idx_products_content_hash ON products(content_hash);
 CREATE INDEX IF NOT EXISTS idx_products_master_key ON products(master_key);
 CREATE INDEX IF NOT EXISTS idx_products_parent_sku ON products(parent_sku);
@@ -89,4 +91,10 @@ def get_sqlite_connection(db_path: Union[str, Path]) -> sqlite3.Connection:
 def init_db(db_path: Union[str, Path]) -> None:
     with get_sqlite_connection(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
+        cursor = conn.execute("PRAGMA table_info(products);")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if "barcode" not in columns:
+            conn.execute("ALTER TABLE products ADD COLUMN barcode TEXT;")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode);")
         conn.commit()
+

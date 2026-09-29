@@ -56,6 +56,7 @@ class Product(BaseModel):
 
     product_id: int = Field(..., gt=0)
     title: str = Field(..., min_length=1)
+    barcode: str | None = Field(default=None)
     vendor_name: str | None = Field(default=None)
     vendor_sku: str | None = Field(default=None)
     manufacturer_sku: str | None = Field(default=None)
@@ -109,6 +110,8 @@ class Product(BaseModel):
     @property
     def sku_completeness_score(self) -> int:
         score = 0
+        if self.barcode and self.barcode.strip():
+            score += 4
         if self.manufacturer_sku and self.manufacturer_sku.strip():
             score += 3
         if self.vendor_sku and self.vendor_sku.strip():

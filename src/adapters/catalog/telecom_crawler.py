@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import dataclass, field
 import html
+import json
 import random
 import re
 from typing import Any, Optional, Union
@@ -42,6 +43,8 @@ class ProductDetailResult:
     manufacturer_sku: Optional[str]
     current_specs: dict[str, str]
     detail_url: str
+    barcode: Optional[str] = None
+
 
 
 class TelecomShopCrawler:
@@ -293,28 +296,61 @@ class TelecomShopCrawler:
             if m_btn:
                 pid = int(m_btn.group(1))
 
+        barcode = None
+        vendor_sku = None
+        vendor_name = None
         title = ""
-        h1_match = re.search(r"<h1[^>]*>(.*?)</h1>", page_html, re.DOTALL | re.I)
-        if h1_match:
-            title = self._clean_html_text(h1_match.group(1))
+
+        m_data = re.search(r'<input[^>]*id=["\']productData["\'][^>]*value=["\'](.*?)["\']', page_html, re.DOTALL)
+        if m_data:
+            try:
+                raw_val = html.unescape(m_data.group(1))
+                data = json.loads(raw_val)
+                if isinstance(data, dict):
+                    raw_barcode = data.get("barcode")
+                    if raw_barcode and str(raw_barcode).strip():
+                        barcode = str(raw_barcode).strip()
+
+                    provider_sku = (data.get("partners") or {}).get("article_provider")
+                    if provider_sku and str(provider_sku).strip():
+                        vendor_sku = str(provider_sku).strip()
+
+                    name_from_json = data.get("name")
+                    if name_from_json and str(name_from_json).strip():
+                        title = self._clean_html_text(str(name_from_json))
+
+                    all_p = data.get("all_partners") or []
+                    if all_p and isinstance(all_p, list) and isinstance(all_p[0], dict):
+                        partner_dict = all_p[0].get("partner") or {}
+                        p_email = str(partner_dict.get("email") or "").lower()
+                        p_addr = str(partner_dict.get("address") or "").lower()
+                        if "al-style.kz" in p_email or "al-style.kz" in p_addr:
+                            vendor_name = "Al-Style"
+            except (json.JSONDecodeError, ValueError, Exception):
+                pass
+
+        if not title:
+            h1_match = re.search(r"<h1[^>]*>(.*?)</h1>", page_html, re.DOTALL | re.I)
+            if h1_match:
+                title = self._clean_html_text(h1_match.group(1))
 
         if not title:
             title_tag = re.search(r"<title>(.*?)</title>", page_html, re.DOTALL | re.I)
             if title_tag:
                 title = self._clean_html_text(title_tag.group(1)).split("|")[0].strip()
 
-        vendor_sku = None
-        sku_m = re.search(
-            r'class=["\'][^"\']*vendor-code[^"\']*["\'][^>]*>\s*Артикул:\s*([^<]+)',
-            page_html,
-            re.I,
-        )
-        if sku_m:
-            vendor_sku = sku_m.group(1).strip()
-        else:
-            sku_m2 = re.search(r"Артикул:\s*([a-zA-Z0-9_\-\/]+)", page_html, re.I)
-            if sku_m2:
-                vendor_sku = sku_m2.group(1).strip()
+        if not vendor_sku:
+            sku_m = re.search(
+                r'class=["\'][^"\']*vendor-code[^"\']*["\'][^>]*>\s*Артикул:\s*([^<]+)',
+                page_html,
+                re.I,
+            )
+            if sku_m:
+                vendor_sku = sku_m.group(1).strip()
+            else:
+                sku_m2 = re.search(r"Артикул:\s*([a-zA-Z0-9_\-\/]+)", page_html, re.I)
+                if sku_m2:
+                    vendor_sku = sku_m2.group(1).strip()
 
         specs: dict[str, str] = {}
         spec_items = re.findall(
@@ -349,14 +385,14 @@ class TelecomShopCrawler:
             if manufacturer_sku:
                 break
 
-        vendor_name = None
-        for key in ["производитель", "бренд", "марка", "вендор"]:
-            for spec_key, spec_val in specs.items():
-                if key in spec_key.lower():
-                    vendor_name = spec_val
+        if not vendor_name:
+            for key in ["производитель", "бренд", "марка", "вендор"]:
+                for spec_key, spec_val in specs.items():
+                    if key in spec_key.lower():
+                        vendor_name = spec_val
+                        break
+                if vendor_name:
                     break
-            if vendor_name:
-                break
 
         return ProductDetailResult(
             product_id=pid,
@@ -366,4 +402,5 @@ class TelecomShopCrawler:
             manufacturer_sku=manufacturer_sku,
             current_specs=specs,
             detail_url=url,
+            barcode=barcode,
         )

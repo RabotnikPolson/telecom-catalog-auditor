@@ -179,9 +179,59 @@ class TestTelecomCrawlerAdapter:
         assert details.vendor_name == "Apple"
         assert details.current_specs["Объем встроенной памяти"] == "128 ГБ"
         assert details.current_specs["Цвет"] == "Midnight"
+        assert details.barcode is None
+
+    @pytest.mark.anyio
+    async def test_fetch_product_details_with_valid_product_data(self):
+        crawler = TelecomShopCrawler(delay_min=0.0, delay_max=0.0)
+        html_with_data = """
+        <html><body>
+            <input id="productData" type="hidden" value="{&quot;id&quot;:74619,&quot;name&quot;:&quot;Аккумулятор Camelion&quot;,&quot;barcode&quot;:&quot;849198020366&quot;,&quot;partners&quot;:{&quot;article_provider&quot;:&quot;63450&quot;},&quot;all_partners&quot;:[{&quot;partner&quot;:{&quot;name&quot;:&quot;ТОО Vender1&quot;,&quot;email&quot;:&quot;sales3@al-style.kz&quot;}}]}">
+            <h1 class="product-info__title">Аккумулятор Camelion</h1>
+            <p class="product-info__links vendor-code">Артикул: 450760</p>
+        </body></html>
+        """
+        mock_response = httpx.Response(
+            status_code=200,
+            text=html_with_data,
+            request=httpx.Request("GET", "https://shop.telecom.kz/product/74619"),
+        )
+
+        with patch.object(crawler._get_client(), "get", new=AsyncMock(return_value=mock_response)):
+            details = await crawler.fetch_product_details(74619)
+
+        assert details.product_id == 74619
+        assert details.barcode == "849198020366"
+        assert details.vendor_sku == "63450"
+        assert details.vendor_name == "Al-Style"
+
+    @pytest.mark.anyio
+    async def test_fetch_product_details_resilient_to_broken_json(self):
+        crawler = TelecomShopCrawler(delay_min=0.0, delay_max=0.0)
+        html_with_corrupted_json = """
+        <html><body>
+            <input id="productData" type="hidden" value="{broken_json: true, unexpected_token}">
+            <h1 class="product-info__title">Роутер TP-Link Archer C6</h1>
+            <p class="product-info__links vendor-code">Артикул: 330112</p>
+        </body></html>
+        """
+        mock_response = httpx.Response(
+            status_code=200,
+            text=html_with_corrupted_json,
+            request=httpx.Request("GET", "https://shop.telecom.kz/product/555"),
+        )
+
+        with patch.object(crawler._get_client(), "get", new=AsyncMock(return_value=mock_response)):
+            details = await crawler.fetch_product_details(555)
+
+        assert details.product_id == 555
+        assert details.title == "Роутер TP-Link Archer C6"
+        assert details.vendor_sku == "330112"
+        assert details.barcode is None
 
 
 class TestCrawlerStateRepository:
+
 
     @pytest.fixture
     def test_repo(self, tmp_path: Path) -> SQLiteProductRepository:
@@ -213,6 +263,25 @@ class TestCrawlerStateRepository:
 
         test_repo.reset_crawler_state(cat_key)
         assert test_repo.get_crawler_state(cat_key) is None
+
+    def test_sqlite_barcode_migration_and_retrieval(self, test_repo: SQLiteProductRepository):
+        product = Product(
+            product_id=74619,
+            title="Аккумулятор Camelion UB-AA2200-PBH2",
+            barcode="849198020366",
+            vendor_sku="63450",
+            vendor_name="Al-Style",
+            current_specs={"тип": "литиевый аккумулятор"}
+        )
+        test_repo.save_product(product)
+
+        found = test_repo.get_by_barcode("849198020366")
+        assert found is not None
+        assert found.product_id == 74619
+        assert found.barcode == "849198020366"
+        assert found.vendor_name == "Al-Style"
+
+        assert test_repo.get_by_barcode("0000000000000") is None
 
 
 class TestCrawlShopCatalogUseCase:
