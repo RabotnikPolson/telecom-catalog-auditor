@@ -17,4 +17,5 @@ ENV/
 .DS_Store
 Thumbs.db
 
+*.md
 
