@@ -55,6 +55,7 @@ class Product(BaseModel):
     model_config = ConfigDict(extra="ignore", validate_assignment=True)
 
     product_id: int = Field(..., gt=0)
+    shop_sku: str | None = Field(default=None)
     title: str = Field(..., min_length=1)
     barcode: str | None = Field(default=None)
     vendor_name: str | None = Field(default=None)
@@ -114,6 +115,8 @@ class Product(BaseModel):
             score += 4
         if self.manufacturer_sku and self.manufacturer_sku.strip():
             score += 3
+        if self.shop_sku and self.shop_sku.strip():
+            score += 2
         if self.vendor_sku and self.vendor_sku.strip():
             score += 2
         if self.vendor_name and self.vendor_name.strip():

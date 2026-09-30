@@ -176,6 +176,7 @@ class CrawlShopCatalogUseCase:
             title = f"Product #{preview.product_id}"
 
         specs = details.current_specs if details else {}
+        shop_sku = details.shop_sku if details else None
         vendor_sku = details.vendor_sku if details and details.vendor_sku else preview.vendor_sku
         manufacturer_sku = details.manufacturer_sku if details else None
         vendor_name = details.vendor_name if details else None
@@ -192,6 +193,7 @@ class CrawlShopCatalogUseCase:
 
             existing.title = title
             existing.current_specs = specs
+            existing.shop_sku = shop_sku or existing.shop_sku
             existing.barcode = barcode or existing.barcode
             existing.vendor_name = vendor_name or existing.vendor_name
             existing.vendor_sku = vendor_sku or existing.vendor_sku
@@ -203,6 +205,7 @@ class CrawlShopCatalogUseCase:
 
         new_product = Product(
             product_id=preview.product_id,
+            shop_sku=shop_sku,
             title=title,
             barcode=barcode,
             vendor_name=vendor_name,

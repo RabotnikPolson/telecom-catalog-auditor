@@ -5,6 +5,7 @@ from typing import Union
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS products (
     product_id INTEGER PRIMARY KEY,
+    shop_sku TEXT,
     title TEXT NOT NULL,
     barcode TEXT,
     vendor_name TEXT,
@@ -20,6 +21,7 @@ CREATE TABLE IF NOT EXISTS products (
     updated_at TEXT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_products_shop_sku ON products(shop_sku);
 CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode);
 CREATE INDEX IF NOT EXISTS idx_products_content_hash ON products(content_hash);
 CREATE INDEX IF NOT EXISTS idx_products_master_key ON products(master_key);
@@ -90,11 +92,15 @@ def get_sqlite_connection(db_path: Union[str, Path]) -> sqlite3.Connection:
 
 def init_db(db_path: Union[str, Path]) -> None:
     with get_sqlite_connection(db_path) as conn:
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='products';")
+        if cursor.fetchone():
+            col_cursor = conn.execute("PRAGMA table_info(products);")
+            columns = [row["name"] for row in col_cursor.fetchall()]
+            if "barcode" not in columns:
+                conn.execute("ALTER TABLE products ADD COLUMN barcode TEXT;")
+            if "shop_sku" not in columns:
+                conn.execute("ALTER TABLE products ADD COLUMN shop_sku TEXT;")
         conn.executescript(SCHEMA_SQL)
-        cursor = conn.execute("PRAGMA table_info(products);")
-        columns = [row["name"] for row in cursor.fetchall()]
-        if "barcode" not in columns:
-            conn.execute("ALTER TABLE products ADD COLUMN barcode TEXT;")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode);")
         conn.commit()
+
 

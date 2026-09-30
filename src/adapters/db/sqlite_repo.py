@@ -26,9 +26,11 @@ class SQLiteProductRepository:
             else datetime.now(timezone.utc)
         )
         barcode = row["barcode"] if "barcode" in row.keys() else None
+        shop_sku = row["shop_sku"] if "shop_sku" in row.keys() else None
 
         return Product(
             product_id=row["product_id"],
+            shop_sku=shop_sku,
             title=row["title"],
             barcode=barcode,
             vendor_name=row["vendor_name"],
@@ -47,15 +49,16 @@ class SQLiteProductRepository:
     def save_product(self, product: Product) -> Product:
         sql = """
         INSERT INTO products (
-            product_id, title, barcode, vendor_name, vendor_sku, manufacturer_sku,
+            product_id, shop_sku, title, barcode, vendor_name, vendor_sku, manufacturer_sku,
             current_specs, content_hash, parent_sku, master_key, is_master,
             status, created_at, updated_at
         ) VALUES (
-            :product_id, :title, :barcode, :vendor_name, :vendor_sku, :manufacturer_sku,
+            :product_id, :shop_sku, :title, :barcode, :vendor_name, :vendor_sku, :manufacturer_sku,
             :current_specs, :content_hash, :parent_sku, :master_key, :is_master,
             :status, :created_at, :updated_at
         )
         ON CONFLICT(product_id) DO UPDATE SET
+            shop_sku = excluded.shop_sku,
             title = excluded.title,
             barcode = excluded.barcode,
             vendor_name = excluded.vendor_name,
@@ -71,6 +74,7 @@ class SQLiteProductRepository:
         """
         payload = {
             "product_id": product.product_id,
+            "shop_sku": product.shop_sku,
             "title": product.title,
             "barcode": product.barcode,
             "vendor_name": product.vendor_name,
@@ -98,15 +102,16 @@ class SQLiteProductRepository:
 
         sql = """
         INSERT INTO products (
-            product_id, title, barcode, vendor_name, vendor_sku, manufacturer_sku,
+            product_id, shop_sku, title, barcode, vendor_name, vendor_sku, manufacturer_sku,
             current_specs, content_hash, parent_sku, master_key, is_master,
             status, created_at, updated_at
         ) VALUES (
-            :product_id, :title, :barcode, :vendor_name, :vendor_sku, :manufacturer_sku,
+            :product_id, :shop_sku, :title, :barcode, :vendor_name, :vendor_sku, :manufacturer_sku,
             :current_specs, :content_hash, :parent_sku, :master_key, :is_master,
             :status, :created_at, :updated_at
         )
         ON CONFLICT(product_id) DO UPDATE SET
+            shop_sku = excluded.shop_sku,
             title = excluded.title,
             barcode = excluded.barcode,
             vendor_name = excluded.vendor_name,
@@ -124,6 +129,7 @@ class SQLiteProductRepository:
         records = [
             {
                 "product_id": p.product_id,
+                "shop_sku": p.shop_sku,
                 "title": p.title,
                 "barcode": p.barcode,
                 "vendor_name": p.vendor_name,

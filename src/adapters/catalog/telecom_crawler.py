@@ -43,6 +43,7 @@ class ProductDetailResult:
     manufacturer_sku: Optional[str]
     current_specs: dict[str, str]
     detail_url: str
+    shop_sku: Optional[str] = None
     barcode: Optional[str] = None
 
 
@@ -296,6 +297,7 @@ class TelecomShopCrawler:
             if m_btn:
                 pid = int(m_btn.group(1))
 
+        shop_sku = None
         barcode = None
         vendor_sku = None
         vendor_name = None
@@ -307,6 +309,10 @@ class TelecomShopCrawler:
                 raw_val = html.unescape(m_data.group(1))
                 data = json.loads(raw_val)
                 if isinstance(data, dict):
+                    raw_base_id = data.get("base_id")
+                    if raw_base_id and str(raw_base_id).strip():
+                        shop_sku = str(raw_base_id).strip()
+
                     raw_barcode = data.get("barcode")
                     if raw_barcode and str(raw_barcode).strip():
                         barcode = str(raw_barcode).strip()
@@ -326,6 +332,15 @@ class TelecomShopCrawler:
                         p_addr = str(partner_dict.get("address") or "").lower()
                         if "al-style.kz" in p_email or "al-style.kz" in p_addr:
                             vendor_name = "Al-Style"
+                        else:
+                            p_name = partner_dict.get("name")
+                            if p_name and str(p_name).strip():
+                                vendor_name = str(p_name).strip()
+
+                        if not vendor_sku:
+                            p_sku = all_p[0].get("article_provider")
+                            if p_sku and str(p_sku).strip():
+                                vendor_sku = str(p_sku).strip()
             except (json.JSONDecodeError, ValueError, Exception):
                 pass
 
@@ -339,18 +354,21 @@ class TelecomShopCrawler:
             if title_tag:
                 title = self._clean_html_text(title_tag.group(1)).split("|")[0].strip()
 
-        if not vendor_sku:
+        if not shop_sku:
             sku_m = re.search(
                 r'class=["\'][^"\']*vendor-code[^"\']*["\'][^>]*>\s*Артикул:\s*([^<]+)',
                 page_html,
                 re.I,
             )
             if sku_m:
-                vendor_sku = sku_m.group(1).strip()
+                shop_sku = sku_m.group(1).strip()
             else:
                 sku_m2 = re.search(r"Артикул:\s*([a-zA-Z0-9_\-\/]+)", page_html, re.I)
                 if sku_m2:
-                    vendor_sku = sku_m2.group(1).strip()
+                    shop_sku = sku_m2.group(1).strip()
+
+        if not vendor_sku and shop_sku:
+            vendor_sku = shop_sku
 
         specs: dict[str, str] = {}
         spec_items = re.findall(
@@ -396,6 +414,7 @@ class TelecomShopCrawler:
 
         return ProductDetailResult(
             product_id=pid,
+            shop_sku=shop_sku,
             title=title,
             vendor_name=vendor_name,
             vendor_sku=vendor_sku,
