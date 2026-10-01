@@ -423,3 +423,67 @@ class TelecomShopCrawler:
             detail_url=url,
             barcode=barcode,
         )
+
+    async def search_product_ids(self, query: str) -> list[int]:
+        """Search shop.telecom.kz for query and return discovered product IDs in order."""
+        client = self._get_client()
+        async with self._semaphore:
+            await self._polite_delay()
+            url = f"{self.base_url}/search"
+            try:
+                response = await client.get(url, params={"q": query})
+                if response.status_code != 200:
+                    return []
+                seen: list[int] = []
+                for pid_str in re.findall(r"/product/(\d+)", response.text):
+                    try:
+                        pid = int(pid_str)
+                        if pid not in seen:
+                            seen.append(pid)
+                    except ValueError:
+                        continue
+                return seen
+            except Exception:
+                return []
+
+    async def fetch_product_on_the_fly(self, target: Union[str, int]) -> Optional[ProductDetailResult]:
+        """
+        Find and fetch product details directly from shop.telecom.kz.
+        target can be a full product URL, internal product_id, or store SKU / query.
+        """
+        target_str = str(target).strip()
+        if not target_str:
+            return None
+
+        # 1. Direct URL provided
+        if target_str.startswith("http") or "/product/" in target_str:
+            try:
+                return await self.fetch_product_details(target_str)
+            except Exception:
+                return None
+
+        # 2. Digits provided (could be shop_sku, vendor_sku, or product_id)
+        if target_str.isdigit():
+            # First try site search by SKU
+            pids = await self.search_product_ids(target_str)
+            if pids:
+                try:
+                    return await self.fetch_product_details(pids[0])
+                except Exception:
+                    pass
+
+            # If search produced nothing, try direct URL /product/{id}
+            try:
+                return await self.fetch_product_details(int(target_str))
+            except Exception:
+                return None
+
+        # 3. Text query
+        pids = await self.search_product_ids(target_str)
+        if pids:
+            try:
+                return await self.fetch_product_details(pids[0])
+            except Exception:
+                return None
+
+        return None

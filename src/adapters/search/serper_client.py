@@ -37,8 +37,11 @@ class SerperClient:
         max_concurrency: int = 3,
         client: Optional[httpx.AsyncClient] = None,
     ) -> None:
-        settings = get_settings()
-        self.api_key = (api_key or settings.SERPER_API_KEY or "").strip()
+        if api_key is not None:
+            self.api_key = api_key.strip()
+        else:
+            settings = get_settings()
+            self.api_key = (settings.SERPER_API_KEY or "").strip()
         self.timeout = timeout
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._external_client = client
@@ -178,7 +181,5 @@ class SerperClient:
 
             if is_whitelisted_domain(link, extra_domains=whitelist_domains):
                 whitelisted.append(item)
-            else:
-                organic_clean.append(item)
 
-        return whitelisted if whitelisted else organic_clean
+        return whitelisted

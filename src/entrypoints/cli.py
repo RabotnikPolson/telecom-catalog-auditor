@@ -122,14 +122,37 @@ async def run_resolve_command(args: argparse.Namespace) -> int:
     print("-" * 75)
 
     sku_or_id = getattr(args, "sku", None) or args.product_id
+    url_arg = getattr(args, "url", None)
+    target_key = url_arg or sku_or_id
     products: list[Product] = []
-    if sku_or_id is not None:
-        p = repo.find_product(sku_or_id)
-        if p:
-            products.append(p)
-        else:
-            print(f"[ERROR] Product with SKU/ID '{sku_or_id}' not found in database.")
-            return 1
+
+    if target_key is not None:
+        p = None
+        if not url_arg and sku_or_id is not None:
+            p = repo.find_product(sku_or_id)
+
+        if not p:
+            print(f"[*] Product '{target_key}' not in local DB. Fetching live from shop.telecom.kz...")
+            async with TelecomShopCrawler(delay_min=0.1, delay_max=0.3) as shop_crawler:
+                details = await shop_crawler.fetch_product_on_the_fly(str(target_key))
+                if details:
+                    p = Product(
+                        product_id=details.product_id,
+                        shop_sku=details.shop_sku,
+                        title=details.title,
+                        url=details.detail_url,
+                        vendor_name=details.vendor_name,
+                        vendor_sku=details.vendor_sku,
+                        manufacturer_sku=details.manufacturer_sku,
+                        barcode=details.barcode,
+                        current_specs=details.current_specs,
+                    )
+                    repo.save_product(p)
+                    print(f"  [+] Saved to DB: ID #{p.product_id} | Shop SKU: {p.shop_sku or 'N/A'} | {p.title}")
+                else:
+                    print(f"[ERROR] Product with SKU/ID/URL '{target_key}' not found on shop.telecom.kz.")
+                    return 1
+        products.append(p)
     else:
         products = repo.get_auditable_products(limit=args.limit or 10)
 
@@ -267,11 +290,36 @@ async def run_audit_command(args: argparse.Namespace) -> int:
     repo = SQLiteProductRepository(db_path)
 
     sku_or_id = getattr(args, "sku", None) or args.product_id
-    if sku_or_id is not None:
-        target = repo.find_product(sku_or_id)
+    url_arg = getattr(args, "url", None)
+    target_key = url_arg or sku_or_id
+
+    if target_key is not None:
+        target = None
+        if not url_arg and sku_or_id is not None:
+            target = repo.find_product(sku_or_id)
+
         if not target:
-            print(f"[!] Error: Product with SKU/ID '{sku_or_id}' not found in {db_path}")
-            return 1
+            print(f"[*] Product '{target_key}' not in local DB. Fetching live from shop.telecom.kz...")
+            async with TelecomShopCrawler(delay_min=0.1, delay_max=0.3) as shop_crawler:
+                details = await shop_crawler.fetch_product_on_the_fly(str(target_key))
+                if details:
+                    target = Product(
+                        product_id=details.product_id,
+                        shop_sku=details.shop_sku,
+                        title=details.title,
+                        url=details.detail_url,
+                        vendor_name=details.vendor_name,
+                        vendor_sku=details.vendor_sku,
+                        manufacturer_sku=details.manufacturer_sku,
+                        barcode=details.barcode,
+                        current_specs=details.current_specs,
+                    )
+                    repo.save_product(target)
+                    print(f"  [+] Saved to DB: ID #{target.product_id} | Shop SKU: {target.shop_sku or 'N/A'} | {target.title}")
+                    print(f"  [+] Discovered {len(target.current_specs)} current specs from store page.")
+                else:
+                    print(f"[!] Error: Product '{target_key}' not found in database or on shop.telecom.kz")
+                    return 1
         products = [target]
     else:
         products = repo.get_auditable_products(limit=args.limit)
@@ -449,6 +497,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Target specific product by Store SKU (e.g. 453844)",
     )
     resolve_parser.add_argument(
+        "--url",
+        type=str,
+        default=None,
+        help="Direct product URL on shop.telecom.kz",
+    )
+    resolve_parser.add_argument(
         "--limit",
         type=int,
         default=10,
@@ -499,6 +553,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Target specific product by Store SKU (e.g. 453844)",
+    )
+    audit_parser.add_argument(
+        "--url",
+        type=str,
+        default=None,
+        help="Direct product URL on shop.telecom.kz",
     )
     audit_parser.add_argument(
         "--limit",

@@ -3,6 +3,7 @@ import hashlib
 import re
 from typing import Optional
 from config.vendor_profiles import find_vendor_profile
+from config.whitelist_domains import is_whitelisted_domain
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
 from src.adapters.search.serper_client import SerperClient
 from src.adapters.search.vendor_direct import VendorDirectResolver
@@ -153,11 +154,7 @@ class ResolveReferenceUseCase:
             product, scenario_override="SCENARIO_4_EXTERNAL_SEARCH"
         )
 
-    def _build_search_query(self, product: Product) -> tuple[str, str]:
-        if product.barcode and product.barcode.strip():
-            clean_bc = product.barcode.strip()
-            return f'"{clean_bc}" характеристики', "BARCODE_SEARCH"
-
+    def _build_title_query(self, product: Product) -> tuple[str, str]:
         clean_title = product.title.strip()
         parts = [clean_title]
 
@@ -184,14 +181,57 @@ class ResolveReferenceUseCase:
         source_type = "PROVIDER_SKU_SEARCH" if (product.vendor_sku and not is_internal_sku) else "MODEL_SEARCH"
         return query, source_type
 
+    def _build_search_query(self, product: Product) -> tuple[str, str]:
+        if product.barcode and product.barcode.strip():
+            clean_bc = product.barcode.strip()
+            return f'"{clean_bc}" характеристики', "BARCODE_SEARCH"
+        return self._build_title_query(product)
+
     async def _execute_search_cascade(
         self, product: Product, scenario_override: str
     ) -> ResolvedReference:
-        query, source_type = self._build_search_query(product)
+        # Step A: If product has barcode, attempt barcode search first
+        if product.barcode and product.barcode.strip():
+            bc_query = f'"{product.barcode.strip()}" характеристики'
+            q_hash_bc = self.compute_query_hash(product, bc_query)
+            cached_url = self.repo.get_url_cache(q_hash_bc)
+
+            if cached_url and is_whitelisted_domain(cached_url, extra_domains=self.whitelist_domains):
+                return ResolvedReference(
+                    product_id=product.product_id,
+                    reference_url=cached_url,
+                    source_type="CACHE",
+                    query_used=bc_query,
+                    scenario_applied=scenario_override,
+                    status="FOUND",
+                    is_cached=True,
+                )
+
+            bc_results = await self.serper_client.search_and_filter(
+                query=bc_query,
+                whitelist_domains=self.whitelist_domains,
+                num_results=10,
+            )
+            if bc_results:
+                best_link = str(bc_results[0].get("link") or "").strip()
+                if best_link and is_whitelisted_domain(best_link, extra_domains=self.whitelist_domains):
+                    self.repo.save_url_cache(q_hash_bc, best_link, source_type="BARCODE_SEARCH")
+                    return ResolvedReference(
+                        product_id=product.product_id,
+                        reference_url=best_link,
+                        source_type="BARCODE_SEARCH",
+                        query_used=bc_query,
+                        scenario_applied=scenario_override,
+                        status="FOUND",
+                        is_cached=False,
+                    )
+
+        # Step B: Fallback to Title / Model / Manufacturer SKU search
+        query, source_type = self._build_title_query(product)
         q_hash = self.compute_query_hash(product, query)
 
         cached_url = self.repo.get_url_cache(q_hash)
-        if cached_url:
+        if cached_url and is_whitelisted_domain(cached_url, extra_domains=self.whitelist_domains):
             return ResolvedReference(
                 product_id=product.product_id,
                 reference_url=cached_url,
@@ -210,7 +250,7 @@ class ResolveReferenceUseCase:
 
         if results:
             best_link = str(results[0].get("link") or "").strip()
-            if best_link:
+            if best_link and is_whitelisted_domain(best_link, extra_domains=self.whitelist_domains):
                 self.repo.save_url_cache(q_hash, best_link, source_type=source_type)
                 return ResolvedReference(
                     product_id=product.product_id,
