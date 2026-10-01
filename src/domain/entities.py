@@ -8,6 +8,7 @@ class AuditStatus(str, Enum):
     PENDING = "PENDING"
     VERIFIED = "VERIFIED"
     MISMATCH = "MISMATCH"
+    MISSING_SPECS = "MISSING_SPECS"
     NOT_FOUND = "NOT_FOUND"
     ERROR = "ERROR"
 
@@ -35,6 +36,15 @@ class DiscrepancyItem(BaseModel):
     severity: str = Field(default="warning")
 
 
+class MissingSpecItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    spec_name: str = Field(...)
+    reference_value: str = Field(...)
+    proof_quote: str = Field(...)
+    source_url: str = Field(...)
+
+
 class AuditResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -43,6 +53,7 @@ class AuditResult(BaseModel):
     confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
     reference_url: str | None = Field(default=None)
     discrepancies: list[DiscrepancyItem] = Field(default_factory=list)
+    missing_specs: list[MissingSpecItem] = Field(default_factory=list)
     matched_specs_count: int = Field(default=0, ge=0)
     total_specs_count: int = Field(default=0, ge=0)
     audited_at: datetime = Field(

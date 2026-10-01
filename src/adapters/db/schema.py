@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS audit_results (
     confidence_score REAL NOT NULL,
     reference_url TEXT,
     discrepancies_json TEXT,
+    missing_specs_json TEXT,
     matched_specs_count INTEGER NOT NULL,
     total_specs_count INTEGER NOT NULL,
     audited_at TEXT NOT NULL,

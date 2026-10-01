@@ -3,12 +3,24 @@ import asyncio
 import io
 from pathlib import Path
 import sys
+import warnings
+
+warnings.filterwarnings("ignore", message=".*urllib3.*or chardet.*doesn't match a supported version.*")
+try:
+    from requests.exceptions import RequestsDependencyWarning
+    warnings.filterwarnings("ignore", category=RequestsDependencyWarning)
+except ImportError:
+    pass
+
 from config.settings import get_settings
 from src.adapters.catalog.telecom_crawler import TelecomShopCrawler
+from src.adapters.crawler.web_crawler import WebCrawler
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
+from src.adapters.llm.gemini_judge import GeminiJudge
 from src.adapters.search.serper_client import SerperClient
 from src.adapters.search.vendor_direct import VendorDirectResolver
-from src.domain.entities import Product
+from src.domain.entities import AuditStatus, Product
+from src.use_cases.audit_product import AuditProductUseCase
 from src.use_cases.crawl_shop_catalog import CrawlShopCatalogUseCase
 from src.use_cases.resolve_reference import ResolveReferenceUseCase
 
@@ -109,16 +121,17 @@ async def run_resolve_command(args: argparse.Namespace) -> int:
     print(f"Verify URLs   : {args.verify}")
     print("-" * 75)
 
+    sku_or_id = getattr(args, "sku", None) or args.product_id
     products: list[Product] = []
-    if args.product_id:
-        p = repo.get_product_by_id(args.product_id)
+    if sku_or_id is not None:
+        p = repo.find_product(sku_or_id)
         if p:
             products.append(p)
         else:
-            print(f"[ERROR] Product #{args.product_id} not found in database.")
+            print(f"[ERROR] Product with SKU/ID '{sku_or_id}' not found in database.")
             return 1
     else:
-        products = repo.get_all_products(limit=args.limit or 10)
+        products = repo.get_auditable_products(limit=args.limit or 10)
 
     if not products:
         print("[*] No products found in database to resolve.")
@@ -247,6 +260,125 @@ async def run_live_test_command(args: argparse.Namespace) -> int:
     return 0
 
 
+async def run_audit_command(args: argparse.Namespace) -> int:
+    setup_utf8_terminal()
+
+    db_path = Path(args.db)
+    repo = SQLiteProductRepository(db_path)
+
+    sku_or_id = getattr(args, "sku", None) or args.product_id
+    if sku_or_id is not None:
+        target = repo.find_product(sku_or_id)
+        if not target:
+            print(f"[!] Error: Product with SKU/ID '{sku_or_id}' not found in {db_path}")
+            return 1
+        products = [target]
+    else:
+        products = repo.get_auditable_products(limit=args.limit)
+        if not products:
+            print(f"[!] No products found in database {db_path}")
+            return 1
+
+    settings = get_settings()
+    gemini_key = args.gemini_key or settings.GEMINI_API_KEY
+    if not gemini_key:
+        print("[!] WARNING: GEMINI_API_KEY is not set. Arbitration calls will return ERROR status.")
+        print("    Pass --gemini-key <KEY> or set GEMINI_API_KEY in .env / environment.")
+
+    vendor_resolver = VendorDirectResolver(timeout=10.0)
+    serper_client = SerperClient(api_key=settings.SERPER_API_KEY)
+    ref_resolver = ResolveReferenceUseCase(
+        repository=repo,
+        vendor_resolver=vendor_resolver,
+        serper_client=serper_client,
+        verify_direct_urls=True,
+    )
+
+    crawler = WebCrawler(
+        max_concurrent=2,
+        headless=not args.no_headless,
+        timeout_ms=30000,
+    )
+    judge = GeminiJudge(api_key=gemini_key)
+    audit_use_case = AuditProductUseCase(
+        product_repo=repo,
+        reference_resolver=ref_resolver,
+        crawler=crawler,
+        judge=judge,
+    )
+
+    print("=" * 80)
+    print("TELECOM CATALOG AUDITOR :: STAGE 4 FACTUAL ARBITER")
+    print("=" * 80)
+    print(f"Target DB     : {db_path.resolve()}")
+    print(f"Products Count: {len(products)}")
+    print(f"Headless      : {not args.no_headless}")
+    print(f"Force Refresh : {args.force_refresh}")
+    print("-" * 80)
+
+    try:
+        await crawler.start()
+        verified_count = 0
+        mismatch_count = 0
+        missing_specs_count = 0
+        not_found_count = 0
+        error_count = 0
+
+        for idx, prod in enumerate(products, 1):
+            print(f"[{idx:02d}/{len(products)}] Auditing ID #{prod.product_id} | {prod.title[:150]}")
+            print(f"      Shop SKU: {prod.shop_sku or 'N/A'} | Vendor SKU: {prod.vendor_sku or 'N/A'} | Barcode: {prod.barcode or 'N/A'}")
+            print(f"      Current Specs Count: {len(prod.current_specs)}")
+
+            result = await audit_use_case.audit_product(
+                product=prod,
+                reference_url=args.reference_url if len(products) == 1 else None,
+                force_refresh=args.force_refresh,
+            )
+
+            if result.status == AuditStatus.VERIFIED:
+                verified_count += 1
+                print(f"      STATUS: [VERIFIED] (Confidence: {result.confidence_score:.2f} | Matched: {result.matched_specs_count}/{result.total_specs_count})")
+                print(f"      Ref URL: {result.reference_url}")
+                if result.details:
+                    print(f"      Details: {result.details}")
+            elif result.status == AuditStatus.MISMATCH:
+                mismatch_count += 1
+                print(f"      STATUS: [MISMATCH] (Confidence: {result.confidence_score:.2f} | Discrepancies: {len(result.discrepancies)})")
+                print(f"      Ref URL: {result.reference_url}")
+                for d in result.discrepancies:
+                    print(f"        * Spec: '{d.spec_name}' [{d.severity.upper()}]")
+                    print(f"          Shop Value     : {d.shop_value}")
+                    print(f"          Reference Value: {d.reference_value}")
+                    print(f"          Proof Quote    : \"{d.proof_quote}\"")
+                if result.details:
+                    print(f"      Details: {result.details}")
+            elif result.status == AuditStatus.MISSING_SPECS:
+                missing_specs_count += 1
+                print(f"      STATUS: [MISSING_SPECS] (Confidence: {result.confidence_score:.2f})")
+                print(f"      Ref URL: {result.reference_url}")
+                if result.details:
+                    print(f"      Details: {result.details}")
+            elif result.status == AuditStatus.NOT_FOUND:
+                not_found_count += 1
+                print(f"      STATUS: [NOT_FOUND] - {result.details}")
+            else:
+                error_count += 1
+                print(f"      STATUS: [ERROR] - {result.details}")
+
+            if result.missing_specs:
+                print(f"      * MISSING SPECS (В эталоне найдены важные ТХ, отсутствующие на витрине):")
+                for m in result.missing_specs:
+                    print(f"        + {m.spec_name}: {m.reference_value}")
+            print()
+
+        print("-" * 80)
+        print(f"AUDIT SUMMARY: Total: {len(products)} | Verified: {verified_count} | Mismatches: {mismatch_count} | Missing Specs: {missing_specs_count} | Not Found: {not_found_count} | Errors: {error_count}")
+        print("=" * 80)
+        return 0
+    finally:
+        await crawler.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="telecom-auditor",
@@ -310,6 +442,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Target specific product ID",
     )
     resolve_parser.add_argument(
+        "--sku",
+        "--shop-sku",
+        type=str,
+        default=None,
+        help="Target specific product by Store SKU (e.g. 453844)",
+    )
+    resolve_parser.add_argument(
         "--limit",
         type=int,
         default=10,
@@ -347,6 +486,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to SQLite database (default: catalog_audit.db)",
     )
 
+    audit_parser = subparsers.add_parser("audit", help="Run 1-shot factual audit against external reference")
+    audit_parser.add_argument(
+        "--product-id",
+        type=int,
+        default=None,
+        help="Target specific product ID",
+    )
+    audit_parser.add_argument(
+        "--sku",
+        "--shop-sku",
+        type=str,
+        default=None,
+        help="Target specific product by Store SKU (e.g. 453844)",
+    )
+    audit_parser.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="Max products to audit (default: 5)",
+    )
+    audit_parser.add_argument(
+        "--reference-url",
+        type=str,
+        default=None,
+        help="Manual reference URL override (only with --product-id)",
+    )
+    audit_parser.add_argument(
+        "--gemini-key",
+        type=str,
+        default=None,
+        help="Gemini API Key override",
+    )
+    audit_parser.add_argument(
+        "--no-headless",
+        action="store_true",
+        help="Run browser in graphical mode",
+    )
+    audit_parser.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="Bypass specs_cache and refetch external page",
+    )
+    audit_parser.add_argument(
+        "--db",
+        type=str,
+        default="catalog_audit.db",
+        help="Path to SQLite database (default: catalog_audit.db)",
+    )
+
     return parser
 
 
@@ -362,6 +550,9 @@ def main() -> None:
         sys.exit(exit_code)
     elif args.subcommand == "live-test":
         exit_code = asyncio.run(run_live_test_command(args))
+        sys.exit(exit_code)
+    elif args.subcommand == "audit":
+        exit_code = asyncio.run(run_audit_command(args))
         sys.exit(exit_code)
     else:
         parser.print_help()

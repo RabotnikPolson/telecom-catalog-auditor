@@ -166,13 +166,22 @@ class ResolveReferenceUseCase:
             if m_sku.lower() not in clean_title.lower():
                 parts.append(m_sku)
 
-        if product.vendor_sku and product.vendor_sku.strip():
+        is_internal_sku = False
+        if product.vendor_name:
+            v_lower = product.vendor_name.lower().strip()
+            if any(w in v_lower for w in ["основной склад", "главный склад", "собственный склад", "склад"]):
+                is_internal_sku = True
+        if product.shop_sku and product.vendor_sku and str(product.shop_sku).strip() == str(product.vendor_sku).strip():
+            is_internal_sku = True
+
+        if not is_internal_sku and product.vendor_sku and product.vendor_sku.strip():
             v_sku = product.vendor_sku.strip()
             if v_sku.lower() not in clean_title.lower():
                 parts.append(v_sku)
 
+        parts.append("характеристики")
         query = " ".join(parts).strip()
-        source_type = "PROVIDER_SKU_SEARCH" if product.vendor_sku else "MODEL_SEARCH"
+        source_type = "PROVIDER_SKU_SEARCH" if (product.vendor_sku and not is_internal_sku) else "MODEL_SEARCH"
         return query, source_type
 
     async def _execute_search_cascade(

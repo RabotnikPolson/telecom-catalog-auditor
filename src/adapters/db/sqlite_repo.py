@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import sqlite3
 from typing import Sequence, Union
-from src.domain.entities import AuditStatus, Product
+from src.domain.entities import AuditResult, AuditStatus, DiscrepancyItem, MissingSpecItem, Product
 from .schema import get_sqlite_connection, init_db
 
 
@@ -12,6 +12,12 @@ class SQLiteProductRepository:
     def __init__(self, db_path: Union[str, Path]) -> None:
         self.db_path = Path(db_path)
         init_db(self.db_path)
+        with get_sqlite_connection(self.db_path) as conn:
+            try:
+                conn.execute("ALTER TABLE audit_results ADD COLUMN missing_specs_json TEXT;")
+                conn.commit()
+            except Exception:
+                pass
 
     def _row_to_product(self, row: sqlite3.Row) -> Product:
         specs_dict = json.loads(row["current_specs"]) if row["current_specs"] else {}
@@ -160,6 +166,24 @@ class SQLiteProductRepository:
             row = cursor.fetchone()
             return self._row_to_product(row) if row else None
 
+    def get_product_by_shop_sku(self, shop_sku: str) -> Product | None:
+        sql = "SELECT * FROM products WHERE shop_sku = ? LIMIT 1;"
+        with get_sqlite_connection(self.db_path) as conn:
+            cursor = conn.execute(sql, (str(shop_sku).strip(),))
+            row = cursor.fetchone()
+            return self._row_to_product(row) if row else None
+
+    def find_product(self, identifier: str | int) -> Product | None:
+        clean_id = str(identifier).strip()
+        by_sku = self.get_product_by_shop_sku(clean_id)
+        if by_sku:
+            return by_sku
+        if clean_id.isdigit():
+            by_id = self.get_product_by_id(int(clean_id))
+            if by_id:
+                return by_id
+        return None
+
     def get_by_content_hash(self, content_hash: str) -> Product | None:
         sql = "SELECT * FROM products WHERE content_hash = ? LIMIT 1;"
         with get_sqlite_connection(self.db_path) as conn:
@@ -186,6 +210,15 @@ class SQLiteProductRepository:
         with get_sqlite_connection(self.db_path) as conn:
             cursor = conn.execute(sql, (limit, offset))
             return [self._row_to_product(row) for row in cursor.fetchall()]
+
+    def get_auditable_products(self, limit: int = 100, offset: int = 0) -> list[Product]:
+        sql = "SELECT * FROM products WHERE shop_sku IS NOT NULL ORDER BY product_id ASC LIMIT ? OFFSET ?;"
+        with get_sqlite_connection(self.db_path) as conn:
+            cursor = conn.execute(sql, (limit, offset))
+            real_products = [self._row_to_product(row) for row in cursor.fetchall()]
+            if real_products:
+                return real_products
+        return self.get_all_products(limit=limit, offset=offset)
 
     def count_products(self) -> int:
         sql = "SELECT COUNT(*) FROM products;"
@@ -316,4 +349,86 @@ class SQLiteProductRepository:
                 }
                 for row in cursor.fetchall()
             ]
+
+    def _row_to_audit_result(self, row: sqlite3.Row) -> AuditResult:
+        disc_raw = row["discrepancies_json"]
+        discrepancies = [
+            DiscrepancyItem(**item) for item in json.loads(disc_raw)
+        ] if disc_raw else []
+        missing_raw = row["missing_specs_json"] if "missing_specs_json" in row.keys() else None
+        missing_specs = [
+            MissingSpecItem(**item) for item in json.loads(missing_raw)
+        ] if missing_raw else []
+        audited_at = (
+            datetime.fromisoformat(row["audited_at"])
+            if row["audited_at"]
+            else datetime.now(timezone.utc)
+        )
+        return AuditResult(
+            product_id=row["product_id"],
+            status=AuditStatus(row["status"]),
+            confidence_score=row["confidence_score"],
+            reference_url=row["reference_url"],
+            discrepancies=discrepancies,
+            missing_specs=missing_specs,
+            matched_specs_count=row["matched_specs_count"],
+            total_specs_count=row["total_specs_count"],
+            audited_at=audited_at,
+            details=row["details"],
+        )
+
+    def save_audit_result(self, result: AuditResult) -> int:
+        sql = """
+        INSERT INTO audit_results (
+            product_id, status, confidence_score, reference_url,
+            discrepancies_json, missing_specs_json, matched_specs_count, total_specs_count,
+            audited_at, details
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """
+        disc_json = json.dumps(
+            [d.model_dump() for d in result.discrepancies],
+            ensure_ascii=False
+        )
+        missing_json = json.dumps(
+            [m.model_dump() for m in result.missing_specs],
+            ensure_ascii=False
+        )
+        now_iso = result.audited_at.isoformat()
+        with get_sqlite_connection(self.db_path) as conn:
+            cursor = conn.execute(
+                sql,
+                (
+                    result.product_id,
+                    result.status.value,
+                    result.confidence_score,
+                    result.reference_url,
+                    disc_json,
+                    missing_json,
+                    result.matched_specs_count,
+                    result.total_specs_count,
+                    now_iso,
+                    result.details,
+                ),
+            )
+            audit_id = cursor.lastrowid
+            conn.execute(
+                "UPDATE products SET status = ?, updated_at = ? WHERE product_id = ?;",
+                (result.status.value, now_iso, result.product_id),
+            )
+            conn.commit()
+            return int(audit_id)
+
+    def get_audit_results_by_product_id(self, product_id: int) -> list[AuditResult]:
+        sql = "SELECT * FROM audit_results WHERE product_id = ? ORDER BY audit_id DESC;"
+        with get_sqlite_connection(self.db_path) as conn:
+            cursor = conn.execute(sql, (product_id,))
+            return [self._row_to_audit_result(row) for row in cursor.fetchall()]
+
+    def get_latest_audit_result(self, product_id: int) -> AuditResult | None:
+        sql = "SELECT * FROM audit_results WHERE product_id = ? ORDER BY audit_id DESC LIMIT 1;"
+        with get_sqlite_connection(self.db_path) as conn:
+            cursor = conn.execute(sql, (product_id,))
+            row = cursor.fetchone()
+            return self._row_to_audit_result(row) if row else None
+
 

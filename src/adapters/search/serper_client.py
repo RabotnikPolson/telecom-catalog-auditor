@@ -103,6 +103,55 @@ class SerperClient:
                 logger.error(f"Serper API search error: {exc}")
                 return []
 
+    async def _gemini_search_fallback(self, query: str) -> list[dict[str, Any]]:
+        settings = get_settings()
+        gemini_key = settings.GEMINI_API_KEY
+        if not gemini_key:
+            return []
+        try:
+            from google import genai
+            from google.genai import types
+            import re
+            client = genai.Client(api_key=gemini_key)
+            prompt = (
+                f'Найди прямую ссылку на страницу с характеристиками товара для: "{query}".\n'
+                f'Приоритет: 1) официальный сайт производителя бренда, 2) надежные магазины Казахстана: kaspi.kz, dns-shop.kz, mechta.kz, technodom.kz, sulpak.kz, shop.kz.\n'
+                f'Верни ТОЛЬКО одну прямую ссылку (URL).'
+            )
+            config = types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.1,
+            )
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(
+                None,
+                lambda: client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                    config=config,
+                ),
+            )
+            urls = []
+            if resp.candidates and resp.candidates[0].grounding_metadata:
+                gm = resp.candidates[0].grounding_metadata
+                for chunk in getattr(gm, "grounding_chunks", []) or []:
+                    web = getattr(chunk, "web", None)
+                    if web and getattr(web, "uri", None):
+                        uri = str(web.uri).strip()
+                        if uri.startswith("http") and not self.is_spam_or_unwanted(uri):
+                            urls.append({"link": uri, "title": getattr(web, "title", "")})
+
+            raw_text = (resp.text or "").strip()
+            url_match = re.search(r'https?://[^\s<>"]+', raw_text)
+            if url_match:
+                found_url = url_match.group(0).rstrip(".,;)")
+                if not self.is_spam_or_unwanted(found_url):
+                    urls.insert(0, {"link": found_url, "title": query})
+            return urls
+        except Exception as e:
+            logger.warning(f"Gemini search fallback error: {e}")
+            return []
+
     async def search_and_filter(
         self,
         query: str,
@@ -110,6 +159,9 @@ class SerperClient:
         num_results: int = 10,
     ) -> list[dict[str, Any]]:
         organic_results = await self.search(query, num_results=num_results)
+        if not organic_results:
+            organic_results = await self._gemini_search_fallback(query)
+
         if not organic_results:
             return []
 
