@@ -60,6 +60,12 @@ class AuditResult(BaseModel):
         default_factory=lambda: datetime.now(timezone.utc)
     )
     details: str | None = Field(default=None)
+    execution_time_sec: float = Field(default=0.0)
+    crawler_time_sec: float = Field(default=0.0)
+    llm_time_sec: float = Field(default=0.0)
+    input_tokens: int = Field(default=0)
+    output_tokens: int = Field(default=0)
+    estimated_cost_usd: float = Field(default=0.0)
 
 
 class Product(BaseModel):

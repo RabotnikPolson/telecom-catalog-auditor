@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import hashlib
 import re
-from typing import Optional
+from typing import Any, Optional
 from config.vendor_profiles import find_vendor_profile
 from config.whitelist_domains import is_whitelisted_domain
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
@@ -187,6 +187,35 @@ class ResolveReferenceUseCase:
             return f'"{clean_bc}" характеристики', "BARCODE_SEARCH"
         return self._build_title_query(product)
 
+    def _sort_by_domain_priority(
+        self, results: list[dict[str, Any]], product: Product
+    ) -> list[dict[str, Any]]:
+        brand_candidates: list[str] = []
+        if product.vendor_name and "склад" not in product.vendor_name.lower():
+            brand_candidates.append(product.vendor_name.lower().strip())
+        for token in product.title.split():
+            clean_tok = re.sub(r"[^a-zA-Z0-9]", "", token).lower()
+            if len(clean_tok) >= 3 and clean_tok not in ("ноутбук", "смартфон", "телефон", "кабель", "планшет", "noutbuk", "smartfon"):
+                brand_candidates.append(clean_tok)
+                break
+
+        def priority_score(item: dict[str, Any]) -> int:
+            link = str(item.get("link") or "").lower()
+            for b in brand_candidates:
+                if f"{b}." in link or f"/{b}" in link or f".{b}" in link:
+                    return 1
+            if "kaspi.kz" in link:
+                return 2
+            if "dns-shop.kz" in link:
+                return 3
+            if any(d in link for d in ["technodom.kz", "shop.kz", "mechta.kz", "sulpak.kz", "fora.kz"]):
+                return 4
+            if any(d in link for d in ["al-style.kz", "e-katalog.kz", "marvel.kz", "treolan.kz"]):
+                return 5
+            return 10
+
+        return sorted(results, key=priority_score)
+
     async def _execute_search_cascade(
         self, product: Product, scenario_override: str
     ) -> ResolvedReference:
@@ -213,7 +242,8 @@ class ResolveReferenceUseCase:
                 num_results=10,
             )
             if bc_results:
-                best_link = str(bc_results[0].get("link") or "").strip()
+                sorted_bc = self._sort_by_domain_priority(bc_results, product)
+                best_link = str(sorted_bc[0].get("link") or "").strip()
                 if best_link and is_whitelisted_domain(best_link, extra_domains=self.whitelist_domains):
                     self.repo.save_url_cache(q_hash_bc, best_link, source_type="BARCODE_SEARCH")
                     return ResolvedReference(
@@ -249,7 +279,8 @@ class ResolveReferenceUseCase:
         )
 
         if results:
-            best_link = str(results[0].get("link") or "").strip()
+            sorted_res = self._sort_by_domain_priority(results, product)
+            best_link = str(sorted_res[0].get("link") or "").strip()
             if best_link and is_whitelisted_domain(best_link, extra_domains=self.whitelist_domains):
                 self.repo.save_url_cache(q_hash, best_link, source_type=source_type)
                 return ResolvedReference(

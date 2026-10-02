@@ -395,9 +395,13 @@ class TelecomShopCrawler:
                     specs[k] = v
 
         manufacturer_sku = None
-        for key in ["модель", "код модели", "артикул производителя", "партномер", "partnumber"]:
+        excluded_sku_keys = ["процессор", "видеокарт", "чипсет", "матриц", "экран"]
+        for key in ["код модели", "артикул производителя", "партномер", "partnumber", "модель"]:
             for spec_key, spec_val in specs.items():
-                if key in spec_key.lower():
+                s_lower = spec_key.lower()
+                if any(ex in s_lower for ex in excluded_sku_keys):
+                    continue
+                if key in s_lower:
                     manufacturer_sku = spec_val
                     break
             if manufacturer_sku:

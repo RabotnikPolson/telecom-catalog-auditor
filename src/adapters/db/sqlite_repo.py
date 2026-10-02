@@ -364,6 +364,7 @@ class SQLiteProductRepository:
             if row["audited_at"]
             else datetime.now(timezone.utc)
         )
+        keys = row.keys()
         return AuditResult(
             product_id=row["product_id"],
             status=AuditStatus(row["status"]),
@@ -375,6 +376,12 @@ class SQLiteProductRepository:
             total_specs_count=row["total_specs_count"],
             audited_at=audited_at,
             details=row["details"],
+            execution_time_sec=row["execution_time_sec"] if "execution_time_sec" in keys and row["execution_time_sec"] is not None else 0.0,
+            crawler_time_sec=row["crawler_time_sec"] if "crawler_time_sec" in keys and row["crawler_time_sec"] is not None else 0.0,
+            llm_time_sec=row["llm_time_sec"] if "llm_time_sec" in keys and row["llm_time_sec"] is not None else 0.0,
+            input_tokens=row["input_tokens"] if "input_tokens" in keys and row["input_tokens"] is not None else 0,
+            output_tokens=row["output_tokens"] if "output_tokens" in keys and row["output_tokens"] is not None else 0,
+            estimated_cost_usd=row["estimated_cost_usd"] if "estimated_cost_usd" in keys and row["estimated_cost_usd"] is not None else 0.0,
         )
 
     def save_audit_result(self, result: AuditResult) -> int:
@@ -382,8 +389,9 @@ class SQLiteProductRepository:
         INSERT INTO audit_results (
             product_id, status, confidence_score, reference_url,
             discrepancies_json, missing_specs_json, matched_specs_count, total_specs_count,
-            audited_at, details
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            audited_at, details, execution_time_sec, crawler_time_sec, llm_time_sec,
+            input_tokens, output_tokens, estimated_cost_usd
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         disc_json = json.dumps(
             [d.model_dump() for d in result.discrepancies],
@@ -408,6 +416,12 @@ class SQLiteProductRepository:
                     result.total_specs_count,
                     now_iso,
                     result.details,
+                    result.execution_time_sec,
+                    result.crawler_time_sec,
+                    result.llm_time_sec,
+                    result.input_tokens,
+                    result.output_tokens,
+                    result.estimated_cost_usd,
                 ),
             )
             audit_id = cursor.lastrowid

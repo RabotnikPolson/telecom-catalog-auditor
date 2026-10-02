@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 import json
+import time
 from typing import Sequence
 
 from src.adapters.crawler.web_crawler import WebCrawler
@@ -30,6 +31,8 @@ class AuditProductUseCase:
         reference_url: str | None = None,
         force_refresh: bool = False,
     ) -> AuditResult:
+        t_audit_start = time.perf_counter()
+        crawler_time_sec = 0.0
         target_url = reference_url
         if not target_url:
             resolver_fn = getattr(self.reference_resolver, "execute", None) or getattr(self.reference_resolver, "resolve", None)
@@ -50,6 +53,7 @@ class AuditProductUseCase:
                     total_specs_count=len(product.current_specs),
                     audited_at=datetime.now(timezone.utc),
                     details="Reference URL could not be resolved from suppliers or search",
+                    execution_time_sec=round(time.perf_counter() - t_audit_start, 2),
                 )
                 self.product_repo.save_audit_result(result)
                 return result
@@ -66,7 +70,9 @@ class AuditProductUseCase:
                     external_markdown = cached_raw
 
         if not external_markdown:
+            t_crawl_start = time.perf_counter()
             crawl_res = await self.crawler.crawl(target_url)
+            crawler_time_sec = time.perf_counter() - t_crawl_start
             if not crawl_res.success:
                 result = AuditResult(
                     product_id=product.product_id,
@@ -78,6 +84,8 @@ class AuditProductUseCase:
                     total_specs_count=len(product.current_specs),
                     audited_at=datetime.now(timezone.utc),
                     details=f"Crawler error: {crawl_res.error}",
+                    crawler_time_sec=round(crawler_time_sec, 2),
+                    execution_time_sec=round(time.perf_counter() - t_audit_start, 2),
                 )
                 self.product_repo.save_audit_result(result)
                 return result
@@ -101,6 +109,8 @@ class AuditProductUseCase:
             reference_url=target_url,
             external_markdown=external_markdown,
         )
+        result.crawler_time_sec = round(crawler_time_sec, 2)
+        result.execution_time_sec = round(time.perf_counter() - t_audit_start, 2)
         self.product_repo.save_audit_result(result)
         return result
 

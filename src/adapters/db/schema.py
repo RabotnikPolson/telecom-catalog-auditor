@@ -58,6 +58,12 @@ CREATE TABLE IF NOT EXISTS audit_results (
     total_specs_count INTEGER NOT NULL,
     audited_at TEXT NOT NULL,
     details TEXT,
+    execution_time_sec REAL DEFAULT 0.0,
+    crawler_time_sec REAL DEFAULT 0.0,
+    llm_time_sec REAL DEFAULT 0.0,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    estimated_cost_usd REAL DEFAULT 0.0,
     FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE CASCADE
 );
 
@@ -101,6 +107,24 @@ def init_db(db_path: Union[str, Path]) -> None:
                 conn.execute("ALTER TABLE products ADD COLUMN barcode TEXT;")
             if "shop_sku" not in columns:
                 conn.execute("ALTER TABLE products ADD COLUMN shop_sku TEXT;")
+
+        # Migrate audit_results table if missing metrics columns
+        audit_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit_results';")
+        if audit_cursor.fetchone():
+            a_cols = [row["name"] for row in conn.execute("PRAGMA table_info(audit_results);").fetchall()]
+            if "execution_time_sec" not in a_cols:
+                conn.execute("ALTER TABLE audit_results ADD COLUMN execution_time_sec REAL DEFAULT 0.0;")
+            if "crawler_time_sec" not in a_cols:
+                conn.execute("ALTER TABLE audit_results ADD COLUMN crawler_time_sec REAL DEFAULT 0.0;")
+            if "llm_time_sec" not in a_cols:
+                conn.execute("ALTER TABLE audit_results ADD COLUMN llm_time_sec REAL DEFAULT 0.0;")
+            if "input_tokens" not in a_cols:
+                conn.execute("ALTER TABLE audit_results ADD COLUMN input_tokens INTEGER DEFAULT 0;")
+            if "output_tokens" not in a_cols:
+                conn.execute("ALTER TABLE audit_results ADD COLUMN output_tokens INTEGER DEFAULT 0;")
+            if "estimated_cost_usd" not in a_cols:
+                conn.execute("ALTER TABLE audit_results ADD COLUMN estimated_cost_usd REAL DEFAULT 0.0;")
+
         conn.executescript(SCHEMA_SQL)
         conn.commit()
 

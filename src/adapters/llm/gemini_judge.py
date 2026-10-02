@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import os
+import time
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
@@ -87,12 +88,23 @@ class GeminiJudge:
             thinking_config=types.ThinkingConfig(thinking_budget=0),
         )
 
+        t_llm_start = time.perf_counter()
         try:
             response = await self._client.aio.models.generate_content(
                 model=self.model,
                 contents=user_prompt,
                 config=config,
             )
+            llm_time_sec = time.perf_counter() - t_llm_start
+
+            input_tokens = 0
+            output_tokens = 0
+            if hasattr(response, "usage_metadata") and response.usage_metadata:
+                input_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
+                output_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+
+            # Gemini 2.5 Flash pricing: $0.10/M input, $0.40/M output
+            cost_usd = (input_tokens * 0.00000010) + (output_tokens * 0.00000040)
 
             raw_text = response.text or "{}"
             output = LLMJudgeOutput.model_validate_json(raw_text)
@@ -107,6 +119,20 @@ class GeminiJudge:
                     else AuditStatus.VERIFIED
                 )
 
+            # Filter out false-positive discrepancies where reference has placeholder/no data
+            placeholder_markers = ("нет данных", "не указано", "отсутствует", "-", "n/a", "none", "null")
+            valid_discrepancies = []
+            for d in output.discrepancies:
+                ref_val = (d.reference_value or "").strip().lower()
+                quote_val = (d.proof_quote or "").strip().lower()
+                if ref_val in placeholder_markers or quote_val in placeholder_markers:
+                    continue
+                valid_discrepancies.append(d)
+
+            if not valid_discrepancies and audit_status == AuditStatus.MISMATCH:
+                audit_status = AuditStatus.VERIFIED
+                output.details = f"Все заявленные характеристики витрины подтверждены эталоном; выявлено {len(output.missing_specs)} характеристик для обогащения."
+
             discrepancy_items = [
                 DiscrepancyItem(
                     spec_name=d.spec_name,
@@ -120,7 +146,7 @@ class GeminiJudge:
                         else "warning"
                     ),
                 )
-                for d in output.discrepancies
+                for d in valid_discrepancies
             ]
 
             missing_items = [
@@ -144,6 +170,10 @@ class GeminiJudge:
                 total_specs_count=output.total_specs_count or len(product.current_specs),
                 audited_at=datetime.now(timezone.utc),
                 details=output.details,
+                llm_time_sec=round(llm_time_sec, 2),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                estimated_cost_usd=round(cost_usd, 6),
             )
         except Exception as e:
             return AuditResult(
