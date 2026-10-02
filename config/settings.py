@@ -20,6 +20,8 @@ class Settings(BaseSettings):
 
     SERPER_API_KEY: str | None = Field(default=None)
     GEMINI_API_KEY: str | None = Field(default=None)
+    OPENROUTER_API_KEY: str | None = Field(default=None)
+    OPENROUTER_MODEL: str = Field(default="google/gemini-2.5-flash")
 
     @property
     def db_file_path(self) -> Path:

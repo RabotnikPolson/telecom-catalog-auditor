@@ -1,8 +1,11 @@
-from datetime import datetime, timezone
+import json
 import os
 import time
+from datetime import datetime, timezone
+from typing import Any
 from google import genai
 from google.genai import types
+import httpx
 from pydantic import BaseModel, Field
 
 from config.settings import get_settings
@@ -41,16 +44,86 @@ class GeminiJudge:
         api_key: str | None = None,
         model: str = "gemini-2.5-flash",
     ) -> None:
-        self.api_key = (
+        settings = get_settings()
+        self.openrouter_api_key = (
+            os.environ.get("OPENROUTER_API_KEY")
+            or settings.OPENROUTER_API_KEY
+        )
+        self.openrouter_model = (
+            os.environ.get("OPENROUTER_MODEL")
+            or settings.OPENROUTER_MODEL
+            or "google/gemini-2.5-flash"
+        )
+        self.gemini_api_key = (
             api_key
             or os.environ.get("GEMINI_API_KEY")
             or os.environ.get("GOOGLE_API_KEY")
-            or get_settings().GEMINI_API_KEY
+            or settings.GEMINI_API_KEY
         )
         self.model = model
         self._client: genai.Client | None = None
-        if self.api_key:
-            self._client = genai.Client(api_key=self.api_key)
+        if self.gemini_api_key:
+            try:
+                self._client = genai.Client(api_key=self.gemini_api_key)
+            except Exception:
+                self._client = None
+
+    async def clean_search_query(self, title: str, vendor_name: str | None = None) -> str:
+        """
+        Extracts clean Brand + Model query without noise (colors, device category, advertising slogans).
+        E.g.: 'Смартфон Apple iPhone 17 Pro Max 256Gb оранжевый MFYN4HX/A' -> 'Apple iPhone 17 Pro Max 256GB'
+        """
+        clean_title = title.strip()
+        system_msg = (
+            "Ты поисковый ассистент каталога электроники в Казахстане. "
+            "Получив сырое название товара с витрины магазина, сформируй краткий, идеальный поисковый запрос (Бренд + Модель + ключевая модификация, например объем памяти или версия). "
+            "Удали цвета (синий, оранжевый, белый и т.д.), категорию устройства (смартфон, умная колонка, настольная лампа, батарейка, mesh-система), "
+            "маркетинговые фразы (до ~425 кв.м., с гибкой ножкой, 2-pack) и внутренние складские артикулы. "
+            "Ответь ТОЛЬКО очищенной поисковой фразой на одной строке без кавычек, знаков препинания и пояснений."
+        )
+        user_msg = f"Название товара: {clean_title}"
+        if vendor_name and "склад" not in vendor_name.lower():
+            user_msg += f"\nБренд: {vendor_name}"
+
+        try:
+            if self.openrouter_api_key:
+                payload = {
+                    "model": self.openrouter_model,
+                    "messages": [
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    "temperature": 0.0,
+                }
+                headers = {
+                    "Authorization": f"Bearer {self.openrouter_api_key}",
+                    "HTTP-Referer": "https://shop.telecom.kz",
+                    "X-Title": "Telecom Catalog Auditor",
+                }
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        result = data["choices"][0]["message"]["content"].strip().strip('"').strip("'")
+                        if result:
+                            return result
+            elif self._client and self.gemini_api_key:
+                response = await self._client.aio.models.generate_content(
+                    model=self.model,
+                    contents=f"{system_msg}\n\n{user_msg}",
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    ),
+                )
+                if response.text:
+                    result = response.text.strip().strip('"').strip("'")
+                    if result:
+                        return result
+        except Exception:
+            pass
+
+        return clean_title
 
     async def judge(
         self,
@@ -58,7 +131,7 @@ class GeminiJudge:
         reference_url: str,
         external_markdown: str,
     ) -> AuditResult:
-        if not self._client or not self.api_key:
+        if not self.openrouter_api_key and (not self._client or not self.gemini_api_key):
             return AuditResult(
                 product_id=product.product_id,
                 status=AuditStatus.ERROR,
@@ -67,7 +140,7 @@ class GeminiJudge:
                 discrepancies=[],
                 matched_specs_count=0,
                 total_specs_count=len(product.current_specs),
-                details="GEMINI_API_KEY is not configured",
+                details="Neither OPENROUTER_API_KEY nor GEMINI_API_KEY is configured",
             )
 
         user_prompt = build_audit_user_prompt(
@@ -80,33 +153,58 @@ class GeminiJudge:
             external_markdown=external_markdown,
         )
 
-        config = types.GenerateContentConfig(
-            system_instruction=AUDIT_SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            response_schema=LLMJudgeOutput,
-            temperature=0.1,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-        )
-
         t_llm_start = time.perf_counter()
         try:
-            response = await self._client.aio.models.generate_content(
-                model=self.model,
-                contents=user_prompt,
-                config=config,
-            )
-            llm_time_sec = time.perf_counter() - t_llm_start
-
+            raw_text = "{}"
             input_tokens = 0
             output_tokens = 0
-            if hasattr(response, "usage_metadata") and response.usage_metadata:
-                input_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
-                output_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
 
-            # Gemini 2.5 Flash pricing: $0.10/M input, $0.40/M output
+            if self.openrouter_api_key:
+                payload = {
+                    "model": self.openrouter_model,
+                    "messages": [
+                        {"role": "system", "content": AUDIT_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.1,
+                }
+                headers = {
+                    "Authorization": f"Bearer {self.openrouter_api_key}",
+                    "HTTP-Referer": "https://shop.telecom.kz",
+                    "X-Title": "Telecom Catalog Auditor",
+                }
+                async with httpx.AsyncClient(timeout=45.0) as client:
+                    resp = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers)
+                    if resp.status_code != 200:
+                        raise RuntimeError(f"OpenRouter HTTP {resp.status_code}: {resp.text}")
+                    data = resp.json()
+                    raw_text = data["choices"][0]["message"]["content"] or "{}"
+                    usage = data.get("usage", {})
+                    input_tokens = usage.get("prompt_tokens", 0) or 0
+                    output_tokens = usage.get("completion_tokens", 0) or 0
+            else:
+                config = types.GenerateContentConfig(
+                    system_instruction=AUDIT_SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                    response_schema=LLMJudgeOutput,
+                    temperature=0.1,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                )
+                assert self._client is not None
+                response = await self._client.aio.models.generate_content(
+                    model=self.model,
+                    contents=user_prompt,
+                    config=config,
+                )
+                raw_text = response.text or "{}"
+                if hasattr(response, "usage_metadata") and response.usage_metadata:
+                    input_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
+                    output_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+
+            llm_time_sec = time.perf_counter() - t_llm_start
             cost_usd = (input_tokens * 0.00000010) + (output_tokens * 0.00000040)
 
-            raw_text = response.text or "{}"
             output = LLMJudgeOutput.model_validate_json(raw_text)
 
             status_str = output.status.strip().upper()

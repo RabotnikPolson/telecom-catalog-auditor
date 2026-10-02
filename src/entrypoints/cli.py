@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import io
+import os
 from pathlib import Path
 import sys
 import warnings
@@ -153,11 +154,13 @@ async def run_resolve_command(args: argparse.Namespace) -> int:
 
     vendor_resolver = VendorDirectResolver()
     serper_client = SerperClient(api_key=settings.SERPER_API_KEY)
+    judge = GeminiJudge()
     use_case = ResolveReferenceUseCase(
         repository=repo,
         vendor_resolver=vendor_resolver,
         serper_client=serper_client,
         verify_direct_urls=args.verify,
+        judge=judge,
     )
 
     print("=" * 75)
@@ -393,10 +396,12 @@ async def run_audit_command(args: argparse.Namespace) -> int:
 
     settings = get_settings()
     gemini_key = args.gemini_key or settings.GEMINI_API_KEY
-    if not gemini_key:
-        print("[!] WARNING: GEMINI_API_KEY is not set. Arbitration calls will return ERROR status.")
-        print("    Pass --gemini-key <KEY> or set GEMINI_API_KEY in .env / environment.")
+    has_llm = bool(gemini_key or settings.OPENROUTER_API_KEY or os.environ.get("OPENROUTER_API_KEY"))
+    if not has_llm:
+        print("[!] WARNING: Neither OPENROUTER_API_KEY nor GEMINI_API_KEY is set. Arbitration calls will return ERROR status.")
+        print("    Pass --gemini-key <KEY> or set OPENROUTER_API_KEY in .env.")
 
+    judge = GeminiJudge(api_key=gemini_key)
     vendor_resolver = VendorDirectResolver(timeout=10.0)
     serper_client = SerperClient(api_key=settings.SERPER_API_KEY)
     ref_resolver = ResolveReferenceUseCase(
@@ -404,6 +409,7 @@ async def run_audit_command(args: argparse.Namespace) -> int:
         vendor_resolver=vendor_resolver,
         serper_client=serper_client,
         verify_direct_urls=True,
+        judge=judge,
     )
 
     crawler = WebCrawler(
@@ -411,7 +417,6 @@ async def run_audit_command(args: argparse.Namespace) -> int:
         headless=not args.no_headless,
         timeout_ms=30000,
     )
-    judge = GeminiJudge(api_key=gemini_key)
     audit_use_case = AuditProductUseCase(
         product_repo=repo,
         reference_resolver=ref_resolver,

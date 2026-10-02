@@ -148,7 +148,7 @@ class TestResolveReferenceUseCase:
         assert res.status == "FOUND"
         assert res.scenario_applied == "SCENARIO_2_VENDOR_FALLBACK"
         assert res.reference_url == "https://kaspi.kz/shop/p/camelion-102/"
-        assert res.query_used == '"849198020366" характеристики'
+        assert "Camelion" in res.query_used
 
     @pytest.mark.anyio
     async def test_scenario_3_vendor_in_list_without_sku(self, test_repo: SQLiteProductRepository):

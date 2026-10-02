@@ -76,10 +76,26 @@ class WebCrawler:
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
+                    "Chrome/125.0.0.0 Safari/537.36"
                 ),
-                viewport={"width": 1366, "height": 768},
+                viewport={"width": 1920, "height": 1080},
+                locale="ru-RU",
+                timezone_id="Asia/Almaty",
+                extra_http_headers={
+                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "sec-ch-ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                },
             )
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+                window.chrome = {
+                    runtime: {}
+                };
+            """)
             page = await context.new_page()
             try:
                 response = await page.goto(
@@ -222,6 +238,24 @@ class WebCrawler:
                 markdown = extracted.get("markdown", "")
 
                 md_lower = markdown.lower()
+                is_cf = (
+                    "checking if the site connection is secure" in md_lower
+                    or "verify you are human" in md_lower
+                    or "checking your browser" in md_lower
+                    or "cloudflare turnstile" in md_lower
+                    or "just a moment..." in md_lower
+                    or "attention required! | cloudflare" in md_lower
+                )
+                if is_cf:
+                    return CrawlResult(
+                        url=url,
+                        title=title,
+                        markdown=markdown,
+                        status_code=403,
+                        success=False,
+                        error="Cloudflare anti-bot verification challenge page",
+                    )
+
                 is_error_page = (
                     status_code >= 400
                     or "страница не найдена" in md_lower

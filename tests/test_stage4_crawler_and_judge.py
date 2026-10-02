@@ -87,7 +87,8 @@ class TestGeminiJudge:
         self, sample_product: Product
     ) -> None:
         judge = GeminiJudge(api_key=None)
-        judge.api_key = None
+        judge.gemini_api_key = None
+        judge.openrouter_api_key = None
         judge._client = None
 
         res = await judge.judge(
@@ -96,11 +97,12 @@ class TestGeminiJudge:
             external_markdown="# Item Specs",
         )
         assert res.status == AuditStatus.ERROR
-        assert "GEMINI_API_KEY is not configured" in (res.details or "")
+        assert "is not configured" in (res.details or "")
 
     @pytest.mark.anyio
     async def test_judge_verified_scenario(self, sample_product: Product) -> None:
         judge = GeminiJudge(api_key="test-key")
+        judge.openrouter_api_key = None
         judge._client = MagicMock()
 
         mock_output = LLMJudgeOutput(
@@ -135,6 +137,7 @@ class TestGeminiJudge:
         self, sample_product: Product
     ) -> None:
         judge = GeminiJudge(api_key="test-key")
+        judge.openrouter_api_key = None
         judge._client = MagicMock()
 
         mock_output = LLMJudgeOutput(
@@ -186,6 +189,7 @@ class TestGeminiJudge:
             current_specs={},
         )
         judge = GeminiJudge(api_key="test-key")
+        judge.openrouter_api_key = None
         judge._client = MagicMock()
 
         mock_output = LLMJudgeOutput(
