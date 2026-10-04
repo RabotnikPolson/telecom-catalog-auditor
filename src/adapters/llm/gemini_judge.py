@@ -1,12 +1,13 @@
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
 from google import genai
 from google.genai import types
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from config.settings import get_settings
 from src.domain.entities import AuditResult, AuditStatus, DiscrepancyItem, MissingSpecItem, Product
@@ -14,17 +15,44 @@ from .prompts import AUDIT_SYSTEM_PROMPT, build_audit_user_prompt
 
 
 class LLMDiscrepancy(BaseModel):
-    spec_name: str = Field(...)
-    shop_value: str = Field(...)
-    reference_value: str = Field(...)
-    proof_quote: str = Field(...)
+    spec_name: str = Field(default="")
+    shop_value: str = Field(default="")
+    reference_value: str = Field(default="")
+    proof_quote: str = Field(default="")
     severity: str = Field(default="warning")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "shop_value" not in data or not data["shop_value"]:
+                for alt in ("store_value", "current_value", "our_value", "shop_val", "value"):
+                    if alt in data and data[alt]:
+                        data["shop_value"] = str(data[alt])
+                        break
+            if "reference_value" not in data or not data["reference_value"]:
+                for alt in ("ref_value", "external_value", "reference_val"):
+                    if alt in data and data[alt]:
+                        data["reference_value"] = str(data[alt])
+                        break
+        return data
 
 
 class LLMMissingSpec(BaseModel):
-    spec_name: str = Field(...)
-    reference_value: str = Field(...)
-    proof_quote: str = Field(...)
+    spec_name: str = Field(default="")
+    reference_value: str = Field(default="")
+    proof_quote: str = Field(default="")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_missing(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "reference_value" not in data or not data["reference_value"]:
+                for alt in ("ref_value", "external_value", "value"):
+                    if alt in data and data[alt]:
+                        data["reference_value"] = str(data[alt])
+                        break
+        return data
 
 
 class LLMJudgeOutput(BaseModel):
@@ -94,6 +122,7 @@ class GeminiJudge:
                         {"role": "user", "content": user_msg},
                     ],
                     "temperature": 0.0,
+                    "max_tokens": 100,
                 }
                 headers = {
                     "Authorization": f"Bearer {self.openrouter_api_key}",
@@ -140,7 +169,7 @@ class GeminiJudge:
                 discrepancies=[],
                 matched_specs_count=0,
                 total_specs_count=len(product.current_specs),
-                details="Neither OPENROUTER_API_KEY nor GEMINI_API_KEY is configured",
+                details="API key is not configured (neither OPENROUTER_API_KEY nor GEMINI_API_KEY is available)",
             )
 
         user_prompt = build_audit_user_prompt(
@@ -168,6 +197,7 @@ class GeminiJudge:
                     ],
                     "response_format": {"type": "json_object"},
                     "temperature": 0.1,
+                    "max_tokens": 4000,
                 }
                 headers = {
                     "Authorization": f"Bearer {self.openrouter_api_key}",
@@ -205,7 +235,12 @@ class GeminiJudge:
             llm_time_sec = time.perf_counter() - t_llm_start
             cost_usd = (input_tokens * 0.00000010) + (output_tokens * 0.00000040)
 
-            output = LLMJudgeOutput.model_validate_json(raw_text)
+            clean_json_str = raw_text.strip()
+            if clean_json_str.startswith("```"):
+                clean_json_str = re.sub(r"^```(?:json)?\s*", "", clean_json_str, flags=re.I)
+                clean_json_str = re.sub(r"\s*```$", "", clean_json_str)
+
+            output = LLMJudgeOutput.model_validate_json(clean_json_str)
 
             status_str = output.status.strip().upper()
             try:
@@ -222,8 +257,19 @@ class GeminiJudge:
             valid_discrepancies = []
             for d in output.discrepancies:
                 ref_val = (d.reference_value or "").strip().lower()
+                shop_val = (d.shop_value or "").strip().lower()
                 quote_val = (d.proof_quote or "").strip().lower()
                 if ref_val in placeholder_markers or quote_val in placeholder_markers:
+                    continue
+                # If shop_value is missing or placeholder, this is actually a missing spec, not a discrepancy!
+                if not shop_val or shop_val in ("нет", "отсутствует", "не указано", "n/a", "none"):
+                    output.missing_specs.append(
+                        LLMMissingSpec(
+                            spec_name=d.spec_name,
+                            reference_value=d.reference_value,
+                            proof_quote=d.proof_quote,
+                        )
+                    )
                     continue
                 valid_discrepancies.append(d)
 

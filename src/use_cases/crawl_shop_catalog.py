@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
 from typing import Callable, Optional
+from src.adapters.catalog.mysql_reader import MySQLCatalogReader
 from src.adapters.catalog.telecom_crawler import LeafCategory, TelecomShopCrawler
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
 from src.domain.entities import AuditStatus, Product
@@ -25,12 +26,14 @@ class CrawlShopCatalogUseCase:
 
     def __init__(
         self,
-        crawler: TelecomShopCrawler,
-        repository: SQLiteProductRepository,
+        crawler: Optional[TelecomShopCrawler] = None,
+        repository: Optional[SQLiteProductRepository] = None,
+        mysql_reader: Optional[MySQLCatalogReader] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.crawler = crawler
         self.repo = repository
+        self.mysql_reader = mysql_reader
         self.progress_callback = progress_callback
 
     def _notify(self, message: str) -> None:
@@ -38,12 +41,55 @@ class CrawlShopCatalogUseCase:
             self.progress_callback(message)
         logger.info(message)
 
+    async def sync_from_mysql(
+        self,
+        limit: int | None = None,
+        batch_size: int = 500,
+        category_id: int | None = None,
+    ) -> CrawlRunStats:
+        """Fast catalog ingestion directly from shop MySQL database."""
+        if not self.mysql_reader:
+            raise ValueError("MySQLCatalogReader must be provided for MySQL sync")
+        if not self.repo:
+            raise ValueError("SQLiteProductRepository must be provided for MySQL sync")
+
+        stats = CrawlRunStats()
+        self._notify("Starting fast catalog sync directly from shop MySQL (READ-ONLY)...")
+
+        async with self.mysql_reader:
+            total_db = await self.mysql_reader.count_products(category_id=category_id)
+            target_limit = min(limit, total_db) if limit is not None else total_db
+            self._notify(f"Total available products in MySQL: {total_db} (Target limit: {target_limit})")
+
+            async for batch in self.mysql_reader.stream_products(
+                batch_size=batch_size, limit=limit, category_id=category_id
+            ):
+                stats.products_seen += len(batch)
+                inserted = self.repo.batch_upsert(batch)
+                stats.products_added += inserted
+                self._notify(
+                    f"Sync progress: {stats.products_seen}/{target_limit} products processed ({inserted} upserted into local DB)..."
+                )
+
+        self._notify(f"MySQL catalog sync finished: {stats.products_seen} products saved.")
+        return stats
+
     async def execute(
         self,
         category_path: Optional[str] = None,
         limit: Optional[int] = None,
         force_rescan: bool = False,
+        source: str = "mysql",
     ) -> CrawlRunStats:
+        if source == "mysql" and self.mysql_reader:
+            category_id = int(category_path) if category_path and category_path.isdigit() else None
+            return await self.sync_from_mysql(limit=limit, category_id=category_id)
+
+        if not self.crawler:
+            raise ValueError("TelecomShopCrawler must be provided for web crawler mode")
+        if not self.repo:
+            raise ValueError("SQLiteProductRepository must be provided")
+
         stats = CrawlRunStats()
 
         target_categories: list[LeafCategory] = []

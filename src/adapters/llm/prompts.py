@@ -39,6 +39,35 @@ RULES:
    - Provide ONLY a concise 1-sentence factual summary of the audit verdict in Russian.
    - Example (VERIFIED): "Все заявленные характеристики витрины полностью подтверждены эталоном."
    - Example (MISMATCH): "Обнаружено расхождение по видеокарте (витрина: RTX 3070, эталон: RTX 3070 Ti); выявлено 5 недостающих характеристик."
+
+6. OUTPUT JSON FORMAT (STRICT):
+Output a single valid JSON object strictly matching this schema:
+{
+  "status": "VERIFIED" | "MISMATCH" | "MISSING_SPECS" | "NOT_FOUND",
+  "confidence_score": 0.0 to 1.0,
+  "matched_specs_count": integer,
+  "total_specs_count": integer,
+  "discrepancies": [
+    {
+      "spec_name": "string",
+      "shop_value": "string (value on store)",
+      "reference_value": "string (conflicting value in reference)",
+      "proof_quote": "exact quote from reference",
+      "severity": "critical" | "warning"
+    }
+  ],
+  "missing_specs": [
+    {
+      "spec_name": "string",
+      "reference_value": "string",
+      "proof_quote": "exact quote from reference"
+    }
+  ],
+  "details": "1-sentence summary"
+}
+CRITICAL RULES:
+- Every item in "discrepancies" MUST have BOTH "shop_value" AND "reference_value".
+- If a technical characteristic is present on the reference page but was NOT stated on the store at all, it belongs in "missing_specs", NEVER in "discrepancies"!
 """
 
 

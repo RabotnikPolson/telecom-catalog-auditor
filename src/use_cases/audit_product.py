@@ -79,13 +79,13 @@ class AuditProductUseCase:
                         external_markdown = parsed.get("markdown", cached_raw) if isinstance(parsed, dict) else cached_raw
                     except Exception:
                         external_markdown = cached_raw
-                    if external_markdown and len(external_markdown.strip()) > 50:
+                    if external_markdown and len(external_markdown.strip()) > 0:
                         break
 
             t_crawl_start = time.perf_counter()
             crawl_res = await self.crawler.crawl(cand_url)
             crawler_time_sec += (time.perf_counter() - t_crawl_start)
-            if crawl_res.success and crawl_res.markdown and len(crawl_res.markdown.strip()) > 50:
+            if crawl_res.success and crawl_res.markdown and len(crawl_res.markdown.strip()) > 0:
                 external_markdown = crawl_res.markdown
                 cache_payload = json.dumps(
                     {

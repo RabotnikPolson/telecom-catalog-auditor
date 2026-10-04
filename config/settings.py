@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     OPENROUTER_API_KEY: str | None = Field(default=None)
     OPENROUTER_MODEL: str = Field(default="google/gemini-2.5-flash")
 
+    MYSQL_HOST: str | None = Field(default=None)
+    MYSQL_PORT: int = Field(default=3306)
+    MYSQL_USER: str | None = Field(default=None)
+    MYSQL_PASSWORD: str | None = Field(default=None)
+    MYSQL_DATABASE: str = Field(default="laravel")
+
     @property
     def db_file_path(self) -> Path:
         return Path(self.DATABASE_PATH)

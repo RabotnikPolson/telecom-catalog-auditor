@@ -14,6 +14,7 @@ except ImportError:
     pass
 
 from config.settings import get_settings
+from src.adapters.catalog.mysql_reader import MySQLCatalogReader
 from src.adapters.catalog.telecom_crawler import TelecomShopCrawler
 from src.adapters.crawler.web_crawler import WebCrawler
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
@@ -40,6 +41,40 @@ async def run_crawl_command(args: argparse.Namespace) -> int:
 
     db_path = Path(args.db)
     repo = SQLiteProductRepository(db_path)
+    settings = get_settings()
+
+    source = getattr(args, "source", "mysql")
+    if source == "mysql" and settings.MYSQL_HOST:
+        def on_progress(msg: str) -> None:
+            print(f"  [+] {msg}")
+
+        print("=" * 70)
+        print("TELECOM CATALOG AUDITOR :: HIGH-SPEED MYSQL INGESTION")
+        print("=" * 70)
+        print(f"Target DB     : {db_path.resolve()}")
+        print(f"WAL Mode      : {'ACTIVE' if repo.check_wal_mode() else 'INACTIVE'}")
+        print(f"MySQL Source  : {settings.MYSQL_HOST}:{settings.MYSQL_PORT}/{settings.MYSQL_DATABASE}")
+        print(f"Product Limit : {args.limit or 'NO LIMIT'}")
+        print("-" * 70)
+
+        mysql_reader = MySQLCatalogReader()
+        use_case = CrawlShopCatalogUseCase(
+            mysql_reader=mysql_reader,
+            repository=repo,
+            progress_callback=on_progress,
+        )
+        stats = await use_case.execute(
+            category_path=args.category,
+            limit=args.limit,
+            source="mysql",
+        )
+        print("-" * 70)
+        print("MYSQL INGESTION COMPLETED")
+        print(f"Total Products Seen  : {stats.products_seen}")
+        print(f"Products Upserted    : {stats.products_added}")
+        print(f"Total Products in DB : {repo.count_products()}")
+        print("=" * 70)
+        return 0
 
     if getattr(args, "reset_state", False):
         repo.reset_crawler_state(args.category)
@@ -146,6 +181,82 @@ def _extract_target_keys(args: argparse.Namespace) -> list[str]:
     return unique_keys
 
 
+async def _live_sync_products(
+    target_keys: list[str],
+    repo: SQLiteProductRepository,
+    source: str = "mysql",
+) -> list[Product]:
+    """
+    Live-sync product details before resolution or audit.
+    Prioritizes fast direct MySQL read, falls back to web crawler or local DB cache.
+    """
+    settings = get_settings()
+    products: list[Product] = []
+    keys_to_fetch = list(target_keys)
+
+    # 1. Try MySQL first if available and selected
+    if source == "mysql" and settings.MYSQL_HOST:
+        print(f"[*] Live syncing {len(keys_to_fetch)} product(s) directly from shop MySQL (READ-ONLY)...")
+        try:
+            async with MySQLCatalogReader() as mysql_reader:
+                remaining_keys = []
+                for key in keys_to_fetch:
+                    p = None
+                    try:
+                        p = await mysql_reader.fetch_product(key)
+                        if p:
+                            repo.save_product(p)
+                            print(f"  [+] MySQL sync OK: Key '{key}' -> ID #{p.product_id} | Shop SKU: {p.shop_sku or 'N/A'} | {p.title[:50]}")
+                            print(f"      Current specs: {len(p.current_specs)} items | Barcode: {p.barcode or 'N/A'}")
+                            products.append(p)
+                    except Exception as e:
+                        print(f"  [!] MySQL error for key '{key}': {e}")
+
+                    if not p:
+                        remaining_keys.append(key)
+                keys_to_fetch = remaining_keys
+        except Exception as e:
+            print(f"  [!] MySQL connection error: {e}. Falling back to web crawler / local DB.")
+
+    # 2. For any remaining keys, fallback to TelecomShopCrawler
+    if keys_to_fetch:
+        print(f"[*] Fallback: web-fetching {len(keys_to_fetch)} product(s) from shop.telecom.kz...")
+        async with TelecomShopCrawler(delay_min=0.1, delay_max=0.3) as shop_crawler:
+            for key in keys_to_fetch:
+                p = None
+                try:
+                    details = await shop_crawler.fetch_product_on_the_fly(str(key))
+                    if details:
+                        p = Product(
+                            product_id=details.product_id,
+                            shop_sku=details.shop_sku,
+                            title=details.title,
+                            url=details.detail_url,
+                            vendor_name=details.vendor_name,
+                            vendor_sku=details.vendor_sku,
+                            manufacturer_sku=details.manufacturer_sku,
+                            barcode=details.barcode,
+                            current_specs=details.current_specs,
+                        )
+                        repo.save_product(p)
+                        print(f"  [+] Web crawl OK: SKU/ID '{key}' -> ID #{p.product_id} | Shop SKU: {p.shop_sku or 'N/A'} | {p.title[:50]}")
+                        print(f"      Current specs on store: {len(p.current_specs)} items.")
+                except Exception:
+                    pass
+
+                if not p:
+                    p = repo.find_product(key)
+                    if p:
+                        print(f"  [*] Using cached record from local DB: ID #{p.product_id} ({p.title[:50]})")
+
+                if p:
+                    products.append(p)
+                else:
+                    print(f"  [!] Warning: Product '{key}' not found in MySQL, on shop.telecom.kz, or in DB (skipping).")
+
+    return products
+
+
 async def run_resolve_command(args: argparse.Namespace) -> int:
     setup_utf8_terminal()
     db_path = Path(args.db)
@@ -175,39 +286,8 @@ async def run_resolve_command(args: argparse.Namespace) -> int:
     products: list[Product] = []
 
     if target_keys:
-        print(f"[*] Live syncing {len(target_keys)} product(s) from shop.telecom.kz...")
-        async with TelecomShopCrawler(delay_min=0.1, delay_max=0.3) as shop_crawler:
-            for key in target_keys:
-                p = None
-                try:
-                    details = await shop_crawler.fetch_product_on_the_fly(str(key))
-                    if details:
-                        p = Product(
-                            product_id=details.product_id,
-                            shop_sku=details.shop_sku,
-                            title=details.title,
-                            url=details.detail_url,
-                            vendor_name=details.vendor_name,
-                            vendor_sku=details.vendor_sku,
-                            manufacturer_sku=details.manufacturer_sku,
-                            barcode=details.barcode,
-                            current_specs=details.current_specs,
-                        )
-                        repo.save_product(p)
-                        print(f"  [+] Live sync OK: SKU/ID '{key}' -> ID #{p.product_id} | Shop SKU: {p.shop_sku or 'N/A'} | {p.title[:50]}")
-                except Exception:
-                    pass
-
-                if not p:
-                    p = repo.find_product(key)
-                    if p:
-                        print(f"  [*] Using cached record from local DB: ID #{p.product_id} ({p.title[:50]})")
-
-                if p:
-                    products.append(p)
-                else:
-                    print(f"  [!] Warning: Product '{key}' not found on shop.telecom.kz or in DB (skipping).")
-
+        source_mode = getattr(args, "source", "mysql")
+        products = await _live_sync_products(target_keys, repo, source=source_mode)
         if not products:
             print(f"[ERROR] None of the specified products {target_keys} were found.")
             return 1
@@ -350,41 +430,8 @@ async def run_audit_command(args: argparse.Namespace) -> int:
     target_keys = _extract_target_keys(args)
 
     if target_keys:
-        products = []
-        print(f"[*] Live syncing {len(target_keys)} product(s) from shop.telecom.kz...")
-        async with TelecomShopCrawler(delay_min=0.1, delay_max=0.3) as shop_crawler:
-            for key in target_keys:
-                target = None
-                try:
-                    details = await shop_crawler.fetch_product_on_the_fly(str(key))
-                    if details:
-                        target = Product(
-                            product_id=details.product_id,
-                            shop_sku=details.shop_sku,
-                            title=details.title,
-                            url=details.detail_url,
-                            vendor_name=details.vendor_name,
-                            vendor_sku=details.vendor_sku,
-                            manufacturer_sku=details.manufacturer_sku,
-                            barcode=details.barcode,
-                            current_specs=details.current_specs,
-                        )
-                        repo.save_product(target)
-                        print(f"  [+] Live sync OK: SKU/ID '{key}' -> ID #{target.product_id} | Shop SKU: {target.shop_sku or 'N/A'} | {target.title[:50]}")
-                        print(f"      Current specs on store: {len(target.current_specs)} items.")
-                except Exception:
-                    pass
-
-                if not target:
-                    target = repo.find_product(key)
-                    if target:
-                        print(f"  [*] Using cached record from local DB: ID #{target.product_id} ({target.title[:50]})")
-
-                if target:
-                    products.append(target)
-                else:
-                    print(f"  [!] Warning: Product '{key}' not found on shop.telecom.kz or in DB (skipping).")
-
+        source_mode = getattr(args, "source", "mysql")
+        products = await _live_sync_products(target_keys, repo, source=source_mode)
         if not products:
             print(f"[!] Error: None of the specified products {target_keys} were found.")
             return 1
@@ -561,6 +608,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reset crawler_state for target category before running",
     )
     crawl_parser.add_argument(
+        "--source",
+        choices=["mysql", "crawler"],
+        default="mysql" if get_settings().MYSQL_HOST else "crawler",
+        help="Catalog source: mysql (fast direct DB read) or crawler (web scraper)",
+    )
+    crawl_parser.add_argument(
         "--db",
         type=str,
         default="catalog_audit.db",
@@ -606,6 +659,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--verify",
         action="store_true",
         help="Verify direct URLs with HTTP HEAD",
+    )
+    resolve_parser.add_argument(
+        "--source",
+        choices=["mysql", "crawler"],
+        default="mysql" if get_settings().MYSQL_HOST else "crawler",
+        help="Live sync source: mysql or crawler",
     )
     resolve_parser.add_argument(
         "--db",
@@ -690,6 +749,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--force-refresh",
         action="store_true",
         help="Bypass specs_cache and refetch external page",
+    )
+    audit_parser.add_argument(
+        "--source",
+        choices=["mysql", "crawler"],
+        default="mysql" if get_settings().MYSQL_HOST else "crawler",
+        help="Live sync source: mysql or crawler",
     )
     audit_parser.add_argument(
         "--db",
