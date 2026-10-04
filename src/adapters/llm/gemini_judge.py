@@ -65,6 +65,52 @@ class LLMJudgeOutput(BaseModel):
     details: str = Field(default="")
 
 
+def _normalize_tech_val(val: str) -> str:
+    """Normalizes technology terms, units, and punctuation for strict equivalence checking."""
+    v = val.lower()
+    v = re.sub(r"\brj-?45\b", "ethernet", v)
+    v = re.sub(r"\btype-?c\b", "usb-c", v)
+    v = re.sub(r"\bwi-?fi\b", "wifi", v)
+    v = re.sub(r"\bmah\b", "мач", v)
+    v = re.sub(r"\bgb\b", "гб", v)
+    v = re.sub(r"\btb\b", "тб", v)
+    return re.sub(r"[\s\-_/+,.:;()]+", "", v)
+
+
+def _is_equivalent_value(val1: str, val2: str) -> bool:
+    """Checks if two specification values are semantically identical."""
+    if not val1 or not val2:
+        return False
+    norm1 = _normalize_tech_val(val1)
+    norm2 = _normalize_tech_val(val2)
+    return norm1 == norm2
+
+
+def _is_cross_domain_mismatch(shop_val: str, ref_val: str) -> bool:
+    """
+    Checks if shop_val and ref_val belong to fundamentally incompatible physical measurement domains.
+    For example: coverage area (sq.m) vs device count (units), or power source vs lamp socket.
+    """
+    s = shop_val.lower()
+    r = ref_val.lower()
+
+    # 1. Area (sq.m) vs Device count (devices, clients, pcs)
+    area_markers = ("кв.м", "кв. м", "м²", "м2", "sqm", "кв. метр")
+    count_markers = ("устройств", "клиент", "шт", "подключен", "devices", "clients")
+    if (any(m in s for m in area_markers) and any(m in r for m in count_markers)) or \
+       (any(m in r for m in area_markers) and any(m in s for m in count_markers)):
+        return True
+
+    # 2. Power source vs Lamp Base / Socket
+    power_markers = ("от сети", "аккумулятор", "батарейк", "мач", "mah", "220в", "220 v")
+    socket_markers = ("цокол", "e27", "e14", "gu10", "без цоколя", "светодиодн")
+    if (any(m in s for m in power_markers) and any(m in r for m in socket_markers)) or \
+       (any(m in r for m in power_markers) and any(m in s for m in socket_markers)):
+        return True
+
+    return False
+
+
 class GeminiJudge:
 
     def __init__(
@@ -271,11 +317,36 @@ class GeminiJudge:
                         )
                     )
                     continue
+
+                # Discard if values are semantically identical (e.g. Ethernet + SFP vs Ethernet + SFP)
+                if _is_equivalent_value(d.shop_value, d.reference_value):
+                    continue
+
+                # Discard if comparing incompatible physical domains (e.g. sq.m vs connected devices)
+                if _is_cross_domain_mismatch(d.shop_value, d.reference_value):
+                    continue
+
                 valid_discrepancies.append(d)
+
+            # Filter out excluded categories from missing_specs (warranty, lifespan/service life)
+            excluded_missing_keywords = (
+                "гаранти",          # гарантия продавца / производителя, гарантийный срок
+                "срок эксплуат",    # срок эксплуатации
+                "срок служб",       # срок службы
+                "warranty",
+                "service life",
+            )
+            output.missing_specs = [
+                m for m in output.missing_specs
+                if not any(kw in (m.spec_name or "").lower() for kw in excluded_missing_keywords)
+            ]
 
             if not valid_discrepancies and audit_status == AuditStatus.MISMATCH:
                 audit_status = AuditStatus.VERIFIED
                 output.details = f"Все заявленные характеристики витрины подтверждены эталоном; выявлено {len(output.missing_specs)} характеристик для обогащения."
+            elif valid_discrepancies and len(valid_discrepancies) < len(output.discrepancies):
+                spec_names = ", ".join(f"'{d.spec_name}'" for d in valid_discrepancies[:3])
+                output.details = f"Обнаружено расхождение по характеристикам: {spec_names}; выявлено {len(output.missing_specs)} недостающих характеристик."
 
             discrepancy_items = [
                 DiscrepancyItem(

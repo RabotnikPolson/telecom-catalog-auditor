@@ -45,6 +45,7 @@ class ResolveReferenceUseCase:
         whitelist_domains: Optional[list[str]] = None,
         verify_direct_urls: bool = False,
         judge: Optional[Any] = None,
+        use_url_cache: bool = True,
     ) -> None:
         self.repo = repository
         self.vendor_resolver = vendor_resolver
@@ -52,6 +53,7 @@ class ResolveReferenceUseCase:
         self.whitelist_domains = whitelist_domains
         self.verify_direct_urls = verify_direct_urls
         self.judge = judge
+        self.use_url_cache = use_url_cache
 
     def is_nameless_generic_product(self, product: Product) -> bool:
         if product.barcode and product.barcode.strip():
@@ -97,17 +99,18 @@ class ResolveReferenceUseCase:
         if has_trusted_vendor and has_vendor_sku:
             cached_query = f"vendor:{product.vendor_name}:{product.vendor_sku}"
             q_hash = self.compute_query_hash(product, cached_query)
-            cached_url = self.repo.get_url_cache(q_hash)
-            if cached_url:
-                return ResolvedReference(
-                    product_id=product.product_id,
-                    reference_url=cached_url,
-                    source_type="CACHE",
-                    query_used=cached_query,
-                    scenario_applied="SCENARIO_1_VENDOR_DIRECT",
-                    status="FOUND",
-                    is_cached=True,
-                )
+            if self.use_url_cache:
+                cached_url = self.repo.get_url_cache(q_hash)
+                if cached_url:
+                    return ResolvedReference(
+                        product_id=product.product_id,
+                        reference_url=cached_url,
+                        source_type="CACHE",
+                        query_used=cached_query,
+                        scenario_applied="SCENARIO_1_VENDOR_DIRECT",
+                        status="FOUND",
+                        is_cached=True,
+                    )
 
             if self.verify_direct_urls:
                 res = await self.vendor_resolver.resolve_vendor_card(
@@ -249,18 +252,19 @@ class ResolveReferenceUseCase:
                 clean_model_query = f"{clean_model_query} характеристики"
 
         q_hash = self.compute_query_hash(product, clean_model_query)
-        cached_url = self.repo.get_url_cache(q_hash)
-        if cached_url and is_whitelisted_domain(cached_url, extra_domains=self.whitelist_domains):
-            return ResolvedReference(
-                product_id=product.product_id,
-                reference_url=cached_url,
-                source_type="CACHE",
-                query_used=clean_model_query,
-                scenario_applied=scenario_override,
-                status="FOUND",
-                candidate_urls=[cached_url],
-                is_cached=True,
-            )
+        if self.use_url_cache:
+            cached_url = self.repo.get_url_cache(q_hash)
+            if cached_url and is_whitelisted_domain(cached_url, extra_domains=self.whitelist_domains):
+                return ResolvedReference(
+                    product_id=product.product_id,
+                    reference_url=cached_url,
+                    source_type="CACHE",
+                    query_used=clean_model_query,
+                    scenario_applied=scenario_override,
+                    status="FOUND",
+                    candidate_urls=[cached_url],
+                    is_cached=True,
+                )
 
         results = await self.serper_client.search_and_filter(
             query=clean_model_query,
