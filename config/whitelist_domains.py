@@ -62,3 +62,43 @@ def is_whitelisted_domain(
             return True
 
     return False
+
+
+DOMAIN_PRIORITY_MAP: dict[str, int] = {
+    "kaspi.kz": 1,
+    "dns-shop.kz": 3,
+    "technodom.kz": 4,
+    "shop.kz": 4,
+    "mechta.kz": 4,
+    "sulpak.kz": 4,
+    "fora.kz": 4,
+    "al-style.kz": 5,
+    "e-katalog.kz": 5,
+    "marvel.kz": 5,
+    "treolan.kz": 5,
+    "asbis.kz": 5,
+    "rrc.kz": 5,
+}
+
+
+def get_domain_priority(url: str, brand: str | None = None) -> int:
+    target_domain = extract_domain(url)
+    if not target_domain:
+        return 10
+
+    if target_domain == "kaspi.kz" or target_domain.endswith(".kaspi.kz"):
+        return 1
+
+    if brand:
+        b = brand.lower().strip()
+        if len(b) >= 2:
+            # Check strictly with dot, e.g. "mi." to avoid collisions with "microsoft" or "mechta"
+            if target_domain.startswith(f"{b}.") or f".{b}." in target_domain:
+                return 2
+
+    for domain_name, priority in DOMAIN_PRIORITY_MAP.items():
+        if target_domain == domain_name or target_domain.endswith(f".{domain_name}"):
+            return priority
+
+    return 10
+

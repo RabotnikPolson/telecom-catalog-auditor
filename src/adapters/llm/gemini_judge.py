@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -66,11 +67,8 @@ class LLMJudgeOutput(BaseModel):
 
 
 def _normalize_tech_val(val: str) -> str:
-    """Normalizes technology terms, units, and punctuation for strict equivalence checking."""
+    """Normalizes standard metric units and punctuation for strict equivalence checking."""
     v = val.lower()
-    v = re.sub(r"\brj-?45\b", "ethernet", v)
-    v = re.sub(r"\btype-?c\b", "usb-c", v)
-    v = re.sub(r"\bwi-?fi\b", "wifi", v)
     v = re.sub(r"\bmah\b", "мач", v)
     v = re.sub(r"\bgb\b", "гб", v)
     v = re.sub(r"\btb\b", "тб", v)
@@ -78,37 +76,12 @@ def _normalize_tech_val(val: str) -> str:
 
 
 def _is_equivalent_value(val1: str, val2: str) -> bool:
-    """Checks if two specification values are semantically identical."""
+    """Checks if two specification values are strictly identical (ignoring case, whitespace, separators)."""
     if not val1 or not val2:
         return False
     norm1 = _normalize_tech_val(val1)
     norm2 = _normalize_tech_val(val2)
     return norm1 == norm2
-
-
-def _is_cross_domain_mismatch(shop_val: str, ref_val: str) -> bool:
-    """
-    Checks if shop_val and ref_val belong to fundamentally incompatible physical measurement domains.
-    For example: coverage area (sq.m) vs device count (units), or power source vs lamp socket.
-    """
-    s = shop_val.lower()
-    r = ref_val.lower()
-
-    # 1. Area (sq.m) vs Device count (devices, clients, pcs)
-    area_markers = ("кв.м", "кв. м", "м²", "м2", "sqm", "кв. метр")
-    count_markers = ("устройств", "клиент", "шт", "подключен", "devices", "clients")
-    if (any(m in s for m in area_markers) and any(m in r for m in count_markers)) or \
-       (any(m in r for m in area_markers) and any(m in s for m in count_markers)):
-        return True
-
-    # 2. Power source vs Lamp Base / Socket
-    power_markers = ("от сети", "аккумулятор", "батарейк", "мач", "mah", "220в", "220 v")
-    socket_markers = ("цокол", "e27", "e14", "gu10", "без цоколя", "светодиодн")
-    if (any(m in s for m in power_markers) and any(m in r for m in socket_markers)) or \
-       (any(m in r for m in power_markers) and any(m in s for m in socket_markers)):
-        return True
-
-    return False
 
 
 class GeminiJudge:
@@ -149,11 +122,14 @@ class GeminiJudge:
         """
         clean_title = title.strip()
         system_msg = (
-            "Ты поисковый ассистент каталога электроники в Казахстане. "
-            "Получив сырое название товара с витрины магазина, сформируй краткий, идеальный поисковый запрос (Бренд + Модель + ключевая модификация, например объем памяти или версия). "
-            "Удали цвета (синий, оранжевый, белый и т.д.), категорию устройства (смартфон, умная колонка, настольная лампа, батарейка, mesh-система), "
-            "маркетинговые фразы (до ~425 кв.м., с гибкой ножкой, 2-pack) и внутренние складские артикулы. "
-            "Ответь ТОЛЬКО очищенной поисковой фразой на одной строке без кавычек, знаков препинания и пояснений."
+            "Ты поисковый ассистент каталога электроники. Твоя задача — извлечь из сырого названия товара "
+            "краткую, чистую поисковую фразу по строгой формуле: [Бренд] + [Модель] + [Аппаратная модификация (память, процессор, ревизия, если есть)]. "
+            "ПРАВИЛА ОЧИСТКИ: "
+            "1. Удали начальное общее наименование категории товара (любые вводные существительные типа «смартфон», «ноутбук», «пылесос» и т.д.). "
+            "2. Удали цвет, рекламные лозунги, маркетинговые описания свойств, комплектацию и упаковочный шум. "
+            "3. Если в скобках указан номер ревизии, модели или аппаратный параметр (память/накопитель) — сохрани его. Рекламный текст и лозунги в скобках удали. "
+            "4. Удали внутренние складские артикулы магазина. "
+            "Ответь ТОЛЬКО очищенной строкой на одной строке без кавычек и знаков препинания в конце."
         )
         user_msg = f"Название товара: {clean_title}"
         if vendor_name and "склад" not in vendor_name.lower():
@@ -251,14 +227,19 @@ class GeminiJudge:
                     "X-Title": "Telecom Catalog Auditor",
                 }
                 async with httpx.AsyncClient(timeout=45.0) as client:
-                    resp = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers)
-                    if resp.status_code != 200:
-                        raise RuntimeError(f"OpenRouter HTTP {resp.status_code}: {resp.text}")
-                    data = resp.json()
-                    raw_text = data["choices"][0]["message"]["content"] or "{}"
-                    usage = data.get("usage", {})
-                    input_tokens = usage.get("prompt_tokens", 0) or 0
-                    output_tokens = usage.get("completion_tokens", 0) or 0
+                    for attempt in range(3):
+                        resp = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers)
+                        if resp.status_code == 429 and attempt < 2:
+                            await asyncio.sleep(3.0 * (attempt + 1))
+                            continue
+                        if resp.status_code != 200:
+                            raise RuntimeError(f"OpenRouter HTTP {resp.status_code}: {resp.text}")
+                        data = resp.json()
+                        raw_text = data["choices"][0]["message"]["content"] or "{}"
+                        usage = data.get("usage", {})
+                        input_tokens = usage.get("prompt_tokens", 0) or 0
+                        output_tokens = usage.get("completion_tokens", 0) or 0
+                        break
             else:
                 config = types.GenerateContentConfig(
                     system_instruction=AUDIT_SYSTEM_PROMPT,
@@ -320,10 +301,6 @@ class GeminiJudge:
 
                 # Discard if values are semantically identical (e.g. Ethernet + SFP vs Ethernet + SFP)
                 if _is_equivalent_value(d.shop_value, d.reference_value):
-                    continue
-
-                # Discard if comparing incompatible physical domains (e.g. sq.m vs connected devices)
-                if _is_cross_domain_mismatch(d.shop_value, d.reference_value):
                     continue
 
                 valid_discrepancies.append(d)

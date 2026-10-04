@@ -254,6 +254,12 @@ class SQLiteProductRepository:
             row = cursor.fetchone()
             return row["resolved_url"] if row else None
 
+    def delete_url_cache_by_url(self, resolved_url: str) -> None:
+        sql = "DELETE FROM url_cache WHERE resolved_url = ?;"
+        with get_sqlite_connection(self.db_path) as conn:
+            conn.execute(sql, (resolved_url,))
+            conn.commit()
+
     def save_specs_cache(
         self,
         resolved_url: str,
@@ -281,6 +287,12 @@ class SQLiteProductRepository:
             cursor = conn.execute(sql, (resolved_url,))
             row = cursor.fetchone()
             return row["specs_json"] if row else None
+
+    def delete_specs_cache(self, resolved_url: str) -> None:
+        sql = "DELETE FROM specs_cache WHERE resolved_url = ?;"
+        with get_sqlite_connection(self.db_path) as conn:
+            conn.execute(sql, (resolved_url,))
+            conn.commit()
 
     def check_wal_mode(self) -> bool:
         with get_sqlite_connection(self.db_path) as conn:

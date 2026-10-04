@@ -39,7 +39,10 @@ class AuditProductUseCase:
         else:
             resolver_fn = getattr(self.reference_resolver, "execute", None) or getattr(self.reference_resolver, "resolve", None)
             if resolver_fn:
-                call_res = resolver_fn(product)
+                try:
+                    call_res = resolver_fn(product, force_refresh=force_refresh)
+                except TypeError:
+                    call_res = resolver_fn(product)
                 resolved = await call_res if asyncio.iscoroutine(call_res) else call_res
             else:
                 resolved = None
@@ -105,6 +108,10 @@ class AuditProductUseCase:
                 continue
 
         if not external_markdown:
+            if target_url:
+                self.product_repo.delete_url_cache_by_url(target_url)
+                self.product_repo.delete_specs_cache(target_url)
+
             result = AuditResult(
                 product_id=product.product_id,
                 status=AuditStatus.ERROR,
@@ -126,6 +133,10 @@ class AuditProductUseCase:
             reference_url=target_url,
             external_markdown=external_markdown,
         )
+        if result.status in (AuditStatus.NOT_FOUND, AuditStatus.ERROR) and target_url:
+            self.product_repo.delete_url_cache_by_url(target_url)
+            self.product_repo.delete_specs_cache(target_url)
+
         result.crawler_time_sec = round(crawler_time_sec, 2)
         result.execution_time_sec = round(time.perf_counter() - t_audit_start, 2)
         self.product_repo.save_audit_result(result)

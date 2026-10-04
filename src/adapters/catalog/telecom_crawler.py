@@ -367,8 +367,6 @@ class TelecomShopCrawler:
                 if sku_m2:
                     shop_sku = sku_m2.group(1).strip()
 
-        if not vendor_sku and shop_sku:
-            vendor_sku = shop_sku
 
         specs: dict[str, str] = {}
         spec_items = re.findall(

@@ -3,7 +3,7 @@ import hashlib
 import re
 from typing import Any, Optional
 from config.vendor_profiles import find_vendor_profile
-from config.whitelist_domains import is_whitelisted_domain
+from config.whitelist_domains import get_domain_priority, is_whitelisted_domain
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
 from src.adapters.search.serper_client import SerperClient
 from src.adapters.search.vendor_direct import VendorDirectResolver
@@ -81,7 +81,7 @@ class ResolveReferenceUseCase:
         key = f"ref:{product.product_id}:{query_str.strip().lower()}"
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
-    async def execute(self, product: Product) -> ResolvedReference:
+    async def execute(self, product: Product, force_refresh: bool = False) -> ResolvedReference:
         if self.is_nameless_generic_product(product):
             return ResolvedReference(
                 product_id=product.product_id,
@@ -99,7 +99,7 @@ class ResolveReferenceUseCase:
         if has_trusted_vendor and has_vendor_sku:
             cached_query = f"vendor:{product.vendor_name}:{product.vendor_sku}"
             q_hash = self.compute_query_hash(product, cached_query)
-            if self.use_url_cache:
+            if self.use_url_cache and not force_refresh:
                 cached_url = self.repo.get_url_cache(q_hash)
                 if cached_url:
                     return ResolvedReference(
@@ -139,7 +139,7 @@ class ResolveReferenceUseCase:
                         is_cached=False,
                     )
                 return await self._execute_search_cascade(
-                    product, scenario_override="SCENARIO_2_VENDOR_FALLBACK"
+                    product, scenario_override="SCENARIO_2_VENDOR_FALLBACK", force_refresh=force_refresh
                 )
 
             direct_url = self.vendor_resolver.build_direct_url(
@@ -159,16 +159,16 @@ class ResolveReferenceUseCase:
                 )
 
             return await self._execute_search_cascade(
-                product, scenario_override="SCENARIO_2_VENDOR_FALLBACK"
+                product, scenario_override="SCENARIO_2_VENDOR_FALLBACK", force_refresh=force_refresh
             )
 
         if has_trusted_vendor and not has_vendor_sku:
             return await self._execute_search_cascade(
-                product, scenario_override="SCENARIO_3_VENDOR_NO_SKU"
+                product, scenario_override="SCENARIO_3_VENDOR_NO_SKU", force_refresh=force_refresh
             )
 
         return await self._execute_search_cascade(
-            product, scenario_override="SCENARIO_4_EXTERNAL_SEARCH"
+            product, scenario_override="SCENARIO_4_EXTERNAL_SEARCH", force_refresh=force_refresh
         )
 
     def _build_title_query(self, product: Product) -> tuple[str, str]:
@@ -205,36 +205,23 @@ class ResolveReferenceUseCase:
         return self._build_title_query(product)
 
     def _sort_by_domain_priority(
-        self, results: list[dict[str, Any]], product: Product
+        self, results: list[dict[str, Any]], product: Product, clean_query: str | None = None
     ) -> list[dict[str, Any]]:
-        brand_candidates: list[str] = []
+        brand: str | None = None
         if product.vendor_name and "склад" not in product.vendor_name.lower():
-            brand_candidates.append(product.vendor_name.lower().strip())
-        for token in product.title.split():
-            clean_tok = re.sub(r"[^a-zA-Z0-9]", "", token).lower()
-            if len(clean_tok) >= 3 and clean_tok not in ("ноутбук", "смартфон", "телефон", "кабель", "планшет", "noutbuk", "smartfon"):
-                brand_candidates.append(clean_tok)
-                break
+            brand = product.vendor_name.strip()
+        elif clean_query:
+            parts = clean_query.split()
+            if parts:
+                brand = parts[0].strip()
 
-        def priority_score(item: dict[str, Any]) -> int:
-            link = str(item.get("link") or "").lower()
-            if "kaspi.kz" in link:
-                return 1
-            for b in brand_candidates:
-                if f"{b}." in link or f"/{b}" in link or f".{b}" in link:
-                    return 2
-            if "dns-shop.kz" in link:
-                return 3
-            if any(d in link for d in ["technodom.kz", "shop.kz", "mechta.kz", "sulpak.kz", "fora.kz"]):
-                return 4
-            if any(d in link for d in ["al-style.kz", "e-katalog.kz", "marvel.kz", "treolan.kz"]):
-                return 5
-            return 10
-
-        return sorted(results, key=priority_score)
+        return sorted(
+            results,
+            key=lambda item: get_domain_priority(str(item.get("link") or ""), brand=brand),
+        )
 
     async def _execute_search_cascade(
-        self, product: Product, scenario_override: str
+        self, product: Product, scenario_override: str, force_refresh: bool = False
     ) -> ResolvedReference:
         # STEP 1 (PRIMARY): Clean Brand + Model Search (via LLM query cleaner or heuristic)
         clean_model_query = None
@@ -252,7 +239,7 @@ class ResolveReferenceUseCase:
                 clean_model_query = f"{clean_model_query} характеристики"
 
         q_hash = self.compute_query_hash(product, clean_model_query)
-        if self.use_url_cache:
+        if self.use_url_cache and not force_refresh:
             cached_url = self.repo.get_url_cache(q_hash)
             if cached_url and is_whitelisted_domain(cached_url, extra_domains=self.whitelist_domains):
                 return ResolvedReference(
@@ -273,7 +260,7 @@ class ResolveReferenceUseCase:
         )
 
         if results:
-            sorted_res = self._sort_by_domain_priority(results, product)
+            sorted_res = self._sort_by_domain_priority(results, product, clean_query=clean_model_query)
             candidate_links = [
                 str(item.get("link") or "").strip()
                 for item in sorted_res
@@ -298,19 +285,19 @@ class ResolveReferenceUseCase:
         if product.barcode and product.barcode.strip():
             bc_query = f'"{product.barcode.strip()}" характеристики'
             q_hash_bc = self.compute_query_hash(product, bc_query)
-            cached_bc = self.repo.get_url_cache(q_hash_bc)
-
-            if cached_bc and is_whitelisted_domain(cached_bc, extra_domains=self.whitelist_domains):
-                return ResolvedReference(
-                    product_id=product.product_id,
-                    reference_url=cached_bc,
-                    source_type="CACHE",
-                    query_used=bc_query,
-                    scenario_applied=scenario_override,
-                    status="FOUND",
-                    candidate_urls=[cached_bc],
-                    is_cached=True,
-                )
+            if self.use_url_cache and not force_refresh:
+                cached_bc = self.repo.get_url_cache(q_hash_bc)
+                if cached_bc and is_whitelisted_domain(cached_bc, extra_domains=self.whitelist_domains):
+                    return ResolvedReference(
+                        product_id=product.product_id,
+                        reference_url=cached_bc,
+                        source_type="CACHE",
+                        query_used=bc_query,
+                        scenario_applied=scenario_override,
+                        status="FOUND",
+                        candidate_urls=[cached_bc],
+                        is_cached=True,
+                    )
 
             bc_results = await self.serper_client.search_and_filter(
                 query=bc_query,
@@ -318,7 +305,7 @@ class ResolveReferenceUseCase:
                 num_results=10,
             )
             if bc_results:
-                sorted_bc = self._sort_by_domain_priority(bc_results, product)
+                sorted_bc = self._sort_by_domain_priority(bc_results, product, clean_query=clean_model_query)
                 bc_candidate_links = [
                     str(item.get("link") or "").strip()
                     for item in sorted_bc

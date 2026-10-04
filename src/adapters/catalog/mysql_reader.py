@@ -165,13 +165,17 @@ class MySQLCatalogReader:
 
                 partner_info = partners.get(pid, {})
                 title = (row["title"] or "").strip() or f"Product #{pid}"
+                vendor_name = partner_info.get("vendor_name")
+                brand_name = (row.get("brand_name") or "").strip() or None
+                if (not vendor_name or "склад" in vendor_name.lower()) and brand_name:
+                    vendor_name = brand_name
 
                 return Product(
                     product_id=pid,
                     shop_sku=str(row["shop_sku"]).strip() if row["shop_sku"] else str(pid),
                     title=title,
                     barcode=str(row["barcode"]).strip() if row["barcode"] else None,
-                    vendor_name=partner_info.get("vendor_name"),
+                    vendor_name=vendor_name,
                     vendor_sku=partner_info.get("vendor_sku"),
                     manufacturer_sku=None,
                     current_specs=specs.get(pid, {}),
@@ -322,13 +326,17 @@ class MySQLCatalogReader:
                         pid = r["product_id"]
                         title = (r["title"] or "").strip() or f"Product #{pid}"
                         partner_info = partners.get(pid, {})
+                        vendor_name = partner_info.get("vendor_name")
+                        brand_name = (r.get("brand_name") or "").strip() or None
+                        if (not vendor_name or "склад" in vendor_name.lower()) and brand_name:
+                            vendor_name = brand_name
 
                         prod = Product(
                             product_id=pid,
                             shop_sku=str(r["shop_sku"]).strip() if r["shop_sku"] else str(pid),
                             title=title,
                             barcode=str(r["barcode"]).strip() if r["barcode"] else None,
-                            vendor_name=partner_info.get("vendor_name"),
+                            vendor_name=vendor_name,
                             vendor_sku=partner_info.get("vendor_sku"),
                             manufacturer_sku=None,
                             current_specs=specs.get(pid, {}),

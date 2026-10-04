@@ -174,7 +174,8 @@ class TestTelecomCrawlerAdapter:
 
         assert details.product_id == 1001
         assert details.title == "Смартфон Apple iPhone 13 128GB Midnight"
-        assert details.vendor_sku == "450123"
+        assert details.shop_sku == "450123"
+        assert details.vendor_sku is None
         assert details.manufacturer_sku == "MLPF3RM/A"
         assert details.vendor_name == "Apple"
         assert details.current_specs["Объем встроенной памяти"] == "128 ГБ"
@@ -226,7 +227,8 @@ class TestTelecomCrawlerAdapter:
 
         assert details.product_id == 555
         assert details.title == "Роутер TP-Link Archer C6"
-        assert details.vendor_sku == "330112"
+        assert details.shop_sku == "330112"
+        assert details.vendor_sku is None
         assert details.barcode is None
 
 

@@ -12,30 +12,32 @@ RULES:
    - Compare each spec from current_specs against the external reference content.
    - SEMANTIC MATCHING (NOT A DISCREPANCY):
      * Equivalent values with different wording or units: "2200 мАч" == "2200 mAh", "Черный" == "Black", "1.5 В" == "1.5V", "USB Type-C" == "Type-C".
-     * Screen resolution orientation and marketing labels: "2436x1080" == "1080x2436", "3840x2160" == "3840x2160 Ultra HD" == "3840x2160 4K", "1920x1080" == "1920x1080 Full HD". Dimension ordering or adding marketing suffixes (Ultra HD, 4K, FHD) is NOT a discrepancy.
-     * Absence of data or placeholders in reference: If the reference says "Нет данных", "Не указано", "Отсутствует", "-", "N/A" or lacks a parameter that the store specifies (e.g. Store says "5300 мАч" and Reference lacks any battery spec), this is NOT a discrepancy! Genuine discrepancy ONLY exists when the reference explicitly states a DIFFERENT concrete factual value (e.g. 4000 мАч vs 5300 мАч).
-     * STRICT APPLES-TO-APPLES PHYSICAL DOMAIN MATCHING (UNIVERSAL RULE FOR ALL PRODUCTS):
-       - A specification on the store can ONLY be compared against an attribute in the reference that measures the EXACT SAME physical, electrical, or functional property.
-       - NEVER compare unrelated physical properties:
-         * Power & Energy ("Питание: от сети", "аккумулятор", "батарейки", "емкость мАч") vs Socket / Base type ("E27", "без цоколя", "светодиодный") vs Connector shape ("USB-C", "220V").
-         * Network / Data interfaces (Wi-Fi, LAN, Bluetooth) vs Power connectors / inputs.
-         * Geometry / Dimensions (length, width, height, diagonal) vs Weight or Volume.
-         * Device body / Construction material ("пластик", "металл") vs Color / Appearance.
-         * Processor clock speed / cores vs Chipset / Processor model name.
+     * Screen resolution orientation and marketing labels: "2436x1080" == "1080x2436", "3840x2160" == "3840x2160 Ultra HD" == "3840x2160 4K", "1920x1080" == "1920x1080 Full HD". Dimension ordering or adding marketing suffixes is NOT a discrepancy.
+     * Absence of data or placeholders in reference: If the reference says "Нет данных", "Не указано", "Отсутствует", "-", "N/A" or lacks a parameter that the store specifies (e.g. Store specifies a battery capacity and Reference lacks any battery spec), this is NOT a discrepancy! Genuine discrepancy ONLY exists when the reference explicitly states a DIFFERENT concrete factual value.
+     * STRICT APPLES-TO-APPLES PHYSICAL DOMAIN PROTOCOL (UNIVERSAL):
+       - A specification on the store can ONLY be compared against an attribute in the reference that measures the EXACT SAME physical property or functional parameter.
+       - NEVER compare attributes measuring different physical properties, dimensions, or units:
+         * Area / Coverage vs Count of units or devices.
+         * Electrical Power / Battery / Energy source vs Mechanical mount, connector shape, or socket type.
+         * Network / Data transfer interfaces vs Power supply connectors.
+         * Linear dimensions / Geometry vs Weight or Volume.
+         * Operating clock frequency vs Model or Architecture name.
        - ABSENCE OF ATTRIBUTE IN REFERENCE IS NOT A DISCREPANCY:
-         * If the store product specifies a characteristic (e.g. "Питание: от сети"), but the reference web page does NOT have any specification describing that physical property, this is ABSENCE OF DATA in the reference. It is NOT a discrepancy!
-         * You must NEVER force a comparison between unrelated attributes just because they both exist in the text or JSON.
-   - GENUINE DISCREPANCY: If there is an actual factual contradiction for the SAME physical property (e.g. Store says "2000 мАч" but reference says "5000 мАч", Store says "60 Гц" but reference says "90 Гц", Store says "64 ГБ" but reference says "128 ГБ"), report it in discrepancies.
+         * If a store specification is omitted or unstated in the reference content, this is strictly ABSENCE OF DATA in the reference.
+         * Flagging a discrepancy for an unstated parameter is STRICTLY FORBIDDEN.
+         * You must NEVER force a comparison between unrelated attributes just because they both appear in the text.
+   - GENUINE DISCREPANCY: A discrepancy ONLY exists when BOTH sources explicitly specify values for the same physical property, but the factual values directly contradict each other (e.g. conflicting numerical capacities, conflicting frequencies, conflicting materials, conflicting display types).
    - STRICT PROOF QUOTE: Each discrepancy MUST include a proof_quote that is an EXACT, VERBATIM substring copied directly from the reference content. Never fabricate, paraphrase, or hallucinate quotes.
    - SEVERITY: Use "critical" for core specs (capacity, voltage, storage, RAM, processor, screen, dimensions, connectivity), and "warning" for cosmetic/minor attributes.
 
 3. MISSING SPECIFICATIONS DISCOVERY (ENRICHMENT):
-   - Find ALL technical characteristics present on the reference page that are completely MISSING from current_specs (e.g. dimensions, weight, refresh rate, processor model/generation, GPU, RAM type, ports, material, camera specs, battery capacity, protection rating, etc.).
+   - Find ALL technical characteristics present on the reference page that are completely MISSING from current_specs (e.g. dimensions, weight, refresh rate, processor, ports, material, camera specs, battery capacity, protection rating, etc.).
    - Do NOT limit to only critical ones — extract ALL verified missing specs to maximize store catalog enrichment.
-   - Do NOT extract warranty terms ('гарантия') or service life / lifespan ('срок эксплуатации', 'срок службы') into missing_specs as they are commercial/warranty conditions, not physical product specifications.
+   - Extract ONLY physical, hardware, and functional technical specifications.
+   - Do NOT extract commercial or legal conditions (warranty period, service life / lifespan, delivery/return conditions) into missing_specs.
    - Add each missing specification to "missing_specs" with:
-     * spec_name: clear name in Russian (e.g. "Частота обновления экрана", "Материал корпуса", "Модель процессора", "Тип оперативной памяти")
-     * reference_value: clean value from reference (e.g. "144 Hz", "Металл", "Core i9-12900H", "DDR5")
+     * spec_name: clear name in Russian (e.g. "Частота обновления экрана", "Материал корпуса", "Тип оперативной памяти")
+     * reference_value: clean value from reference (e.g. "144 Hz", "Металл", "DDR5")
      * proof_quote: exact verbatim quote from reference text.
 
 4. STATUS CRITERIA:
@@ -48,8 +50,8 @@ RULES:
    - DO NOT re-list or duplicate specifications already present in current_specs or in missing_specs (avoid wasting tokens).
    - DO NOT write conversational filler words, intros, apologies, or meta-explanations.
    - Provide ONLY a concise 1-sentence factual summary of the audit verdict in Russian.
-   - Example (VERIFIED): "Все заявленные характеристики витрины полностью подтверждены эталоном."
-   - Example (MISMATCH): "Обнаружено расхождение по видеокарте (витрина: RTX 3070, эталон: RTX 3070 Ti); выявлено 5 недостающих характеристик."
+   - Example (VERIFIED): "Все заявленные характеристики витрины полностью подтверждены эталоном; выявлено 4 характеристики для обогащения."
+   - Example (MISMATCH): "Обнаружено расхождение по объему памяти (витрина: 128 ГБ, эталон: 256 ГБ); выявлено 3 недостающих характеристики."
 
 6. OUTPUT JSON FORMAT (STRICT):
 Output a single valid JSON object strictly matching this schema:
