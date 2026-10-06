@@ -157,28 +157,27 @@ class OpenAIJudge:
             or "low"
         )
 
-    async def clean_search_query(self, title: str, vendor_name: str | None = None) -> str:
+    async def clean_search_query(
+        self, title: str, vendor_name: str | None = None
+    ) -> tuple[str, str | None]:
         """
-        Extracts clean Brand + Model query without noise (colors, device category, advertising slogans).
-        E.g.: 'Смартфон Apple iPhone 17 Pro Max 256Gb оранжевый MFYN4HX/A' -> 'Apple iPhone 17 Pro Max 256GB'
+        Extracts clean Brand + Model query without noise and detects manufacturer brand.
+        Returns: (clean_query: str, brand: str | None)
         """
         clean_title = title.strip()
         if not self.api_key:
-            return clean_title
+            return clean_title, None
 
         system_msg = (
             "Ты поисковый ассистент каталога электроники. Твоя задача — извлечь из сырого названия товара "
-            "краткую, чистую поисковую фразу по строгой формуле: [Бренд] + [Модель] + [Аппаратная модификация (память, процессор, ревизия, если есть)]. "
-            "ПРАВИЛА ОЧИСТКИ: "
-            "1. Удали начальное общее наименование категории товара (любые вводные существительные типа «смартфон», «ноутбук», «пылесос» и т.д.). "
-            "2. Удали цвет, рекламные лозунги, маркетинговые описания свойств, комплектацию и упаковочный шум. "
-            "3. Если в скобках указан номер ревизии, модели или аппаратный параметр (память/накопитель) — сохрани его. Рекламный текст и лозунги в скобках удали. "
-            "4. Удали внутренние складские артикулы магазина. "
-            "Ответь ТОЛЬКО очищенной строкой на одной строке без кавычек и знаков препинания в конце."
+            "истинный бренд производителя и краткую поисковую строку по формуле: [Бренд] + [Модель] + [Аппаратная модификация (память, процессор, ревизия, если есть)].\n"
+            "ПРАВИЛА:\n"
+            "1. В поле 'brand' укажи только имя бренда производителя (например, TP-Link, Apple, Xiaomi, Keenetic, Яндекс, Samsung, Camelion, D-Link).\n"
+            "2. В поле 'clean_query' укажи очищенную поисковую строку. Удали начальное общее наименование категории (смартфон, ноутбук, беспроводной роутер, настольная лампа), цвет, рекламные лозунги и упаковочный шум.\n"
+            "3. Ответь СТРОГО в формате JSON:\n"
+            '{"brand": "...", "clean_query": "..."}'
         )
         user_msg = f"Название товара: {clean_title}"
-        if vendor_name and "склад" not in vendor_name.lower():
-            user_msg += f"\nБренд: {vendor_name}"
 
         payload = {
             "model": self.model,
@@ -186,6 +185,7 @@ class OpenAIJudge:
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
+            "response_format": {"type": "json_object"},
             "reasoning_effort": self.reasoning_effort,
             "max_completion_tokens": 300,
             # Note: temperature is intentionally omitted for reasoning models (gpt-6-luna)
@@ -201,10 +201,8 @@ class OpenAIJudge:
                     resp = await client.post(self.API_URL, json=payload, headers=headers)
                     if resp.status_code == 200:
                         data = resp.json()
-                        result = data["choices"][0]["message"]["content"].strip().strip('"').strip("'")
-                        if result:
-                            return result
-                        break
+                        raw_content = str(data["choices"][0]["message"]["content"]).strip()
+                        return self._safe_parse_query_metadata(raw_content, clean_title)
                     elif resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
                         await asyncio.sleep(2.0 * (attempt + 1))
                         continue
@@ -217,14 +215,52 @@ class OpenAIJudge:
                     logger.warning(f"clean_search_query exception: {exc}")
                     break
 
-        return clean_title
+        return clean_title, None
+
+    @staticmethod
+    def _safe_parse_query_metadata(raw_content: str, default_title: str) -> tuple[str, str | None]:
+        """
+        Safely parses LLM response into (clean_query, brand).
+        Gracefully handles JSON objects, markdown fences, and plain string fallbacks.
+        """
+        clean = raw_content.strip()
+        if not clean:
+            return default_title, None
+
+        # 1. Attempt JSON parsing (direct or regex extracted)
+        try:
+            json_str = clean
+            if "{" in clean and "}" in clean:
+                m = re.search(r"\{[\s\S]*\}", clean)
+                if m:
+                    json_str = m.group(0)
+            parsed = json.loads(json_str)
+            if isinstance(parsed, dict):
+                clean_q = str(parsed.get("clean_query") or "").strip().strip('"').strip("'")
+                brand = str(parsed.get("brand") or "").strip().strip('"').strip("'") or None
+                if clean_q:
+                    return clean_q, brand
+        except Exception:
+            pass
+
+        # 2. Fallback to plain text string (e.g. from mock tests or unstructured LLM output)
+        first_line = clean.splitlines()[0].strip().strip('"').strip("'")
+        if first_line:
+            tokens = first_line.split()
+            fallback_brand = tokens[0] if tokens else None
+            return first_line, fallback_brand
+
+        return default_title, None
 
     async def extract_core_product_name(self, title: str, vendor_name: str | None = None) -> str:
         """
         Extracts clean Brand + Model query without noise.
-        Universal alias / interface for clean_search_query.
+        Strictly returns str as required.
         """
-        return await self.clean_search_query(title=title, vendor_name=vendor_name)
+        res = await self.clean_search_query(title=title, vendor_name=vendor_name)
+        if isinstance(res, tuple):
+            return str(res[0])
+        return str(res)
 
     async def judge(
         self,

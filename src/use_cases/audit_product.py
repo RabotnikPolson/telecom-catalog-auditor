@@ -68,12 +68,13 @@ class AuditProductUseCase:
                 return result
             urls_to_try = candidates
 
-        external_markdown: str | None = None
-        target_url = urls_to_try[0]
-        crawl_error = None
+        last_result: AuditResult | None = None
+        crawl_error: str | None = None
 
         for cand_url in urls_to_try:
             target_url = cand_url
+            external_markdown: str | None = None
+
             if not force_refresh:
                 cached_raw = self.product_repo.get_specs_cache(cand_url)
                 if cached_raw:
@@ -82,63 +83,64 @@ class AuditProductUseCase:
                         external_markdown = parsed.get("markdown", cached_raw) if isinstance(parsed, dict) else cached_raw
                     except Exception:
                         external_markdown = cached_raw
-                    if external_markdown and len(external_markdown.strip()) > 0:
-                        break
 
-            t_crawl_start = time.perf_counter()
-            crawl_res = await self.crawler.crawl(cand_url)
-            crawler_time_sec += (time.perf_counter() - t_crawl_start)
-            if crawl_res.success and crawl_res.markdown and len(crawl_res.markdown.strip()) > 0:
-                external_markdown = crawl_res.markdown
-                cache_payload = json.dumps(
-                    {
-                        "title": crawl_res.title,
-                        "markdown": crawl_res.markdown,
-                    },
-                    ensure_ascii=False,
-                )
-                self.product_repo.save_specs_cache(
-                    resolved_url=cand_url,
-                    specs_json=cache_payload,
-                    status_code=crawl_res.status_code,
-                )
-                break
-            else:
-                crawl_error = crawl_res.error or f"Failed crawling {cand_url}"
+            if not external_markdown or len(external_markdown.strip()) == 0:
+                t_crawl_start = time.perf_counter()
+                crawl_res = await self.crawler.crawl(cand_url)
+                crawler_time_sec += (time.perf_counter() - t_crawl_start)
+                if crawl_res.success and crawl_res.markdown and len(crawl_res.markdown.strip()) > 0:
+                    external_markdown = crawl_res.markdown
+                    cache_payload = json.dumps(
+                        {
+                            "title": crawl_res.title,
+                            "markdown": crawl_res.markdown,
+                        },
+                        ensure_ascii=False,
+                    )
+                    self.product_repo.save_specs_cache(
+                        resolved_url=cand_url,
+                        specs_json=cache_payload,
+                        status_code=crawl_res.status_code,
+                    )
+                else:
+                    crawl_error = crawl_res.error or f"Failed crawling {cand_url}"
+                    continue
+
+            result = await self.judge.judge(
+                product=product,
+                reference_url=target_url,
+                external_markdown=external_markdown,
+            )
+            result.crawler_time_sec = round(crawler_time_sec, 2)
+            result.execution_time_sec = round(time.perf_counter() - t_audit_start, 2)
+            last_result = result
+
+            if result.status in (AuditStatus.NOT_FOUND, AuditStatus.ERROR):
+                if target_url:
+                    self.product_repo.delete_url_cache_by_url(target_url)
+                    self.product_repo.delete_specs_cache(target_url)
                 continue
 
-        if not external_markdown:
-            if target_url:
-                self.product_repo.delete_url_cache_by_url(target_url)
-                self.product_repo.delete_specs_cache(target_url)
-
-            result = AuditResult(
-                product_id=product.product_id,
-                status=AuditStatus.ERROR,
-                confidence_score=0.0,
-                reference_url=target_url,
-                discrepancies=[],
-                matched_specs_count=0,
-                total_specs_count=len(product.current_specs),
-                audited_at=datetime.now(timezone.utc),
-                details=f"Crawler error: {crawl_error}",
-                crawler_time_sec=round(crawler_time_sec, 2),
-                execution_time_sec=round(time.perf_counter() - t_audit_start, 2),
-            )
             self.product_repo.save_audit_result(result)
             return result
 
-        result = await self.judge.judge(
-            product=product,
-            reference_url=target_url,
-            external_markdown=external_markdown,
-        )
-        if result.status in (AuditStatus.NOT_FOUND, AuditStatus.ERROR) and target_url:
-            self.product_repo.delete_url_cache_by_url(target_url)
-            self.product_repo.delete_specs_cache(target_url)
+        if last_result:
+            self.product_repo.save_audit_result(last_result)
+            return last_result
 
-        result.crawler_time_sec = round(crawler_time_sec, 2)
-        result.execution_time_sec = round(time.perf_counter() - t_audit_start, 2)
+        result = AuditResult(
+            product_id=product.product_id,
+            status=AuditStatus.ERROR,
+            confidence_score=0.0,
+            reference_url=urls_to_try[0] if urls_to_try else None,
+            discrepancies=[],
+            matched_specs_count=0,
+            total_specs_count=len(product.current_specs),
+            audited_at=datetime.now(timezone.utc),
+            details=f"Crawler error: {crawl_error or 'No candidates accessible'}",
+            crawler_time_sec=round(crawler_time_sec, 2),
+            execution_time_sec=round(time.perf_counter() - t_audit_start, 2),
+        )
         self.product_repo.save_audit_result(result)
         return result
 

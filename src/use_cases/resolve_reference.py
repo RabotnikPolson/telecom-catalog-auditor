@@ -205,19 +205,21 @@ class ResolveReferenceUseCase:
         return self._build_title_query(product)
 
     def _sort_by_domain_priority(
-        self, results: list[dict[str, Any]], product: Product, clean_query: str | None = None
+        self,
+        results: list[dict[str, Any]],
+        product: Product,
+        clean_query: str | None = None,
+        brand: str | None = None,
     ) -> list[dict[str, Any]]:
-        brand: str | None = None
-        if product.vendor_name and "склад" not in product.vendor_name.lower():
-            brand = product.vendor_name.strip()
-        elif clean_query:
+        target_brand = brand
+        if not target_brand and clean_query:
             parts = clean_query.split()
             if parts:
-                brand = parts[0].strip()
+                target_brand = parts[0].strip()
 
         return sorted(
             results,
-            key=lambda item: get_domain_priority(str(item.get("link") or ""), brand=brand),
+            key=lambda item: get_domain_priority(str(item.get("link") or ""), brand=target_brand),
         )
 
     async def _execute_search_cascade(
@@ -225,11 +227,17 @@ class ResolveReferenceUseCase:
     ) -> ResolvedReference:
         # STEP 1 (PRIMARY): Clean Brand + Model Search (via LLM query cleaner or heuristic)
         clean_model_query = None
+        extracted_brand = None
         if self.judge and hasattr(self.judge, "clean_search_query"):
             try:
-                clean_model_query = await self.judge.clean_search_query(product.title, product.vendor_name)
+                res = await self.judge.clean_search_query(product.title)
+                if isinstance(res, tuple):
+                    clean_model_query, extracted_brand = res
+                elif isinstance(res, str):
+                    clean_model_query = res
             except Exception:
                 clean_model_query = None
+                extracted_brand = None
 
         source_type = "MODEL_SEARCH"
         if not clean_model_query:
@@ -260,7 +268,9 @@ class ResolveReferenceUseCase:
         )
 
         if results:
-            sorted_res = self._sort_by_domain_priority(results, product, clean_query=clean_model_query)
+            sorted_res = self._sort_by_domain_priority(
+                results, product, clean_query=clean_model_query, brand=extracted_brand
+            )
             candidate_links = [
                 str(item.get("link") or "").strip()
                 for item in sorted_res
@@ -305,7 +315,9 @@ class ResolveReferenceUseCase:
                 num_results=10,
             )
             if bc_results:
-                sorted_bc = self._sort_by_domain_priority(bc_results, product, clean_query=clean_model_query)
+                sorted_bc = self._sort_by_domain_priority(
+                    bc_results, product, clean_query=clean_model_query, brand=extracted_brand
+                )
                 bc_candidate_links = [
                     str(item.get("link") or "").strip()
                     for item in sorted_bc

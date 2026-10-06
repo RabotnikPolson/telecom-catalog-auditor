@@ -234,7 +234,13 @@ class MySQLCatalogReader:
             FROM partner_products pp
             LEFT JOIN partners part ON pp.partner_id = part.id
             WHERE pp.product_id IN ({format_strings})
-            ORDER BY pp.enabled DESC, pp.id DESC
+            ORDER BY 
+                CASE 
+                    WHEN (INSTR(LOWER(part.name), 'vender1') > 0 OR INSTR(LOWER(part.name), 'al-style') > 0) AND pp.article_provider IS NOT NULL AND TRIM(pp.article_provider) != '' THEN 1 
+                    ELSE 0 
+                END DESC,
+                pp.enabled DESC, 
+                pp.id DESC
         """
         await cur.execute(query, tuple(product_ids))
         rows = await cur.fetchall()
