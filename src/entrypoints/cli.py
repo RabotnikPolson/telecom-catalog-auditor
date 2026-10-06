@@ -18,7 +18,7 @@ from src.adapters.catalog.mysql_reader import MySQLCatalogReader
 from src.adapters.catalog.telecom_crawler import TelecomShopCrawler
 from src.adapters.crawler.web_crawler import WebCrawler
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
-from src.adapters.llm.gemini_judge import GeminiJudge
+from src.adapters.llm.openai_judge import OpenAIJudge, GeminiJudge
 from src.adapters.search.serper_client import SerperClient
 from src.adapters.search.vendor_direct import VendorDirectResolver
 from src.domain.entities import AuditStatus, Product
@@ -206,7 +206,7 @@ async def _live_sync_products(
                         p = await mysql_reader.fetch_product(key)
                         if p:
                             repo.save_product(p)
-                            print(f"  [+] MySQL sync OK: Key '{key}' -> ID #{p.product_id} | Shop SKU: {p.shop_sku or 'N/A'} | {p.title[:50]}")
+                            print(f"  [+] MySQL sync OK: Key '{key}' -> ID #{p.product_id} | Shop SKU: {p.shop_sku or 'N/A'} | {p.title[:150]}")
                             print(f"      Current specs: {len(p.current_specs)} items | Barcode: {p.barcode or 'N/A'}")
                             products.append(p)
                     except Exception as e:
@@ -265,7 +265,7 @@ async def run_resolve_command(args: argparse.Namespace) -> int:
 
     vendor_resolver = VendorDirectResolver()
     serper_client = SerperClient(api_key=settings.SERPER_API_KEY)
-    judge = GeminiJudge()
+    judge = OpenAIJudge()
     use_case = ResolveReferenceUseCase(
         repository=repo,
         vendor_resolver=vendor_resolver,
@@ -442,13 +442,17 @@ async def run_audit_command(args: argparse.Namespace) -> int:
             return 1
 
     settings = get_settings()
-    gemini_key = args.gemini_key or settings.GEMINI_API_KEY
-    has_llm = bool(gemini_key or settings.OPENROUTER_API_KEY or os.environ.get("OPENROUTER_API_KEY"))
-    if not has_llm:
-        print("[!] WARNING: Neither OPENROUTER_API_KEY nor GEMINI_API_KEY is set. Arbitration calls will return ERROR status.")
-        print("    Pass --gemini-key <KEY> or set OPENROUTER_API_KEY in .env.")
+    openai_key = (
+        getattr(args, "openai_key", None)
+        or getattr(args, "gemini_key", None)
+        or settings.OPENAI_API_KEY
+        or os.environ.get("OPENAI_API_KEY")
+    )
+    if not openai_key:
+        print("[!] WARNING: OPENAI_API_KEY is not set. Arbitration calls will return ERROR status.")
+        print("    Pass --openai-key <KEY> or set OPENAI_API_KEY in .env.")
 
-    judge = GeminiJudge(api_key=gemini_key)
+    judge = OpenAIJudge(api_key=openai_key)
     vendor_resolver = VendorDirectResolver(timeout=10.0)
     serper_client = SerperClient(api_key=settings.SERPER_API_KEY)
     ref_resolver = ResolveReferenceUseCase(
@@ -476,6 +480,7 @@ async def run_audit_command(args: argparse.Namespace) -> int:
     print("=" * 80)
     print(f"Target DB     : {db_path.resolve()}")
     print(f"Products Count: {len(products)}")
+    print(f"LLM Engine    : OpenAI (model: {settings.OPENAI_MODEL})")
     print(f"Headless      : {not args.no_headless}")
     print(f"Force Refresh : {args.force_refresh}")
     print("-" * 80)
@@ -735,10 +740,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Manual reference URL override (only with --product-id)",
     )
     audit_parser.add_argument(
+        "--openai-key",
+        type=str,
+        default=None,
+        help="OpenAI API Key override",
+    )
+    audit_parser.add_argument(
         "--gemini-key",
         type=str,
         default=None,
-        help="Gemini API Key override",
+        help="Backwards-compatible alias for --openai-key",
     )
     audit_parser.add_argument(
         "--no-headless",

@@ -6,7 +6,6 @@ anyio>=4.0.0
 python-dotenv>=1.0.1
 httpx>=0.27.0
 playwright>=1.49.0
-google-genai>=1.0.0
 crawl4ai>=0.9.0
 pymysql>=1.1.0
 aiomysql>=0.2.0

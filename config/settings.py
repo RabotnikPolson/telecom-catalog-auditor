@@ -19,9 +19,9 @@ class Settings(BaseSettings):
     DATABASE_PATH: str = "catalog_audit.db"
 
     SERPER_API_KEY: str | None = Field(default=None)
-    GEMINI_API_KEY: str | None = Field(default=None)
-    OPENROUTER_API_KEY: str | None = Field(default=None)
-    OPENROUTER_MODEL: str = Field(default="google/gemini-2.5-flash")
+    OPENAI_API_KEY: str | None = Field(default=None)
+    OPENAI_MODEL: str = Field(default="gpt-6-luna")
+    OPENAI_REASONING_EFFORT: str = Field(default="low")
 
     MYSQL_HOST: str | None = Field(default=None)
     MYSQL_PORT: int = Field(default=3306)

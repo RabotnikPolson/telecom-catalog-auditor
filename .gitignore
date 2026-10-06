@@ -18,4 +18,5 @@ ENV/
 Thumbs.db
 
 *.md
-
+*.csv
+*.xlsx

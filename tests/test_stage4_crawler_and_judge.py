@@ -3,11 +3,12 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+import httpx
 import pytest
 
 from src.adapters.crawler.web_crawler import CrawlResult, WebCrawler
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
-from src.adapters.llm.gemini_judge import GeminiJudge, LLMDiscrepancy, LLMJudgeOutput
+from src.adapters.llm.openai_judge import OpenAIJudge, GeminiJudge, LLMDiscrepancy, LLMJudgeOutput, LLMMissingSpec
 from src.domain.entities import AuditResult, AuditStatus, DiscrepancyItem, Product
 from src.use_cases.audit_product import AuditProductUseCase
 from src.use_cases.resolve_reference import ResolvedReference, ResolveReferenceUseCase
@@ -80,16 +81,36 @@ class TestWebCrawler:
             assert res.error is not None
 
 
-class TestGeminiJudge:
+def _make_openai_resp(
+    content: str,
+    status_code: int = 200,
+    prompt_tokens: int = 100,
+    completion_tokens: int = 50,
+    cached_tokens: int = 0,
+) -> httpx.Response:
+    data = {
+        "choices": [{"message": {"content": content}}],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "prompt_tokens_details": {"cached_tokens": cached_tokens},
+        },
+    }
+    return httpx.Response(
+        status_code=status_code,
+        json=data,
+        request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+    )
+
+
+class TestOpenAIJudge:
 
     @pytest.mark.anyio
     async def test_judge_returns_error_when_no_api_key(
         self, sample_product: Product
     ) -> None:
-        judge = GeminiJudge(api_key=None)
-        judge.gemini_api_key = None
-        judge.openrouter_api_key = None
-        judge._client = None
+        judge = OpenAIJudge(api_key=None)
+        judge.api_key = None
 
         res = await judge.judge(
             product=sample_product,
@@ -97,13 +118,11 @@ class TestGeminiJudge:
             external_markdown="# Item Specs",
         )
         assert res.status == AuditStatus.ERROR
-        assert "is not configured" in (res.details or "")
+        assert "OPENAI_API_KEY is not configured" in (res.details or "")
 
     @pytest.mark.anyio
     async def test_judge_verified_scenario(self, sample_product: Product) -> None:
-        judge = GeminiJudge(api_key="test-key")
-        judge.openrouter_api_key = None
-        judge._client = MagicMock()
+        judge = OpenAIJudge(api_key="test-key")
 
         mock_output = LLMJudgeOutput(
             status="VERIFIED",
@@ -113,19 +132,14 @@ class TestGeminiJudge:
             discrepancies=[],
             details="All 3 specs match reference",
         )
-        mock_response = MagicMock()
-        mock_response.text = mock_output.model_dump_json()
+        mock_resp = _make_openai_resp(mock_output.model_dump_json())
 
-        mock_generate = AsyncMock(return_value=mock_response)
-        judge._client.aio = MagicMock()
-        judge._client.aio.models = MagicMock()
-        judge._client.aio.models.generate_content = mock_generate
-
-        res = await judge.judge(
-            product=sample_product,
-            reference_url="https://example.com/item",
-            external_markdown="* Емкость: 2200 мАч\n* Напряжение: 1.2 В",
-        )
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp):
+            res = await judge.judge(
+                product=sample_product,
+                reference_url="https://example.com/item",
+                external_markdown="* Емкость: 2200 мАч\n* Напряжение: 1.2 В",
+            )
 
         assert res.status == AuditStatus.VERIFIED
         assert res.confidence_score == 0.98
@@ -136,9 +150,7 @@ class TestGeminiJudge:
     async def test_judge_mismatch_scenario_with_proof_quote(
         self, sample_product: Product
     ) -> None:
-        judge = GeminiJudge(api_key="test-key")
-        judge.openrouter_api_key = None
-        judge._client = MagicMock()
+        judge = OpenAIJudge(api_key="test-key")
 
         mock_output = LLMJudgeOutput(
             status="MISMATCH",
@@ -156,19 +168,14 @@ class TestGeminiJudge:
             ],
             details="Found 1 mismatch in capacity",
         )
-        mock_response = MagicMock()
-        mock_response.text = mock_output.model_dump_json()
+        mock_resp = _make_openai_resp(mock_output.model_dump_json())
 
-        mock_generate = AsyncMock(return_value=mock_response)
-        judge._client.aio = MagicMock()
-        judge._client.aio.models = MagicMock()
-        judge._client.aio.models.generate_content = mock_generate
-
-        res = await judge.judge(
-            product=sample_product,
-            reference_url="https://example.com/item",
-            external_markdown="* Емкость: 2000 мАч",
-        )
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp):
+            res = await judge.judge(
+                product=sample_product,
+                reference_url="https://example.com/item",
+                external_markdown="* Емкость: 2000 мАч",
+            )
 
         assert res.status == AuditStatus.MISMATCH
         assert len(res.discrepancies) == 1
@@ -188,9 +195,7 @@ class TestGeminiJudge:
             shop_sku="YANDEX-1",
             current_specs={},
         )
-        judge = GeminiJudge(api_key="test-key")
-        judge.openrouter_api_key = None
-        judge._client = MagicMock()
+        judge = OpenAIJudge(api_key="test-key")
 
         mock_output = LLMJudgeOutput(
             status="MISSING_SPECS",
@@ -200,22 +205,157 @@ class TestGeminiJudge:
             discrepancies=[],
             details="Shop catalog has 0 specs but reference has power, bluetooth, audio",
         )
-        mock_response = MagicMock()
-        mock_response.text = mock_output.model_dump_json()
+        mock_resp = _make_openai_resp(mock_output.model_dump_json())
 
-        mock_generate = AsyncMock(return_value=mock_response)
-        judge._client.aio = MagicMock()
-        judge._client.aio.models = MagicMock()
-        judge._client.aio.models.generate_content = mock_generate
-
-        res = await judge.judge(
-            product=empty_specs_product,
-            reference_url="https://example.com/yandex",
-            external_markdown="# Yandex Station\n* Power: 30W\n* Bluetooth: 5.0",
-        )
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp):
+            res = await judge.judge(
+                product=empty_specs_product,
+                reference_url="https://example.com/yandex",
+                external_markdown="# Yandex Station\n* Power: 30W\n* Bluetooth: 5.0",
+            )
 
         assert res.status == AuditStatus.MISSING_SPECS
         assert "Shop catalog has 0 specs" in (res.details or "")
+
+    @pytest.mark.anyio
+    async def test_judge_numeric_vs_prose_guard_and_equivalence(self, sample_product: Product) -> None:
+        from src.adapters.llm.openai_judge import _is_equivalent_value
+
+        # Test SI metric unit equivalence (Mbps vs Gbps, MHz vs GHz)
+        assert _is_equivalent_value("2500 Мбит/с", "2.5 Гбит/с") is True
+        assert _is_equivalent_value("1000 МГц", "1 ГГц") is True
+        assert _is_equivalent_value("1000 ГБ", "1 ТБ") is True
+
+        judge = OpenAIJudge(api_key="test-key")
+
+        # LLM returned false discrepancy that violates Mutual Exclusion or Numeric vs Prose
+        mock_output = LLMJudgeOutput(
+            status="MISMATCH",
+            confidence_score=0.90,
+            matched_specs_count=5,
+            total_specs_count=7,
+            discrepancies=[
+                LLMDiscrepancy(
+                    spec_name="Радиус действия внутри помещения",
+                    shop_value="425 кв.м.",
+                    reference_value="Более широкое покрытие всего дома",
+                    proof_quote="Более широкое покрытие всего дома",
+                    contradiction_reason="",
+                    severity="warning",
+                ),
+                LLMDiscrepancy(
+                    spec_name="Особенности",
+                    shop_value="LED-экран с часами",
+                    reference_value="Часы есть",
+                    proof_quote="Часы есть",
+                    contradiction_reason="Нет противоречия, эталон подтверждает наличие часов",
+                    severity="warning",
+                ),
+            ],
+            missing_specs=[
+                LLMMissingSpec(
+                    spec_name="Производительность маршрутизатора",
+                    reference_value="Очень высокая",
+                    proof_quote="Очень высокая производительность",
+                ),
+                LLMMissingSpec(
+                    spec_name="Стандарт Wi-Fi",
+                    reference_value="Wi-Fi 7",
+                    proof_quote="Поддержка Wi-Fi 7",
+                ),
+            ],
+            details="Found mismatches",
+        )
+        mock_resp = _make_openai_resp(mock_output.model_dump_json())
+
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp):
+            res = await judge.judge(
+                product=sample_product,
+                reference_url="https://example.com/item",
+                external_markdown="* Ports: 4 Ethernet",
+            )
+
+        # Both false discrepancies must be discarded, so status flips to VERIFIED
+        assert res.status == AuditStatus.VERIFIED
+        assert len(res.discrepancies) == 0
+
+        # Subjective missing spec "Очень высокая" must be discarded, factual "Wi-Fi 7" kept
+        assert len(res.missing_specs) == 1
+        assert res.missing_specs[0].spec_name == "Стандарт Wi-Fi"
+        assert res.missing_specs[0].reference_value == "Wi-Fi 7"
+
+    @pytest.mark.anyio
+    async def test_judge_openai_retry_on_transient_error(self, sample_product: Product) -> None:
+        judge = OpenAIJudge(api_key="test-key")
+
+        mock_output = LLMJudgeOutput(
+            status="VERIFIED",
+            confidence_score=0.99,
+            matched_specs_count=3,
+            total_specs_count=3,
+            discrepancies=[],
+            details="All specs match after retry",
+        )
+        err_resp = _make_openai_resp("", status_code=503)
+        ok_resp = _make_openai_resp(mock_output.model_dump_json(), status_code=200)
+
+        # First request returns 503, second returns 200 OK
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock, side_effect=[err_resp, ok_resp]), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            res = await judge.judge(
+                product=sample_product,
+                reference_url="https://example.com/item",
+                external_markdown="Specs",
+            )
+            assert res.status == AuditStatus.VERIFIED
+            assert res.confidence_score == 0.99
+
+    @pytest.mark.anyio
+    async def test_extract_core_product_name_openai(self) -> None:
+        judge = OpenAIJudge(api_key="test-key")
+        mock_resp = _make_openai_resp("Apple iPhone 17 Pro Max 256GB")
+
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp):
+            name = await judge.extract_core_product_name("Смартфон Apple iPhone 17 Pro Max 256Gb оранжевый MFYN4HX/A")
+            assert name == "Apple iPhone 17 Pro Max 256GB"
+
+    def test_contradiction_reason_extra_forbid_domain_compliance(self) -> None:
+        llm_d = LLMDiscrepancy(
+            spec_name="Цвет",
+            shop_value="Черный",
+            reference_value="Белый",
+            proof_quote="Цвет: белый",
+            contradiction_reason="Объект не может быть одновременно белым и черным",
+            severity="critical",
+        )
+        assert llm_d.contradiction_reason == "Объект не может быть одновременно белым и черным"
+
+        # Domain entity DiscrepancyItem has extra="forbid"
+        domain_d = DiscrepancyItem(
+            spec_name=llm_d.spec_name,
+            shop_value=llm_d.shop_value,
+            reference_value=llm_d.reference_value,
+            proof_quote=llm_d.proof_quote,
+            source_url="https://example.com",
+            severity=llm_d.severity,
+        )
+        assert domain_d.spec_name == "Цвет"
+
+        # Ensuring extra="forbid" raises ValidationError if contradiction_reason is leaked into domain
+        with pytest.raises(Exception):
+            DiscrepancyItem(
+                spec_name=llm_d.spec_name,
+                shop_value=llm_d.shop_value,
+                reference_value=llm_d.reference_value,
+                proof_quote=llm_d.proof_quote,
+                source_url="https://example.com",
+                severity=llm_d.severity,
+                contradiction_reason=llm_d.contradiction_reason,  # type: ignore[call-arg]
+            )
+
+
+# Backwards compatibility alias for test suite
+TestGeminiJudge = TestOpenAIJudge
 
 
 class TestAuditProductUseCase:
