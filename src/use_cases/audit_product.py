@@ -33,6 +33,14 @@ class AuditProductUseCase:
     ) -> AuditResult:
         t_audit_start = time.perf_counter()
         crawler_time_sec = 0.0
+
+        # Just-in-Time: ensure audited product exists in local repo for audit_results foreign key
+        if hasattr(self.product_repo, "save_product"):
+            try:
+                self.product_repo.save_product(product)
+            except Exception as e:
+                logger.warning(f"Could not persist product #{product.product_id} in local repo: {e}")
+
         urls_to_try: list[str] = []
         if reference_url:
             urls_to_try = [reference_url]

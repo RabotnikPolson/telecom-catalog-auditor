@@ -426,6 +426,7 @@ async def run_audit_command(args: argparse.Namespace) -> int:
 
     db_path = Path(args.db)
     repo = SQLiteProductRepository(db_path)
+    settings = get_settings()
 
     target_keys = _extract_target_keys(args)
 
@@ -436,9 +437,29 @@ async def run_audit_command(args: argparse.Namespace) -> int:
             print(f"[!] Error: None of the specified products {target_keys} were found.")
             return 1
     else:
-        products = repo.get_auditable_products(limit=args.limit)
+        source_mode = getattr(args, "source", "mysql")
+        products = []
+        if source_mode == "mysql" and settings.MYSQL_HOST:
+            print(f"[*] Streaming active products directly from shop MySQL (READ-ONLY, limit={args.limit or 'ALL'})...")
+            try:
+                cat_arg = getattr(args, "category", None)
+                cat_id = int(cat_arg) if (cat_arg and str(cat_arg).isdigit()) else None
+                async with MySQLCatalogReader() as mysql_reader:
+                    async for batch in mysql_reader.stream_products(
+                        batch_size=min(500, args.limit or 500),
+                        limit=args.limit,
+                        category_id=cat_id,
+                        only_active=True,
+                    ):
+                        products.extend(batch)
+            except Exception as e:
+                print(f"[!] MySQL streaming error: {e}. Falling back to local DB.")
+
         if not products:
-            print(f"[!] No products found in database {db_path}")
+            products = repo.get_auditable_products(limit=args.limit)
+
+        if not products:
+            print(f"[!] No auditable products found in database {db_path} or MySQL.")
             return 1
 
     settings = get_settings()
@@ -500,6 +521,7 @@ async def run_audit_command(args: argparse.Namespace) -> int:
         for idx, prod in enumerate(products, 1):
             print(f"[{idx:02d}/{len(products)}] Auditing ID #{prod.product_id} | {prod.title[:150]}")
             print(f"      Shop SKU: {prod.shop_sku or 'N/A'} | Vendor SKU: {prod.vendor_sku or 'N/A'} | Barcode: {prod.barcode or 'N/A'}")
+            print(f"      Shop URL: https://shop.telecom.kz/product/{prod.product_id}")
             print(f"      Current Specs Count: {len(prod.current_specs)}")
 
             result = await audit_use_case.audit_product(
@@ -726,6 +748,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Path to text file with SKUs (one per line or comma-separated)",
+    )
+    audit_parser.add_argument(
+        "--category",
+        type=str,
+        default=None,
+        help="Category ID to filter active products from MySQL (e.g. 416)",
     )
     audit_parser.add_argument(
         "--limit",

@@ -258,16 +258,37 @@ class MySQLCatalogReader:
 
         return result
 
-    async def count_products(self, category_id: int | None = None) -> int:
+    async def count_products(
+        self,
+        category_id: int | None = None,
+        only_active: bool = True,
+    ) -> int:
         """Count total products available in the database."""
         pool = self._ensure_connected()
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await self._init_session(cur)
-                if category_id is not None:
-                    await cur.execute("SELECT COUNT(*) as cnt FROM products WHERE category_id = %s;", (category_id,))
+                if only_active:
+                    if category_id is not None:
+                        query = """
+                            SELECT COUNT(DISTINCT p.id) as cnt
+                            FROM products p
+                            JOIN partner_products pp ON p.id = pp.product_id
+                            WHERE pp.enabled = 1 AND p.category_id = %s;
+                        """
+                        await cur.execute(query, (category_id,))
+                    else:
+                        query = """
+                            SELECT COUNT(DISTINCT pp.product_id) as cnt
+                            FROM partner_products pp
+                            WHERE pp.enabled = 1;
+                        """
+                        await cur.execute(query)
                 else:
-                    await cur.execute("SELECT COUNT(*) as cnt FROM products;")
+                    if category_id is not None:
+                        await cur.execute("SELECT COUNT(*) as cnt FROM products WHERE category_id = %s;", (category_id,))
+                    else:
+                        await cur.execute("SELECT COUNT(*) as cnt FROM products;")
                 row = await cur.fetchone()
                 return int(row["cnt"]) if row else 0
 
@@ -276,6 +297,7 @@ class MySQLCatalogReader:
         batch_size: int = 500,
         limit: int | None = None,
         category_id: int | None = None,
+        only_active: bool = True,
     ) -> AsyncIterator[list[Product]]:
         """
         Stream products in batches using limit/offset with batch attribute fetching.
@@ -297,11 +319,21 @@ class MySQLCatalogReader:
                             break
                         cur_batch_size = min(batch_size, remaining)
 
-                    where_clause = ""
+                    where_conditions: list[str] = []
                     params: list[Any] = []
+
+                    if only_active:
+                        where_conditions.append(
+                            "EXISTS (SELECT 1 FROM partner_products pp WHERE pp.product_id = p.id AND pp.enabled = 1)"
+                        )
+
                     if category_id is not None:
-                        where_clause = "WHERE p.category_id = %s"
+                        where_conditions.append("p.category_id = %s")
                         params.append(category_id)
+
+                    where_clause = ""
+                    if where_conditions:
+                        where_clause = "WHERE " + " AND ".join(where_conditions)
 
                     query = f"""
                         SELECT 
