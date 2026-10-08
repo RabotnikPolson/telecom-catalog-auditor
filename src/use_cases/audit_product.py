@@ -44,6 +44,7 @@ class AuditProductUseCase:
         urls_to_try: list[str] = []
         if reference_url:
             urls_to_try = [reference_url]
+            search_trace = [f"[Manual Reference] Using direct reference URL override: {reference_url}"]
         else:
             resolver_fn = getattr(self.reference_resolver, "execute", None) or getattr(self.reference_resolver, "resolve", None)
             if resolver_fn:
@@ -59,7 +60,10 @@ class AuditProductUseCase:
             if resolved_url and resolved_url not in candidates:
                 candidates.insert(0, resolved_url)
 
+            search_trace = list(getattr(resolved, "search_trace", [])) if resolved else []
+
             if not candidates:
+                search_trace.append("[Audit] No reference candidate URLs available to evaluate -> Status: NOT_FOUND")
                 result = AuditResult(
                     product_id=product.product_id,
                     status=AuditStatus.NOT_FOUND,
@@ -70,6 +74,7 @@ class AuditProductUseCase:
                     total_specs_count=len(product.current_specs),
                     audited_at=datetime.now(timezone.utc),
                     details="Reference URL could not be resolved from suppliers or search",
+                    search_trace=search_trace,
                     execution_time_sec=round(time.perf_counter() - t_audit_start, 2),
                 )
                 self.product_repo.save_audit_result(result)
@@ -79,9 +84,10 @@ class AuditProductUseCase:
         last_result: AuditResult | None = None
         crawl_error: str | None = None
 
-        for cand_url in urls_to_try:
+        for cand_idx, cand_url in enumerate(urls_to_try, 1):
             target_url = cand_url
             external_markdown: str | None = None
+            search_trace.append(f"[Candidate {cand_idx}/{len(urls_to_try)}] Fetching specs: {cand_url}")
 
             if not force_refresh:
                 cached_raw = self.product_repo.get_specs_cache(cand_url)
@@ -89,6 +95,7 @@ class AuditProductUseCase:
                     try:
                         parsed = json.loads(cached_raw)
                         external_markdown = parsed.get("markdown", cached_raw) if isinstance(parsed, dict) else cached_raw
+                        search_trace.append(f"[Candidate {cand_idx}] Loaded specs from local specs_cache")
                     except Exception:
                         external_markdown = cached_raw
 
@@ -110,8 +117,10 @@ class AuditProductUseCase:
                         specs_json=cache_payload,
                         status_code=crawl_res.status_code,
                     )
+                    search_trace.append(f"[Candidate {cand_idx}] Page crawled successfully (HTTP {crawl_res.status_code or 200})")
                 else:
                     crawl_error = crawl_res.error or f"Failed crawling {cand_url}"
+                    search_trace.append(f"[Candidate {cand_idx}] Crawl failed: {crawl_error}")
                     continue
 
             result = await self.judge.judge(
@@ -121,21 +130,28 @@ class AuditProductUseCase:
             )
             result.crawler_time_sec = round(crawler_time_sec, 2)
             result.execution_time_sec = round(time.perf_counter() - t_audit_start, 2)
+            search_trace.append(f"[Candidate {cand_idx}] LLM Judge verdict: {result.status.value} (Confidence: {result.confidence_score:.2f})")
             last_result = result
 
             if result.status in (AuditStatus.NOT_FOUND, AuditStatus.ERROR):
                 if target_url:
                     self.product_repo.delete_url_cache_by_url(target_url)
                     self.product_repo.delete_specs_cache(target_url)
+                search_trace.append(f"[Candidate {cand_idx}] Rejected as non-matching ({result.details or result.status.value}), cascading to next candidate...")
                 continue
 
+            search_trace.append(f"[Candidate {cand_idx}] Accepted as authoritative reference ({result.status.value})")
+            result.search_trace = search_trace
             self.product_repo.save_audit_result(result)
             return result
 
         if last_result:
+            search_trace.append("[Evaluation] All candidate URLs exhausted without a verified match.")
+            last_result.search_trace = search_trace
             self.product_repo.save_audit_result(last_result)
             return last_result
 
+        search_trace.append(f"[Evaluation] All candidates failed. Crawler error: {crawl_error or 'No candidates accessible'}")
         result = AuditResult(
             product_id=product.product_id,
             status=AuditStatus.ERROR,
@@ -146,6 +162,7 @@ class AuditProductUseCase:
             total_specs_count=len(product.current_specs),
             audited_at=datetime.now(timezone.utc),
             details=f"Crawler error: {crawl_error or 'No candidates accessible'}",
+            search_trace=search_trace,
             crawler_time_sec=round(crawler_time_sec, 2),
             execution_time_sec=round(time.perf_counter() - t_audit_start, 2),
         )

@@ -226,7 +226,7 @@ async def _live_sync_products(
                 p = None
                 try:
                     details = await shop_crawler.fetch_product_on_the_fly(str(key))
-                    if details:
+                    if details and details.title and details.current_specs:
                         p = Product(
                             product_id=details.product_id,
                             shop_sku=details.shop_sku,
@@ -247,7 +247,7 @@ async def _live_sync_products(
                 if not p:
                     p = repo.find_product(key)
                     if p:
-                        print(f"  [*] Using cached record from local DB: ID #{p.product_id} ({p.title[:50]})")
+                        print(f"  [*] Using cached record from local DB: ID #{p.product_id} | Shop SKU: {p.shop_sku or 'N/A'} ({p.title[:50]})")
 
                 if p:
                     products.append(p)
@@ -555,9 +555,17 @@ async def run_audit_command(args: argparse.Namespace) -> int:
             elif result.status == AuditStatus.NOT_FOUND:
                 not_found_count += 1
                 print(f"      STATUS: [NOT_FOUND] - {result.details}")
+                if result.search_trace:
+                    print("      SEARCH TRACE:")
+                    for trace_step in result.search_trace:
+                        print(f"        > {trace_step}")
             else:
                 error_count += 1
                 print(f"      STATUS: [ERROR] - {result.details}")
+                if result.search_trace:
+                    print("      SEARCH TRACE:")
+                    for trace_step in result.search_trace:
+                        print(f"        > {trace_step}")
 
             if result.missing_specs:
                 print(f"      * MISSING SPECS (В эталоне найдены важные ТХ, отсутствующие на витрине):")

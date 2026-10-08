@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS audit_results (
     input_tokens INTEGER DEFAULT 0,
     output_tokens INTEGER DEFAULT 0,
     estimated_cost_usd REAL DEFAULT 0.0,
+    search_trace_json TEXT,
     FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE CASCADE
 );
 
@@ -124,6 +125,8 @@ def init_db(db_path: Union[str, Path]) -> None:
                 conn.execute("ALTER TABLE audit_results ADD COLUMN output_tokens INTEGER DEFAULT 0;")
             if "estimated_cost_usd" not in a_cols:
                 conn.execute("ALTER TABLE audit_results ADD COLUMN estimated_cost_usd REAL DEFAULT 0.0;")
+            if "search_trace_json" not in a_cols:
+                conn.execute("ALTER TABLE audit_results ADD COLUMN search_trace_json TEXT;")
 
         conn.executescript(SCHEMA_SQL)
         conn.commit()

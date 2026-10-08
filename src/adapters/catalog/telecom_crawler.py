@@ -414,6 +414,9 @@ class TelecomShopCrawler:
                 if vendor_name:
                     break
 
+        if not title or title.strip().lower() in ("страница не найдена!", "страница не найдена", "404 not found", "404"):
+            return None
+
         return ProductDetailResult(
             product_id=pid,
             shop_sku=shop_sku,

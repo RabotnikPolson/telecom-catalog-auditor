@@ -21,6 +21,7 @@ class ResolvedReference:
     kaspi_code: Optional[str] = None
     candidate_urls: list[str] = field(default_factory=list)
     is_cached: bool = False
+    search_trace: list[str] = field(default_factory=list)
 
 
 class ResolveReferenceUseCase:
@@ -82,7 +83,10 @@ class ResolveReferenceUseCase:
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
     async def execute(self, product: Product, force_refresh: bool = False) -> ResolvedReference:
+        trace: list[str] = []
+
         if self.is_nameless_generic_product(product):
+            trace.append(f"[Inspection] Generic/nameless item '{product.title[:40]}' without identifiers -> Status: INSUFFICIENT_DATA")
             return ResolvedReference(
                 product_id=product.product_id,
                 reference_url=None,
@@ -91,6 +95,7 @@ class ResolveReferenceUseCase:
                 scenario_applied="SCENARIO_5_INSUFFICIENT_DATA",
                 status="INSUFFICIENT_DATA",
                 is_cached=False,
+                search_trace=trace,
             )
 
         has_trusted_vendor = bool(find_vendor_profile(product.vendor_name))
@@ -99,9 +104,12 @@ class ResolveReferenceUseCase:
         if has_trusted_vendor and has_vendor_sku:
             cached_query = f"vendor:{product.vendor_name}:{product.vendor_sku}"
             q_hash = self.compute_query_hash(product, cached_query)
+            trace.append(f"[Vendor Direct] Checking supplier '{product.vendor_name}' for SKU '{product.vendor_sku}'")
+
             if self.use_url_cache and not force_refresh:
                 cached_url = self.repo.get_url_cache(q_hash)
                 if cached_url:
+                    trace.append(f"[Cache Hit] Vendor direct URL resolved from cache: {cached_url}")
                     return ResolvedReference(
                         product_id=product.product_id,
                         reference_url=cached_url,
@@ -109,7 +117,9 @@ class ResolveReferenceUseCase:
                         query_used=cached_query,
                         scenario_applied="SCENARIO_1_VENDOR_DIRECT",
                         status="FOUND",
+                        candidate_urls=[cached_url],
                         is_cached=True,
+                        search_trace=trace,
                     )
 
             if self.verify_direct_urls:
@@ -127,6 +137,7 @@ class ResolveReferenceUseCase:
                         candidates = [kaspi_direct, res.reference_url]
 
                     self.repo.save_url_cache(q_hash, final_url, source_type=source_type)
+                    trace.append(f"[Vendor Direct] Active product card found: {final_url} (Kaspi code: {res.kaspi_code or 'N/A'})")
                     return ResolvedReference(
                         product_id=product.product_id,
                         reference_url=final_url,
@@ -137,9 +148,11 @@ class ResolveReferenceUseCase:
                         kaspi_code=res.kaspi_code,
                         candidate_urls=candidates,
                         is_cached=False,
+                        search_trace=trace,
                     )
+                trace.append("[Vendor Direct] Supplier card unavailable or 404, falling back to search cascade")
                 return await self._execute_search_cascade(
-                    product, scenario_override="SCENARIO_2_VENDOR_FALLBACK", force_refresh=force_refresh
+                    product, scenario_override="SCENARIO_2_VENDOR_FALLBACK", force_refresh=force_refresh, trace=trace
                 )
 
             direct_url = self.vendor_resolver.build_direct_url(
@@ -147,6 +160,7 @@ class ResolveReferenceUseCase:
             )
             if direct_url:
                 self.repo.save_url_cache(q_hash, direct_url, source_type="VENDOR_DIRECT")
+                trace.append(f"[Vendor Direct] Generated direct URL: {direct_url}")
                 return ResolvedReference(
                     product_id=product.product_id,
                     reference_url=direct_url,
@@ -156,19 +170,23 @@ class ResolveReferenceUseCase:
                     status="FOUND",
                     candidate_urls=[direct_url],
                     is_cached=False,
+                    search_trace=trace,
                 )
 
+            trace.append("[Vendor Direct] Could not build direct vendor URL, falling back to search cascade")
             return await self._execute_search_cascade(
-                product, scenario_override="SCENARIO_2_VENDOR_FALLBACK", force_refresh=force_refresh
+                product, scenario_override="SCENARIO_2_VENDOR_FALLBACK", force_refresh=force_refresh, trace=trace
             )
 
         if has_trusted_vendor and not has_vendor_sku:
+            trace.append(f"[Vendor Check] Vendor '{product.vendor_name}' known but vendor_sku is missing -> External search")
             return await self._execute_search_cascade(
-                product, scenario_override="SCENARIO_3_VENDOR_NO_SKU", force_refresh=force_refresh
+                product, scenario_override="SCENARIO_3_VENDOR_NO_SKU", force_refresh=force_refresh, trace=trace
             )
 
+        trace.append("[Vendor Check] No trusted vendor profile -> Running external search cascade")
         return await self._execute_search_cascade(
-            product, scenario_override="SCENARIO_4_EXTERNAL_SEARCH", force_refresh=force_refresh
+            product, scenario_override="SCENARIO_4_EXTERNAL_SEARCH", force_refresh=force_refresh, trace=trace
         )
 
     def _build_title_query(self, product: Product) -> tuple[str, str]:
@@ -193,7 +211,6 @@ class ResolveReferenceUseCase:
             if v_sku.lower() not in clean_title.lower():
                 parts.append(v_sku)
 
-        parts.append("характеристики")
         query = " ".join(parts).strip()
         source_type = "PROVIDER_SKU_SEARCH" if (product.vendor_sku and not is_internal_sku) else "MODEL_SEARCH"
         return query, source_type
@@ -201,7 +218,7 @@ class ResolveReferenceUseCase:
     def _build_search_query(self, product: Product) -> tuple[str, str]:
         if product.barcode and product.barcode.strip():
             clean_bc = product.barcode.strip()
-            return f'"{clean_bc}" характеристики', "BARCODE_SEARCH"
+            return f'"{clean_bc}"', "BARCODE_SEARCH"
         return self._build_title_query(product)
 
     def _sort_by_domain_priority(
@@ -223,8 +240,11 @@ class ResolveReferenceUseCase:
         )
 
     async def _execute_search_cascade(
-        self, product: Product, scenario_override: str, force_refresh: bool = False
+        self, product: Product, scenario_override: str, force_refresh: bool = False, trace: list[str] | None = None
     ) -> ResolvedReference:
+        if trace is None:
+            trace = []
+
         # STEP 1 (PRIMARY): Clean Brand + Model Search (via LLM query cleaner or heuristic)
         clean_model_query = None
         extracted_brand = None
@@ -242,14 +262,14 @@ class ResolveReferenceUseCase:
         source_type = "MODEL_SEARCH"
         if not clean_model_query:
             clean_model_query, source_type = self._build_title_query(product)
-        else:
-            if "характеристик" not in clean_model_query.lower():
-                clean_model_query = f"{clean_model_query} характеристики"
+
+        trace.append(f"[Query Extraction] Clean model query: '{clean_model_query}', Brand: '{extracted_brand or 'N/A'}'")
 
         q_hash = self.compute_query_hash(product, clean_model_query)
         if self.use_url_cache and not force_refresh:
             cached_url = self.repo.get_url_cache(q_hash)
             if cached_url and is_whitelisted_domain(cached_url, extra_domains=self.whitelist_domains):
+                trace.append(f"[Cache Hit] Model query hash matched in url_cache: {cached_url}")
                 return ResolvedReference(
                     product_id=product.product_id,
                     reference_url=cached_url,
@@ -259,6 +279,7 @@ class ResolveReferenceUseCase:
                     status="FOUND",
                     candidate_urls=[cached_url],
                     is_cached=True,
+                    search_trace=trace,
                 )
 
         results = await self.serper_client.search_and_filter(
@@ -277,9 +298,11 @@ class ResolveReferenceUseCase:
                 if str(item.get("link") or "").strip()
                 and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
             ]
+            trace.append(f"[Serper Search] Query '{clean_model_query}' returned {len(results)} items, {len(candidate_links)} whitelisted")
             if candidate_links:
                 best_link = candidate_links[0]
                 self.repo.save_url_cache(q_hash, best_link, source_type=source_type)
+                trace.append(f"[Resolved] Primary candidate selected: {best_link} (out of {len(candidate_links)} candidates)")
                 return ResolvedReference(
                     product_id=product.product_id,
                     reference_url=best_link,
@@ -289,15 +312,19 @@ class ResolveReferenceUseCase:
                     status="FOUND",
                     candidate_urls=candidate_links,
                     is_cached=False,
+                    search_trace=trace,
                 )
 
         # STEP 2 (RESERVE / FALLBACK): Barcode Search if Model search returned no whitelisted pages
         if product.barcode and product.barcode.strip():
-            bc_query = f'"{product.barcode.strip()}" характеристики'
+            bc_query = f'"{product.barcode.strip()}"'
             q_hash_bc = self.compute_query_hash(product, bc_query)
+            trace.append(f"[Fallback] Model search returned no candidates, trying Barcode search: {bc_query}")
+
             if self.use_url_cache and not force_refresh:
                 cached_bc = self.repo.get_url_cache(q_hash_bc)
                 if cached_bc and is_whitelisted_domain(cached_bc, extra_domains=self.whitelist_domains):
+                    trace.append(f"[Cache Hit] Barcode query hash matched in url_cache: {cached_bc}")
                     return ResolvedReference(
                         product_id=product.product_id,
                         reference_url=cached_bc,
@@ -307,6 +334,7 @@ class ResolveReferenceUseCase:
                         status="FOUND",
                         candidate_urls=[cached_bc],
                         is_cached=True,
+                        search_trace=trace,
                     )
 
             bc_results = await self.serper_client.search_and_filter(
@@ -324,9 +352,11 @@ class ResolveReferenceUseCase:
                     if str(item.get("link") or "").strip()
                     and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
                 ]
+                trace.append(f"[Serper Barcode] Query '{bc_query}' returned {len(bc_results)} items, {len(bc_candidate_links)} whitelisted")
                 if bc_candidate_links:
                     best_bc = bc_candidate_links[0]
                     self.repo.save_url_cache(q_hash_bc, best_bc, source_type="BARCODE_SEARCH")
+                    trace.append(f"[Resolved] Primary candidate selected from Barcode: {best_bc}")
                     return ResolvedReference(
                         product_id=product.product_id,
                         reference_url=best_bc,
@@ -336,8 +366,64 @@ class ResolveReferenceUseCase:
                         status="FOUND",
                         candidate_urls=bc_candidate_links,
                         is_cached=False,
+                        search_trace=trace,
                     )
 
+        # STEP 3 (FINAL FALLBACK): Scoped search on top Kazakhstan marketplaces (Kaspi / DNS)
+        # Triggered ONLY as the very last resort when general internet and barcode searches yield 0 whitelisted candidates
+        scoped_query = f"site:kaspi.kz OR site:dns-shop.kz {clean_model_query}"
+        q_hash_scoped = self.compute_query_hash(product, scoped_query)
+        trace.append(f"[Final Fallback] General and barcode searches yielded no candidates, running Scoped Search: {scoped_query}")
+
+        if self.use_url_cache and not force_refresh:
+            cached_scoped = self.repo.get_url_cache(q_hash_scoped)
+            if cached_scoped and is_whitelisted_domain(cached_scoped, extra_domains=self.whitelist_domains):
+                trace.append(f"[Cache Hit] Scoped query hash matched in url_cache: {cached_scoped}")
+                return ResolvedReference(
+                    product_id=product.product_id,
+                    reference_url=cached_scoped,
+                    source_type="CACHE",
+                    query_used=scoped_query,
+                    scenario_applied=scenario_override,
+                    status="FOUND",
+                    candidate_urls=[cached_scoped],
+                    is_cached=True,
+                    search_trace=trace,
+                )
+
+        scoped_results = await self.serper_client.search_and_filter(
+            query=scoped_query,
+            whitelist_domains=self.whitelist_domains,
+            num_results=5,
+        )
+        if scoped_results:
+            sorted_scoped = self._sort_by_domain_priority(
+                scoped_results, product, clean_query=clean_model_query, brand=extracted_brand
+            )
+            scoped_candidate_links = [
+                str(item.get("link") or "").strip()
+                for item in sorted_scoped
+                if str(item.get("link") or "").strip()
+                and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
+            ]
+            trace.append(f"[Serper Scoped] Query '{scoped_query}' returned {len(scoped_results)} items, {len(scoped_candidate_links)} whitelisted")
+            if scoped_candidate_links:
+                best_scoped = scoped_candidate_links[0]
+                self.repo.save_url_cache(q_hash_scoped, best_scoped, source_type="SCOPED_SEARCH")
+                trace.append(f"[Resolved] Primary candidate selected via Scoped Search: {best_scoped}")
+                return ResolvedReference(
+                    product_id=product.product_id,
+                    reference_url=best_scoped,
+                    source_type="SCOPED_SEARCH",
+                    query_used=scoped_query,
+                    scenario_applied=scenario_override,
+                    status="FOUND",
+                    candidate_urls=scoped_candidate_links,
+                    is_cached=False,
+                    search_trace=trace,
+                )
+
+        trace.append("[Resolved] All search attempts exhausted. No whitelisted candidate pages found -> Status: NOT_FOUND")
         return ResolvedReference(
             product_id=product.product_id,
             reference_url=None,
@@ -347,4 +433,5 @@ class ResolveReferenceUseCase:
             status="NOT_FOUND",
             candidate_urls=[],
             is_cached=False,
+            search_trace=trace,
         )

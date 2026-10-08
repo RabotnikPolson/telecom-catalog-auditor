@@ -60,6 +60,7 @@ class AuditResult(BaseModel):
         default_factory=lambda: datetime.now(timezone.utc)
     )
     details: str | None = Field(default=None)
+    search_trace: list[str] = Field(default_factory=list)
     execution_time_sec: float = Field(default=0.0)
     crawler_time_sec: float = Field(default=0.0)
     llm_time_sec: float = Field(default=0.0)

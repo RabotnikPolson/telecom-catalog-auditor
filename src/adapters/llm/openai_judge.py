@@ -169,15 +169,16 @@ class OpenAIJudge:
             return clean_title, None
 
         system_msg = (
-            "Ты поисковый ассистент каталога электроники. Твоя задача — извлечь из сырого названия товара "
-            "истинный бренд производителя и краткую поисковую строку по формуле: [Бренд] + [Модель] + [Аппаратная модификация (память, процессор, ревизия, если есть)].\n"
-            "ПРАВИЛА:\n"
-            "1. В поле 'brand' укажи только имя бренда производителя (например, TP-Link, Apple, Xiaomi, Keenetic, Яндекс, Samsung, Camelion, D-Link).\n"
-            "2. В поле 'clean_query' укажи очищенную поисковую строку. Удали начальное общее наименование категории (смартфон, ноутбук, беспроводной роутер, настольная лампа), цвет, рекламные лозунги и упаковочный шум.\n"
-            "3. Ответь СТРОГО в формате JSON:\n"
+            "You are an e-commerce search query assistant. Your task is to extract from a raw product title "
+            "the authentic manufacturer brand and a concise search query following the formula: "
+            "[Brand] + [Model] + [Hardware variant/modification (memory, processor, revision, if present)].\n"
+            "RULES:\n"
+            "1. In the 'brand' field, specify only the manufacturer brand name (e.g. TP-Link, Apple, Xiaomi, Keenetic, Yandex, Samsung, Camelion, D-Link).\n"
+            "2. In the 'clean_query' field, specify the cleaned search string. Strip leading generic category names (smartphone, laptop, wireless router, desk lamp), color, promotional slogans, and packaging noise.\n"
+            "3. Respond STRICTLY in JSON format:\n"
             '{"brand": "...", "clean_query": "..."}'
         )
-        user_msg = f"Название товара: {clean_title}"
+        user_msg = f"Product title: {clean_title}"
 
         payload = {
             "model": self.model,
@@ -240,12 +241,13 @@ class OpenAIJudge:
                 brand = str(parsed.get("brand") or "").strip().strip('"').strip("'") or None
                 if clean_q:
                     return clean_q, brand
+                return default_title, brand
         except Exception:
             pass
 
         # 2. Fallback to plain text string (e.g. from mock tests or unstructured LLM output)
         first_line = clean.splitlines()[0].strip().strip('"').strip("'")
-        if first_line:
+        if first_line and not first_line.startswith("{"):
             tokens = first_line.split()
             fallback_brand = tokens[0] if tokens else None
             return first_line, fallback_brand

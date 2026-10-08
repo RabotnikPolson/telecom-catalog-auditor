@@ -377,6 +377,8 @@ class SQLiteProductRepository:
             else datetime.now(timezone.utc)
         )
         keys = row.keys()
+        trace_raw = row["search_trace_json"] if "search_trace_json" in keys else None
+        search_trace = [str(x) for x in json.loads(trace_raw)] if trace_raw else []
         return AuditResult(
             product_id=row["product_id"],
             status=AuditStatus(row["status"]),
@@ -388,6 +390,7 @@ class SQLiteProductRepository:
             total_specs_count=row["total_specs_count"],
             audited_at=audited_at,
             details=row["details"],
+            search_trace=search_trace,
             execution_time_sec=row["execution_time_sec"] if "execution_time_sec" in keys and row["execution_time_sec"] is not None else 0.0,
             crawler_time_sec=row["crawler_time_sec"] if "crawler_time_sec" in keys and row["crawler_time_sec"] is not None else 0.0,
             llm_time_sec=row["llm_time_sec"] if "llm_time_sec" in keys and row["llm_time_sec"] is not None else 0.0,
@@ -402,8 +405,8 @@ class SQLiteProductRepository:
             product_id, status, confidence_score, reference_url,
             discrepancies_json, missing_specs_json, matched_specs_count, total_specs_count,
             audited_at, details, execution_time_sec, crawler_time_sec, llm_time_sec,
-            input_tokens, output_tokens, estimated_cost_usd
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            input_tokens, output_tokens, estimated_cost_usd, search_trace_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         disc_json = json.dumps(
             [d.model_dump() for d in result.discrepancies],
@@ -413,6 +416,7 @@ class SQLiteProductRepository:
             [m.model_dump() for m in result.missing_specs],
             ensure_ascii=False
         )
+        trace_json = json.dumps(result.search_trace, ensure_ascii=False) if result.search_trace else None
         now_iso = result.audited_at.isoformat()
         with get_sqlite_connection(self.db_path) as conn:
             cursor = conn.execute(
@@ -434,6 +438,7 @@ class SQLiteProductRepository:
                     result.input_tokens,
                     result.output_tokens,
                     result.estimated_cost_usd,
+                    trace_json,
                 ),
             )
             audit_id = cursor.lastrowid
