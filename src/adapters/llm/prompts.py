@@ -12,16 +12,17 @@ RULES:
      * Packaging descriptors: 'Retail', 'Box', 'Bulk'.
      Treat products with matching core models and harmless markers as IDENTICAL. Strictly prohibited to flag them as NOT_FOUND or as discrepancies.
 
-   - HARDWARE REVISIONS & DISTINCT MODELS (DIFFERENT PRODUCT — IMMEDIATE NOT_FOUND):
+   - HARDWARE REVISIONS, SUB-MODIFICATIONS & DISTINCT MODELS (DIFFERENT PRODUCT — IMMEDIATE NOT_FOUND):
      * Core alphanumeric model index differentiation (e.g., 'B535-232' vs 'B535-232a' / 'B535-232a-LTE', 'TL-WR841N' vs 'TL-WR841ND', 'Archer C6' vs 'Archer C6U').
      * Hardware version / revision marks (e.g., 'V1' vs 'V2' vs 'V3', 'Rev. A' vs 'Rev. B').
      * Product family tier modifiers (e.g., base model vs 'Pro', 'Plus', 'Max', 'Ultra', 'Lite', 'SE', 'Mini').
      * Core generation differences (e.g., 'Band 7' vs 'Band 8', '2nd Gen' vs '3rd Gen').
+     * Configuration & Sub-model Execution Indices: Numerical or alphanumeric execution/modification codes indicating an alternate functional assembly, component layout (e.g. number of burners, engine type, capacity, power tier, port layout), or distinct hardware configuration. If the store specifies a base model and the reference describes a specific sub-modification with divergent functional capabilities, this represents a DISTINCT HARDWARE VARIANT.
      If the store specifies an exact model (e.g., 'B535-232') and the reference is specifically for a different hardware revision/model (e.g., 'B535-232a'), this is a DIFFERENT PRODUCT.
 
    - TOKEN CONSERVATION & IMMEDIATE NOT_FOUND:
      * When a hardware revision mismatch or completely different device is identified, DO NOT burn tokens comparing or listing specs!
-     * Instantly return status "NOT_FOUND" with empty discrepancies and missing_specs, and a concise 1-sentence Russian verdict in "details" (e.g., "Несовпадение аппаратной ревизии/модели: эталон описывает модификацию B535-232a, тогда как на витрине заявлена B535-232.").
+     * Instantly return status "NOT_FOUND" with empty discrepancies and missing_specs, and a concise 1-sentence Russian verdict in "details" (e.g., "Несовпадение аппаратной ревизии/модификации: эталон описывает иную комплектацию или ревизию устройства.").
 
 2. DISCREPANCY VERIFICATION PROTOCOL (FORMAL NLI):
    A genuine discrepancy ("MISMATCH") exists IF AND ONLY IF two specifications are MUTUALLY EXCLUSIVE (P ∧ Q = ⊥) — they physically CANNOT both be true simultaneously for the same physical object.
