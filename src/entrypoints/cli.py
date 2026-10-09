@@ -590,7 +590,7 @@ async def run_audit_command(args: argparse.Namespace) -> int:
         print("    Pass --openai-key <KEY> or set OPENAI_API_KEY in .env.")
 
     judge = OpenAIJudge(api_key=openai_key)
-    vendor_resolver = VendorDirectResolver(timeout=10.0)
+    vendor_resolver = VendorDirectResolver()
     serper_client = SerperClient(api_key=settings.SERPER_API_KEY)
     ref_resolver = ResolveReferenceUseCase(
         repository=repo,

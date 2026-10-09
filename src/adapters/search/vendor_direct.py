@@ -57,11 +57,11 @@ class VendorDirectResolver:
             )
             should_close = True
 
-        is_valid = await self.verify_url_availability(search_url, client=client)
-        if not is_valid:
-            return VendorResolutionResult(is_available=False, reference_url=None)
-
         try:
+            is_valid = await self.verify_url_availability(search_url, client=client)
+            if not is_valid:
+                return VendorResolutionResult(is_available=False, reference_url=None)
+
             if self._last_checked_response and self._last_checked_response[0] == search_url:
                 response = self._last_checked_response[1]
             else:
