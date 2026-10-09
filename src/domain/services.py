@@ -80,6 +80,11 @@ class ParentChildGrouper:
         r"blue\s+titanium",
         r"cosmic\s+black",
         r"prism\s+white",
+        r"ocean\s+blue",
+        r"винн(?:ый|ая|ое|ом|ые)?\s+красн(?:ый|ая|ое|ом|ые)?",
+        r"т[её]мно[- ]син(?:ий|яя|ее|ем|ие)?",
+        r"светло[- ]син(?:ий|яя|ее|ем|ие)?",
+        r"т[её]мно[- ]сер(?:ый|ая|ое|ом|ые)?",
     ]
 
     SINGLE_WORD_COLORS: list[str] = [
@@ -106,6 +111,8 @@ class ParentChildGrouper:
         r"мятн(?:ый|ая|ое|ом|ые)?",
         r"бирюзов(?:ый|ая|ое|ом|ые)?",
         r"бежев(?:ый|ая|ое|ом|ые)?",
+        r"винн(?:ый|ая|ое|ом|ые)?",
+        r"ocean",
         r"midnight",
         r"starlight",
         r"graphite",

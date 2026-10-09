@@ -226,6 +226,51 @@ class SQLiteProductRepository:
             cursor = conn.execute(sql)
             return cursor.fetchone()[0]
 
+    def get_audited_product_ids(self) -> set[int]:
+        sql = "SELECT DISTINCT product_id FROM audit_results;"
+        with get_sqlite_connection(self.db_path) as conn:
+            cursor = conn.execute(sql)
+            return {int(row[0]) for row in cursor.fetchall()}
+
+    def get_audited_master_keys(self) -> set[str]:
+        self.backfill_master_keys()
+        sql = """
+            SELECT DISTINCT p.master_key 
+            FROM audit_results a
+            JOIN products p ON a.product_id = p.product_id
+            WHERE p.master_key IS NOT NULL AND p.master_key != '';
+        """
+        with get_sqlite_connection(self.db_path) as conn:
+            cursor = conn.execute(sql)
+            return {str(row[0]) for row in cursor.fetchall() if row[0]}
+
+    def backfill_master_keys(self) -> int:
+        from src.domain.services import ParentChildGrouper
+        grouper = ParentChildGrouper()
+        with get_sqlite_connection(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT product_id, title, current_specs FROM products WHERE master_key IS NULL OR master_key = '';"
+            )
+            rows = cursor.fetchall()
+            if not rows:
+                return 0
+            updates = []
+            for row in rows:
+                p_id, title, specs_raw = row[0], row[1], row[2]
+                try:
+                    specs = json.loads(specs_raw) if specs_raw else {}
+                except Exception:
+                    specs = {}
+                try:
+                    m_key = grouper.extract_master_key(title, specs)
+                    updates.append((m_key, p_id))
+                except Exception:
+                    pass
+            if updates:
+                conn.executemany("UPDATE products SET master_key = ? WHERE product_id = ?;", updates)
+                conn.commit()
+            return len(updates)
+
     def save_url_cache(
         self,
         query_hash: str,

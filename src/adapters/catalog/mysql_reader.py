@@ -292,11 +292,79 @@ class MySQLCatalogReader:
                 row = await cur.fetchone()
                 return int(row["cnt"]) if row else 0
 
+    async def get_categories(self, only_active: bool = True) -> list[dict[str, Any]]:
+        """List main categories with active/total product counts."""
+        pool = self._ensure_connected()
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await self._init_session(cur)
+                g = chr(96) + "groups" + chr(96)
+                query = f"""
+                    SELECT 
+                        c.id, c.name, c.urlkey,
+                        COUNT(DISTINCT CASE WHEN pp.enabled = 1 THEN p.id END) as active_count,
+                        COUNT(DISTINCT p.id) as total_count
+                    FROM categories c
+                    LEFT JOIN sub_categories sc ON sc.categories_id = c.id
+                    LEFT JOIN {g} g ON g.sub_categories_id = sc.id
+                    LEFT JOIN products p ON p.category_id = g.id
+                    LEFT JOIN partner_products pp ON p.id = pp.product_id
+                    GROUP BY c.id, c.name, c.urlkey
+                    {"HAVING active_count > 0" if only_active else ""}
+                    ORDER BY active_count DESC;
+                """
+                await cur.execute(query)
+                return await cur.fetchall()
+
+    async def get_groups(
+        self,
+        main_category_id: int | None = None,
+        search: str | None = None,
+        only_active: bool = True,
+    ) -> list[dict[str, Any]]:
+        """List product groups with active/total product counts."""
+        pool = self._ensure_connected()
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await self._init_session(cur)
+                g = chr(96) + "groups" + chr(96)
+                conditions = []
+                params: list[Any] = []
+                if main_category_id is not None:
+                    conditions.append("c.id = %s")
+                    params.append(main_category_id)
+                if search:
+                    conditions.append("(g.name LIKE %s OR g.urlkey LIKE %s)")
+                    params.extend([f"%{search}%", f"%{search}%"])
+
+                where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+                query = f"""
+                    SELECT 
+                        g.id as group_id, g.name as group_name, g.urlkey as group_urlkey,
+                        c.id as cat_id, c.name as cat_name,
+                        sc.id as sub_id, sc.name as sub_name,
+                        COUNT(DISTINCT CASE WHEN pp.enabled = 1 THEN p.id END) as active_count,
+                        COUNT(DISTINCT p.id) as total_count
+                    FROM {g} g
+                    JOIN sub_categories sc ON g.sub_categories_id = sc.id
+                    JOIN categories c ON sc.categories_id = c.id
+                    LEFT JOIN products p ON p.category_id = g.id
+                    LEFT JOIN partner_products pp ON p.id = pp.product_id
+                    {where_clause}
+                    GROUP BY g.id, g.name, g.urlkey, c.id, c.name, sc.id, sc.name
+                    {"HAVING active_count > 0" if only_active else ""}
+                    ORDER BY active_count DESC;
+                """
+                await cur.execute(query, tuple(params))
+                return await cur.fetchall()
+
     async def stream_products(
         self,
         batch_size: int = 500,
         limit: int | None = None,
+        offset: int = 0,
         category_id: int | None = None,
+        main_category_id: int | None = None,
         only_active: bool = True,
     ) -> AsyncIterator[list[Product]]:
         """
@@ -304,7 +372,7 @@ class MySQLCatalogReader:
         Yields list[Product] per batch.
         """
         pool = self._ensure_connected()
-        offset = 0
+        cur_offset = offset
         total_yielded = 0
 
         async with pool.acquire() as conn:
@@ -331,6 +399,13 @@ class MySQLCatalogReader:
                         where_conditions.append("p.category_id = %s")
                         params.append(category_id)
 
+                    if main_category_id is not None:
+                        g = chr(96) + "groups" + chr(96)
+                        where_conditions.append(
+                            f"p.category_id IN (SELECT g.id FROM {g} g JOIN sub_categories sc ON g.sub_categories_id = sc.id WHERE sc.categories_id = %s)"
+                        )
+                        params.append(main_category_id)
+
                     where_clause = ""
                     if where_conditions:
                         where_clause = "WHERE " + " AND ".join(where_conditions)
@@ -348,7 +423,7 @@ class MySQLCatalogReader:
                         ORDER BY p.id ASC
                         LIMIT %s OFFSET %s;
                     """
-                    params.extend([cur_batch_size, offset])
+                    params.extend([cur_batch_size, cur_offset])
                     await cur.execute(query, tuple(params))
                     rows = await cur.fetchall()
 
@@ -384,7 +459,7 @@ class MySQLCatalogReader:
 
                     yield batch_products
                     total_yielded += len(batch_products)
-                    offset += len(rows)
+                    cur_offset += len(rows)
 
                     if len(rows) < cur_batch_size:
                         break

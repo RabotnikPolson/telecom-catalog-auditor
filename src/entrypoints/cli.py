@@ -4,6 +4,7 @@ import io
 import os
 from pathlib import Path
 import sys
+import time
 import warnings
 
 warnings.filterwarnings("ignore", message=".*urllib3.*or chardet.*doesn't match a supported version.*")
@@ -22,6 +23,7 @@ from src.adapters.llm.openai_judge import OpenAIJudge, GeminiJudge
 from src.adapters.search.serper_client import SerperClient
 from src.adapters.search.vendor_direct import VendorDirectResolver
 from src.domain.entities import AuditStatus, Product
+from src.domain.services import ParentChildGrouper
 from src.use_cases.audit_product import AuditProductUseCase
 from src.use_cases.crawl_shop_catalog import CrawlShopCatalogUseCase
 from src.use_cases.resolve_reference import ResolveReferenceUseCase
@@ -257,6 +259,48 @@ async def _live_sync_products(
     return products
 
 
+async def run_categories_command(args: argparse.Namespace) -> int:
+    setup_utf8_terminal()
+    settings = get_settings()
+    if not settings.MYSQL_HOST:
+        print("[!] Error: MySQL host is not configured in settings/env.")
+        return 1
+
+    async with MySQLCatalogReader() as reader:
+        main_cat_id = getattr(args, "main_cat", None)
+        search = getattr(args, "search", None)
+
+        if main_cat_id is not None or search:
+            groups = await reader.get_groups(main_category_id=main_cat_id, search=search, only_active=True)
+            # print("=" * 85)
+            print(f"CATALOG PRODUCT GROUPS (Active on Display) | Found: {len(groups)}")
+            if main_cat_id:
+                print(f"Filtered by Main Category ID: {main_cat_id}")
+            if search:
+                print(f"Search query: '{search}'")
+            print("=" * 85)
+            print(f"{'GROUP ID':<10} | {'GROUP NAME':<35} | {'CATEGORY':<25} | {'ACTIVE':<8}")
+            print("-" * 85)
+            for g in groups:
+                print(f"{g['group_id']:<10} | {g['group_name'][:35]:<35} | {g['cat_name'][:25]:<25} | {g['active_count']:<8}")
+            print("=" * 85)
+            print("Tip: Run audit on a group with: python main.py audit --group <GROUP_ID> --limit 10")
+            return 0
+        else:
+            categories = await reader.get_categories(only_active=True)
+            print("=" * 85)
+            print(f"CATALOG MAIN CATEGORIES (Active on Display) | Total: {len(categories)}")
+            print("=" * 85)
+            print(f"{'CAT ID':<8} | {'CATEGORY NAME':<35} | {'URL KEY':<25} | {'ACTIVE':<8}")
+            print("-" * 85)
+            for c in categories:
+                print(f"{c['id']:<8} | {c['name'][:35]:<35} | {c['urlkey'][:25]:<25} | {c['active_count']:<8}")
+            print("=" * 85)
+            print("Tip: To view product groups inside a category: python main.py categories --main-cat <ID>")
+            print("Tip: To search groups by name: python main.py categories --search 'роутер'")
+            return 0
+
+
 async def run_resolve_command(args: argparse.Namespace) -> int:
     setup_utf8_terminal()
     db_path = Path(args.db)
@@ -436,31 +480,102 @@ async def run_audit_command(args: argparse.Namespace) -> int:
         if not products:
             print(f"[!] Error: None of the specified products {target_keys} were found.")
             return 1
+        grouper = ParentChildGrouper()
+        for p in products:
+            if not p.master_key:
+                try:
+                    p.master_key = grouper.extract_master_key(p.title, p.current_specs)
+                except Exception:
+                    pass
     else:
         source_mode = getattr(args, "source", "mysql")
         products = []
+        skip_audited = getattr(args, "skip_audited", True) and not getattr(args, "force_refresh", False)
+        audited_ids: set[int] = set()
+        audited_master_keys: set[str] = set()
+        if skip_audited:
+            audited_ids = repo.get_audited_product_ids()
+            audited_master_keys = repo.get_audited_master_keys()
+            if audited_ids or audited_master_keys:
+                print(f"[*] Incremental Mode: Loaded {len(audited_ids)} audited products ({len(audited_master_keys)} master models) from DB (skipping).")
+
+        main_cat_id = getattr(args, "main_cat", None)
+        group_id = getattr(args, "group", None)
+        cat_arg = getattr(args, "category", None)
+        if cat_arg and str(cat_arg).isdigit():
+            group_id = int(cat_arg)
+
+        target_limit = args.limit or 5
+        grouper = ParentChildGrouper()
+        seen_batch_master_keys: set[str] = set()
+        skipped_count = 0
+
         if source_mode == "mysql" and settings.MYSQL_HOST:
-            print(f"[*] Streaming active products directly from shop MySQL (READ-ONLY, limit={args.limit or 'ALL'})...")
+            filter_desc = []
+            if main_cat_id:
+                filter_desc.append(f"Main Cat #{main_cat_id}")
+            if group_id:
+                filter_desc.append(f"Group #{group_id}")
+            desc_str = f" ({', '.join(filter_desc)})" if filter_desc else ""
+            print(f"[*] Streaming active products directly from shop MySQL (READ-ONLY, limit={target_limit}{desc_str})...")
             try:
-                cat_arg = getattr(args, "category", None)
-                cat_id = int(cat_arg) if (cat_arg and str(cat_arg).isdigit()) else None
                 async with MySQLCatalogReader() as mysql_reader:
                     async for batch in mysql_reader.stream_products(
-                        batch_size=min(500, args.limit or 500),
-                        limit=args.limit,
-                        category_id=cat_id,
+                        batch_size=min(500, max(50, target_limit * 4)),
+                        offset=getattr(args, "offset", 0) or 0,
+                        category_id=group_id,
+                        main_category_id=main_cat_id,
                         only_active=True,
                     ):
-                        products.extend(batch)
+                        grouper.group_products(batch)
+                        for prod in batch:
+                            if not prod.is_master:
+                                skipped_count += 1
+                                continue
+                            if skip_audited:
+                                if prod.product_id in audited_ids:
+                                    skipped_count += 1
+                                    continue
+                                if prod.master_key and prod.master_key in audited_master_keys:
+                                    skipped_count += 1
+                                    continue
+                            if prod.master_key:
+                                if prod.master_key in seen_batch_master_keys:
+                                    skipped_count += 1
+                                    continue
+                                seen_batch_master_keys.add(prod.master_key)
+
+                            products.append(prod)
+                            if len(products) >= target_limit:
+                                break
+                        if len(products) >= target_limit:
+                            break
             except Exception as e:
                 print(f"[!] MySQL streaming error: {e}. Falling back to local DB.")
 
         if not products:
-            products = repo.get_auditable_products(limit=args.limit)
+            db_candidates = repo.get_auditable_products(limit=target_limit * 4, offset=getattr(args, "offset", 0) or 0)
+            if db_candidates:
+                grouper.group_products(db_candidates)
+                for prod in db_candidates:
+                    if not prod.is_master:
+                        continue
+                    if skip_audited:
+                        if prod.product_id in audited_ids:
+                            continue
+                        if prod.master_key and prod.master_key in audited_master_keys:
+                            continue
+                    if prod.master_key:
+                        if prod.master_key in seen_batch_master_keys:
+                            continue
+                        seen_batch_master_keys.add(prod.master_key)
+                    products.append(prod)
+                    if len(products) >= target_limit:
+                        break
 
         if not products:
-            print(f"[!] No auditable products found in database {db_path} or MySQL.")
-            return 1
+            print(f"[*] No un-audited master products found (all audited or none match filter).")
+            return 0
 
     settings = get_settings()
     openai_key = (
@@ -504,7 +619,7 @@ async def run_audit_command(args: argparse.Namespace) -> int:
     print(f"LLM Engine    : OpenAI (model: {settings.OPENAI_MODEL})")
     print(f"Headless      : {not args.no_headless}")
     print(f"Force Refresh : {args.force_refresh}")
-    print("-" * 80)
+    # print("-" * 80)
 
     try:
         await crawler.start()
@@ -517,18 +632,20 @@ async def run_audit_command(args: argparse.Namespace) -> int:
         total_time_all = 0.0
         total_tokens_all = 0
         total_cost_all = 0.0
+        start_time_all = time.perf_counter()
+        total_products_count = len(products)
 
         for idx, prod in enumerate(products, 1):
-            print(f"[{idx:02d}/{len(products)}] Product ID #{prod.product_id} | {prod.title[:150]}")
-            print(f"      Shop SKU: {prod.shop_sku or 'N/A'} | Vendor SKU: {prod.vendor_sku or 'N/A'} | Barcode: {prod.barcode or 'N/A'}")
+            print(f"[{idx:02d}/{total_products_count}] Product ID #{prod.product_id} | SKU: {prod.shop_sku or 'N/A'} | {prod.title[:150]}")
             print(f"      Shop URL: https://shop.telecom.kz/product/{prod.product_id}")
-            print(f"      Current Specs Count: {len(prod.current_specs)}")
 
             result = await audit_use_case.audit_product(
                 product=prod,
                 reference_url=args.reference_url if len(products) == 1 else None,
                 force_refresh=args.force_refresh,
             )
+            if prod.master_key:
+                audited_master_keys.add(prod.master_key)
 
             if result.status == AuditStatus.VERIFIED:
                 verified_count += 1
@@ -728,6 +845,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to SQLite database (default: catalog_audit.db)",
     )
 
+    cat_parser = subparsers.add_parser("categories", help="List shop catalog categories and product groups")
+    cat_parser.add_argument(
+        "--main-cat",
+        type=int,
+        default=None,
+        help="Filter groups within main category ID (e.g. 11 for 'Все для интернета')",
+    )
+    cat_parser.add_argument(
+        "--search",
+        type=str,
+        default=None,
+        help="Search groups by keyword (e.g. 'роутер' or 'wi-fi')",
+    )
+
     audit_parser = subparsers.add_parser("audit", help="Run 1-shot factual audit against external reference")
     audit_parser.add_argument(
         "--product-id",
@@ -762,6 +893,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Category ID to filter active products from MySQL (e.g. 416)",
+    )
+    audit_parser.add_argument(
+        "--main-cat",
+        type=int,
+        default=None,
+        help="Filter active products by main category ID (e.g. 11 for 'Все для интернета', 1 for 'Смартфоны')",
+    )
+    audit_parser.add_argument(
+        "--group",
+        type=int,
+        default=None,
+        help="Filter active products by product group ID (e.g. 78 for 'Модемы и сетевое оборудование WI-FI')",
+    )
+    audit_parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Starting product offset (default: 0)",
+    )
+    audit_parser.add_argument(
+        "--skip-audited",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip products already audited in database (default: True, use --no-skip-audited to disable)",
     )
     audit_parser.add_argument(
         "--limit",
@@ -817,7 +972,10 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.subcommand == "crawl":
+    if args.subcommand == "categories":
+        exit_code = asyncio.run(run_categories_command(args))
+        sys.exit(exit_code)
+    elif args.subcommand == "crawl":
         exit_code = asyncio.run(run_crawl_command(args))
         sys.exit(exit_code)
     elif args.subcommand == "resolve":
