@@ -473,6 +473,7 @@ async def run_audit_command(args: argparse.Namespace) -> int:
     settings = get_settings()
 
     target_keys = _extract_target_keys(args)
+    audited_master_keys: set[str] = set()
 
     if target_keys:
         source_mode = getattr(args, "source", "mysql")

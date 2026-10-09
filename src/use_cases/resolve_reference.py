@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass, field
 import hashlib
 import re
@@ -123,9 +124,19 @@ class ResolveReferenceUseCase:
                     )
 
             if self.verify_direct_urls:
-                res = await self.vendor_resolver.resolve_vendor_card(
+                # Concurrent lookup: probe supplier card while simultaneously running search cascade
+                cascade_trace: list[str] = list(trace)
+                vendor_task = self.vendor_resolver.resolve_vendor_card(
                     product.vendor_name, product.vendor_sku
                 )
+                cascade_task = self._execute_search_cascade(
+                    product,
+                    scenario_override="SCENARIO_2_VENDOR_FALLBACK",
+                    force_refresh=force_refresh,
+                    trace=cascade_trace,
+                )
+                res, cascade_ref = await asyncio.gather(vendor_task, cascade_task)
+
                 if res.is_available and res.reference_url:
                     final_url = res.reference_url
                     source_type = "VENDOR_DIRECT"
@@ -135,6 +146,10 @@ class ResolveReferenceUseCase:
                         final_url = kaspi_direct
                         source_type = "VENDOR_KASPI_DIRECT"
                         candidates = [kaspi_direct, res.reference_url]
+
+                    for cand in cascade_ref.candidate_urls:
+                        if cand not in candidates:
+                            candidates.append(cand)
 
                     self.repo.save_url_cache(q_hash, final_url, source_type=source_type)
                     trace.append(f"[Vendor Direct] Active product card found: {final_url} (Kaspi code: {res.kaspi_code or 'N/A'})")
@@ -150,10 +165,13 @@ class ResolveReferenceUseCase:
                         is_cached=False,
                         search_trace=trace,
                     )
-                trace.append("[Vendor Direct] Supplier card unavailable or 404, falling back to search cascade")
-                return await self._execute_search_cascade(
-                    product, scenario_override="SCENARIO_2_VENDOR_FALLBACK", force_refresh=force_refresh, trace=trace
-                )
+
+                trace.append("[Vendor Direct] Supplier card unavailable or 404, using concurrent search cascade")
+                for step in cascade_trace:
+                    if step not in trace:
+                        trace.append(step)
+                cascade_ref.search_trace = trace
+                return cascade_ref
 
             direct_url = self.vendor_resolver.build_direct_url(
                 product.vendor_name, product.vendor_sku
@@ -291,14 +309,25 @@ class ResolveReferenceUseCase:
                 seen_urls.add(url_clean)
                 candidate_pool.append(url_clean)
 
-        # 1. KASPI FIRST: Search on Kaspi.kz marketplace directly
+        # 1. KASPI FIRST & 2. GENERAL RETAILERS / OFFICIAL SITES (Concurrent via asyncio.gather)
         kaspi_query = f"site:kaspi.kz {clean_model_query}"
+        general_query = clean_model_query
         trace.append(f"[Kaspi Search] Query: '{kaspi_query}'")
-        kaspi_results = await self.serper_client.search_and_filter(
+        trace.append(f"[General Search] Query: '{general_query}'")
+
+        kaspi_task = self.serper_client.search_and_filter(
             query=kaspi_query,
             whitelist_domains=self.whitelist_domains,
             num_results=5,
         )
+        general_task = self.serper_client.search_and_filter(
+            query=general_query,
+            whitelist_domains=self.whitelist_domains,
+            num_results=10,
+        )
+
+        kaspi_results, general_results = await asyncio.gather(kaspi_task, general_task)
+
         if kaspi_results:
             kaspi_candidate_links = [
                 str(item.get("link") or "").strip()
@@ -311,14 +340,6 @@ class ResolveReferenceUseCase:
             for link in kaspi_candidate_links:
                 add_candidate(link)
 
-        # 2. GENERAL RETAILERS & OFFICIAL SITES: Broad search across whitelisted domains (DNS, Sulpak, Mechta, Shop.kz, mi.com, etc.)
-        general_query = clean_model_query
-        trace.append(f"[General Search] Query: '{general_query}'")
-        general_results = await self.serper_client.search_and_filter(
-            query=general_query,
-            whitelist_domains=self.whitelist_domains,
-            num_results=10,
-        )
         if general_results:
             sorted_res = self._sort_by_domain_priority(
                 general_results, product, clean_query=clean_model_query, brand=extracted_brand

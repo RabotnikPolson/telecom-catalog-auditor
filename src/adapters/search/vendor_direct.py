@@ -14,8 +14,9 @@ class VendorResolutionResult:
 
 class VendorDirectResolver:
 
-    def __init__(self, timeout: float = 10.0) -> None:
+    def __init__(self, timeout: float = 2.0) -> None:
         self.timeout = timeout
+        self._last_checked_response: tuple[str, httpx.Response] | None = None
 
     def build_direct_url(
         self, vendor_name: Optional[str], vendor_sku: Optional[str]
@@ -61,7 +62,11 @@ class VendorDirectResolver:
             return VendorResolutionResult(is_available=False, reference_url=None)
 
         try:
-            response = await client.get(search_url) if client else None
+            if self._last_checked_response and self._last_checked_response[0] == search_url:
+                response = self._last_checked_response[1]
+            else:
+                response = await client.get(search_url) if client else None
+
             if not response or response.status_code >= 400:
                 return VendorResolutionResult(is_available=False, reference_url=None)
 
@@ -132,6 +137,7 @@ class VendorDirectResolver:
 
         try:
             response = await client.get(url)
+            self._last_checked_response = (url, response)
             if response.status_code >= 400:
                 return False
 

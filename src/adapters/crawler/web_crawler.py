@@ -96,6 +96,48 @@ class WebCrawler:
                     runtime: {}
                 };
             """)
+
+            # Route filter: abort images, fonts, media, and heavy analytics trackers
+            async def _route_filter(route: Any) -> None:
+                try:
+                    req = route.request
+                    res_type = req.resource_type
+                    req_url_lower = req.url.lower()
+
+                    if res_type in ("image", "media", "font"):
+                        await route.abort()
+                        return
+
+                    if any(
+                        ext in req_url_lower
+                        for ext in (
+                            ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg",
+                            ".ico", ".woff", ".woff2", ".ttf", ".otf", ".mp4", ".mp3",
+                        )
+                    ):
+                        await route.abort()
+                        return
+
+                    if any(
+                        tracker in req_url_lower
+                        for tracker in (
+                            "google-analytics.com",
+                            "googletagmanager.com",
+                            "mc.yandex.ru",
+                            "yandex.ru/metrika",
+                            "hotjar.com",
+                            "connect.facebook.net",
+                        )
+                    ):
+                        await route.abort()
+                        return
+
+                    await route.continue_()
+                except Exception:
+                    pass
+
+            await context.route("**/*", _route_filter)
+
             page = await context.new_page()
             try:
                 response = await page.goto(
@@ -105,12 +147,17 @@ class WebCrawler:
                 )
                 status_code = response.status if response else 200
 
+                # Fast selector wait: wait for content/specs rather than hanging 3s on networkidle
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=3000)
+                    await page.wait_for_selector(
+                        "table, dl, .specifications, [itemprop='description'], h1",
+                        timeout=2000,
+                    )
                 except Exception:
                     pass
 
-                await page.wait_for_timeout(800)
+                # Brief debounce for JavaScript hydration
+                await page.wait_for_timeout(300)
 
                 spoiler_selectors = [
                     "button:has-text('Все характеристики')",
@@ -129,9 +176,9 @@ class WebCrawler:
                 for selector in spoiler_selectors:
                     try:
                         locator = page.locator(selector).first
-                        if await locator.is_visible(timeout=300):
-                            await locator.click(timeout=800)
-                            await page.wait_for_timeout(400)
+                        if await locator.is_visible():
+                            await locator.click(timeout=600)
+                            await page.wait_for_timeout(250)
                     except Exception:
                         continue
 
