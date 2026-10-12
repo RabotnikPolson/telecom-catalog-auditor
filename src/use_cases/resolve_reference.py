@@ -9,6 +9,7 @@ from src.adapters.db.sqlite_repo import SQLiteProductRepository
 from src.adapters.search.serper_client import SerperClient
 from src.adapters.search.vendor_direct import VendorDirectResolver
 from src.domain.entities import Product
+from src.adapters.llm.openai_judge import SearchQueryBundle
 
 
 @dataclass
@@ -263,25 +264,45 @@ class ResolveReferenceUseCase:
         if trace is None:
             trace = []
 
-        # STEP 1 (PRIMARY): Clean Brand + Model Search (via LLM query cleaner or heuristic)
-        clean_model_query = None
-        extracted_brand = None
-        if self.judge and hasattr(self.judge, "clean_search_query"):
+        # STEP 1 (PRIMARY): Deconstruct Brand, Marketing Model, and Model Code
+        bundle: SearchQueryBundle | None = None
+        if self.judge and hasattr(self.judge, "decompose_search_query"):
             try:
-                res = await self.judge.clean_search_query(product.title)
-                if isinstance(res, tuple):
-                    clean_model_query, extracted_brand = res
-                elif isinstance(res, str):
-                    clean_model_query = res
+                bundle = await self.judge.decompose_search_query(product.title, vendor_name=product.vendor_name)
             except Exception:
-                clean_model_query = None
-                extracted_brand = None
+                bundle = None
+
+        if not bundle:
+            from src.adapters.llm.openai_judge import OpenAIJudge
+            bundle = OpenAIJudge._heuristic_decompose(product.title, vendor_name=product.vendor_name)
+
+        is_internal_sku = False
+        if product.vendor_name:
+            v_lower = product.vendor_name.lower().strip()
+            if any(w in v_lower for w in ["основной склад", "главный склад", "собственный склад", "склад"]):
+                is_internal_sku = True
+        if product.shop_sku and product.vendor_sku and str(product.shop_sku).strip() == str(product.vendor_sku).strip():
+            is_internal_sku = True
 
         source_type = "MODEL_SEARCH"
-        if not clean_model_query:
-            clean_model_query, source_type = self._build_title_query(product)
+        if not is_internal_sku and product.vendor_sku and product.vendor_sku.strip():
+            v_sku = product.vendor_sku.strip()
+            source_type = "PROVIDER_SKU_SEARCH"
+            if v_sku.lower() not in bundle.marketing_model.lower():
+                bundle = SearchQueryBundle(
+                    brand=bundle.brand,
+                    marketing_model=f"{bundle.marketing_model} {v_sku}".strip(),
+                    model_code=bundle.model_code,
+                    brand_aliases=bundle.brand_aliases,
+                )
 
-        trace.append(f"[Query Extraction] Clean model query: '{clean_model_query}', Brand: '{extracted_brand or 'N/A'}'")
+        clean_model_query = bundle.marketing_model
+        extracted_brand = bundle.brand
+
+        trace.append(
+            f"[Query Extraction] Marketing: '{bundle.marketing_model}', Code: '{bundle.model_code or 'N/A'}', "
+            f"Brand: '{bundle.brand or 'N/A'}', Aliases: {bundle.brand_aliases}"
+        )
 
         q_hash = self.compute_query_hash(product, clean_model_query)
         if self.use_url_cache and not force_refresh:
@@ -309,11 +330,11 @@ class ResolveReferenceUseCase:
                 seen_urls.add(url_clean)
                 candidate_pool.append(url_clean)
 
-        # 1. KASPI FIRST & 2. GENERAL RETAILERS / OFFICIAL SITES (Concurrent via asyncio.gather)
-        kaspi_query = f"site:kaspi.kz {clean_model_query}"
-        general_query = clean_model_query
-        trace.append(f"[Kaspi Search] Query: '{kaspi_query}'")
-        trace.append(f"[General Search] Query: '{general_query}'")
+        # VECTOR 1: Commercial Marketing Model Search (Kaspi + General, concurrent via asyncio.gather)
+        kaspi_query = f"site:kaspi.kz {bundle.marketing_model}"
+        general_query = bundle.marketing_model
+        trace.append(f"[Vector 1: Kaspi] Query: '{kaspi_query}'")
+        trace.append(f"[Vector 1: General] Query: '{general_query}'")
 
         kaspi_task = self.serper_client.search_and_filter(
             query=kaspi_query,
@@ -336,13 +357,13 @@ class ResolveReferenceUseCase:
                 and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
                 and "/shop/p/" in str(item.get("link") or "").lower()
             ]
-            trace.append(f"[Kaspi Search] Query returned {len(kaspi_results)} items, {len(kaspi_candidate_links)} valid Kaspi product cards")
+            trace.append(f"[Vector 1: Kaspi] Query returned {len(kaspi_results)} items, {len(kaspi_candidate_links)} valid Kaspi product cards")
             for link in kaspi_candidate_links:
                 add_candidate(link)
 
         if general_results:
             sorted_res = self._sort_by_domain_priority(
-                general_results, product, clean_query=clean_model_query, brand=extracted_brand
+                general_results, product, clean_query=bundle.marketing_model, brand=extracted_brand
             )
             general_links = [
                 str(item.get("link") or "").strip()
@@ -350,14 +371,59 @@ class ResolveReferenceUseCase:
                 if str(item.get("link") or "").strip()
                 and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
             ]
-            trace.append(f"[General Search] Query returned {len(general_results)} items, {len(general_links)} whitelisted")
+            trace.append(f"[Vector 1: General] Query returned {len(general_results)} items, {len(general_links)} whitelisted")
             for link in general_links:
                 add_candidate(link)
 
-        # 3. BARCODE SEARCH: If barcode exists and pool is small, search by barcode
-        if product.barcode and product.barcode.strip() and len(candidate_pool) < 4:
+        # VECTOR 2: Factory Model Code / Part Number (STRICT QUOTA GUARD: len(candidate_pool) < 2)
+        if len(candidate_pool) < 2 and bundle.model_code:
+            code_query = f"site:kaspi.kz {bundle.brand or ''} {bundle.model_code}".strip()
+            trace.append(f"[Vector 2: Code Search] (Quota Guard: pool size {len(candidate_pool)} < 2) Query: '{code_query}'")
+            code_results = await self.serper_client.search_and_filter(
+                query=code_query,
+                whitelist_domains=self.whitelist_domains,
+                num_results=5,
+            )
+            if code_results:
+                code_links = [
+                    str(item.get("link") or "").strip()
+                    for item in code_results
+                    if str(item.get("link") or "").strip()
+                    and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
+                    and "/shop/p/" in str(item.get("link") or "").lower()
+                ]
+                trace.append(f"[Vector 2: Code Search] Query returned {len(code_results)} items, {len(code_links)} valid Kaspi cards")
+                for link in code_links:
+                    add_candidate(link)
+
+        # VECTOR 3: Ecosystem Brand Aliases (STRICT QUOTA GUARD: len(candidate_pool) < 2)
+        if len(candidate_pool) < 2 and bundle.brand_aliases:
+            for alias in bundle.brand_aliases[:2]:
+                alias_query = f"site:kaspi.kz {alias} {bundle.marketing_model}"
+                trace.append(f"[Vector 3: Alias Search] (Quota Guard: pool size {len(candidate_pool)} < 2) Query: '{alias_query}'")
+                alias_results = await self.serper_client.search_and_filter(
+                    query=alias_query,
+                    whitelist_domains=self.whitelist_domains,
+                    num_results=5,
+                )
+                if alias_results:
+                    alias_links = [
+                        str(item.get("link") or "").strip()
+                        for item in alias_results
+                        if str(item.get("link") or "").strip()
+                        and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
+                        and "/shop/p/" in str(item.get("link") or "").lower()
+                    ]
+                    trace.append(f"[Vector 3: Alias Search] Query returned {len(alias_results)} items, {len(alias_links)} valid Kaspi cards")
+                    for link in alias_links:
+                        add_candidate(link)
+                if len(candidate_pool) >= 2:
+                    break
+
+        # VECTOR 4: Barcode Search (STRICT QUOTA GUARD: len(candidate_pool) < 2)
+        if len(candidate_pool) < 2 and product.barcode and product.barcode.strip():
             bc_query = f'"{product.barcode.strip()}"'
-            trace.append(f"[Barcode Search] Query: '{bc_query}'")
+            trace.append(f"[Vector 4: Barcode Search] (Quota Guard: pool size {len(candidate_pool)} < 2) Query: '{bc_query}'")
             bc_results = await self.serper_client.search_and_filter(
                 query=bc_query,
                 whitelist_domains=self.whitelist_domains,
@@ -365,7 +431,7 @@ class ResolveReferenceUseCase:
             )
             if bc_results:
                 sorted_bc = self._sort_by_domain_priority(
-                    bc_results, product, clean_query=clean_model_query, brand=extracted_brand
+                    bc_results, product, clean_query=bundle.marketing_model, brand=extracted_brand
                 )
                 bc_links = [
                     str(item.get("link") or "").strip()
@@ -373,23 +439,17 @@ class ResolveReferenceUseCase:
                     if str(item.get("link") or "").strip()
                     and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
                 ]
-                trace.append(f"[Barcode Search] Query returned {len(bc_results)} items, {len(bc_links)} whitelisted")
+                trace.append(f"[Vector 4: Barcode Search] Query returned {len(bc_results)} items, {len(bc_links)} whitelisted")
                 for link in bc_links:
                     add_candidate(link)
 
-        def _pool_priority(u: str) -> int:
-            d = extract_domain(u)
-            if "kaspi.kz" in d:
-                return 1
-            if "dns-shop.kz" in d:
-                return 2
-            if any(m in d for m in ["mi.com", "xiaomi.kz", "apple.com", "samsung.com", "tp-link.com", "tplink.com"]):
-                return 3
-            if any(m in d for m in ["shop.kz", "mechta.kz", "technodom.kz", "sulpak.kz", "fora.kz"]):
-                return 4
-            return 5
+        target_brand = extracted_brand
+        if not target_brand and clean_model_query:
+            parts = clean_model_query.split()
+            if parts:
+                target_brand = parts[0].strip()
 
-        candidate_pool.sort(key=_pool_priority)
+        candidate_pool.sort(key=lambda u: get_domain_priority(u, brand=target_brand))
 
         if candidate_pool:
             best_link = candidate_pool[0]

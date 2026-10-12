@@ -7,13 +7,24 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 import httpx
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from config.settings import get_settings
 from src.domain.entities import AuditResult, AuditStatus, DiscrepancyItem, MissingSpecItem, Product
 from .prompts import AUDIT_SYSTEM_PROMPT, build_audit_user_prompt
 
 logger = logging.getLogger(__name__)
+
+
+class SearchQueryBundle(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    brand: str | None = Field(default=None)
+    marketing_model: str = Field(...)
+    model_code: str | None = Field(default=None)
+    brand_aliases: list[str] = Field(default_factory=list)
+
+
+
 
 
 class LLMDiscrepancy(BaseModel):
@@ -157,26 +168,99 @@ class OpenAIJudge:
             or "low"
         )
 
-    async def clean_search_query(
-        self, title: str, vendor_name: str | None = None
-    ) -> tuple[str, str | None]:
+    @classmethod
+    def _heuristic_decompose(cls, title: str, vendor_name: str | None = None) -> SearchQueryBundle:
         """
-        Extracts clean Brand + Model query without noise and detects manufacturer brand.
-        Returns: (clean_query: str, brand: str | None)
+        Simple universal heuristic fallback to deconstruct title into commercial name and model code.
+        Runs locally without LLM calls or network requests.
+        """
+        clean_title = title.strip()
+        bracket_match = re.search(r"[\(\[](.*?)[\)\]]", clean_title)
+        model_code = bracket_match.group(1).strip() if bracket_match else None
+        marketing_part = re.sub(r"\s*[\(\[].*?[\)\]]", "", clean_title).strip()
+        tokens = marketing_part.split()
+        brand = tokens[0].strip(".,;:\"'") if tokens else None
+        return SearchQueryBundle(
+            brand=brand,
+            marketing_model=marketing_part if marketing_part else clean_title,
+            model_code=model_code,
+            brand_aliases=[],
+        )
+
+    @classmethod
+    def _safe_parse_bundle(
+        cls, raw_content: str, default_title: str, vendor_name: str | None = None
+    ) -> SearchQueryBundle | None:
+        """Safely parses LLM response into SearchQueryBundle."""
+        clean = raw_content.strip()
+        if not clean:
+            return None
+
+        try:
+            json_str = clean
+            if "{" in clean and "}" in clean:
+                m = re.search(r"\{[\s\S]*\}", clean)
+                if m:
+                    json_str = m.group(0)
+            parsed = json.loads(json_str)
+            if isinstance(parsed, dict):
+                brand = str(parsed.get("brand") or "").strip().strip('"').strip("'") or None
+                marketing = str(parsed.get("marketing_model") or parsed.get("clean_query") or "").strip().strip('"').strip("'")
+                code_raw = parsed.get("model_code")
+                model_code = str(code_raw).strip().strip('"').strip("'") if code_raw else None
+                aliases_raw = parsed.get("brand_aliases") or []
+                aliases = [str(a).strip() for a in aliases_raw if str(a).strip()] if isinstance(aliases_raw, list) else []
+
+                if marketing:
+                    return SearchQueryBundle(
+                        brand=brand,
+                        marketing_model=marketing,
+                        model_code=model_code,
+                        brand_aliases=aliases,
+                    )
+        except Exception:
+            pass
+
+        # Fallback to plain text string (e.g. from mock tests or unstructured LLM output)
+        first_line = clean.splitlines()[0].strip().strip('"').strip("'")
+        if first_line and not first_line.startswith("{"):
+            tokens = first_line.split()
+            fallback_brand = tokens[0] if tokens else None
+            return SearchQueryBundle(
+                brand=fallback_brand,
+                marketing_model=first_line,
+                model_code=None,
+                brand_aliases=[],
+            )
+
+        return None
+
+    async def decompose_search_query(
+        self, title: str, vendor_name: str | None = None
+    ) -> SearchQueryBundle:
+        """
+        Extracts structured search query bundle:
+        (brand, marketing_model, model_code, brand_aliases).
+        Uses LLM with fallback to local regex heuristic parser.
         """
         clean_title = title.strip()
         if not self.api_key:
-            return clean_title, None
+            return self._heuristic_decompose(clean_title, vendor_name)
 
         system_msg = (
-            "You are an e-commerce search query assistant. Your task is to extract from a raw product title "
-            "the authentic manufacturer brand and a concise search query following the formula: "
-            "[Brand] + [Model] + [Hardware variant/modification (memory, processor, revision, if present)].\n"
+            "You are an expert e-commerce search query assistant. Your task is to extract from a raw product title "
+            "the authentic manufacturer brand, the clean marketing model name, "
+            "any explicit factory model code / part number (e.g. from parentheses or SKU suffixes), "
+            "and any parent/ecosystem brand aliases (e.g. Xiaomi for Yeelight/Aqara/Poco/Redmi, Huawei for Honor).\n"
             "RULES:\n"
-            "1. In the 'brand' field, specify only the manufacturer brand name (e.g. TP-Link, Apple, Xiaomi, Keenetic, Yandex, Samsung, Camelion, D-Link).\n"
-            "2. In the 'clean_query' field, specify the cleaned search string. Strip leading generic category names (smartphone, laptop, wireless router, desk lamp), color, promotional slogans, and packaging noise.\n"
-            "3. Respond STRICTLY in JSON format:\n"
-            '{"brand": "...", "clean_query": "..."}'
+            "1. 'brand': Authentic manufacturer brand name only (e.g. Yeelight, TP-Link, Apple, ASUS, Gefest, Razer).\n"
+            "2. 'marketing_model': Concise commercial model name WITHOUT generic category nouns (lamp, router, laptop), "
+            "colors, promotional words, or parenthesized factory codes. Example: 'Yeelight Arwen Ceiling Light 550S', 'ASUS Vivobook 15'.\n"
+            "3. 'model_code': Explicit alphanumeric factory part number / execution code / revision code if present in title "
+            "(e.g. 'YLXD013-A', 'YLXDD-0270', 'X1504VA-BQ005', '6100-02 0001'). If absent or only harmless spec (e.g. '12V', 'белый'), return null.\n"
+            "4. 'brand_aliases': Array of parent/ecosystem brand combinations if applicable (e.g. ['Xiaomi Yeelight', 'Xiaomi'] for Yeelight; ['Xiaomi Poco'] for Poco). Otherwise empty list [].\n"
+            "5. Respond STRICTLY in JSON format:\n"
+            '{"brand": "...", "marketing_model": "...", "model_code": "..." or null, "brand_aliases": [...]}\n'
         )
         user_msg = f"Product title: {clean_title}"
 
@@ -189,7 +273,6 @@ class OpenAIJudge:
             "response_format": {"type": "json_object"},
             "reasoning_effort": self.reasoning_effort,
             "max_completion_tokens": 300,
-            # Note: temperature is intentionally omitted for reasoning models (gpt-6-luna)
         }
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -203,7 +286,9 @@ class OpenAIJudge:
                     if resp.status_code == 200:
                         data = resp.json()
                         raw_content = str(data["choices"][0]["message"]["content"]).strip()
-                        return self._safe_parse_query_metadata(raw_content, clean_title)
+                        parsed = self._safe_parse_bundle(raw_content, clean_title, vendor_name)
+                        if parsed:
+                            return parsed
                     elif resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
                         await asyncio.sleep(2.0 * (attempt + 1))
                         continue
@@ -213,56 +298,28 @@ class OpenAIJudge:
                     if attempt < 2:
                         await asyncio.sleep(2.0 * (attempt + 1))
                         continue
-                    logger.warning(f"clean_search_query exception: {exc}")
+                    logger.warning(f"decompose_search_query exception: {exc}")
                     break
 
-        return clean_title, None
+        return self._heuristic_decompose(clean_title, vendor_name)
 
-    @staticmethod
-    def _safe_parse_query_metadata(raw_content: str, default_title: str) -> tuple[str, str | None]:
+    async def clean_search_query(
+        self, title: str, vendor_name: str | None = None
+    ) -> tuple[str, str | None]:
         """
-        Safely parses LLM response into (clean_query, brand).
-        Gracefully handles JSON objects, markdown fences, and plain string fallbacks.
+        Extracts clean Brand + Model query without noise and detects manufacturer brand.
+        Returns: (clean_query: str, brand: str | None)
         """
-        clean = raw_content.strip()
-        if not clean:
-            return default_title, None
-
-        # 1. Attempt JSON parsing (direct or regex extracted)
-        try:
-            json_str = clean
-            if "{" in clean and "}" in clean:
-                m = re.search(r"\{[\s\S]*\}", clean)
-                if m:
-                    json_str = m.group(0)
-            parsed = json.loads(json_str)
-            if isinstance(parsed, dict):
-                clean_q = str(parsed.get("clean_query") or "").strip().strip('"').strip("'")
-                brand = str(parsed.get("brand") or "").strip().strip('"').strip("'") or None
-                if clean_q:
-                    return clean_q, brand
-                return default_title, brand
-        except Exception:
-            pass
-
-        # 2. Fallback to plain text string (e.g. from mock tests or unstructured LLM output)
-        first_line = clean.splitlines()[0].strip().strip('"').strip("'")
-        if first_line and not first_line.startswith("{"):
-            tokens = first_line.split()
-            fallback_brand = tokens[0] if tokens else None
-            return first_line, fallback_brand
-
-        return default_title, None
+        bundle = await self.decompose_search_query(title=title, vendor_name=vendor_name)
+        return bundle.marketing_model, bundle.brand
 
     async def extract_core_product_name(self, title: str, vendor_name: str | None = None) -> str:
         """
         Extracts clean Brand + Model query without noise.
         Strictly returns str as required.
         """
-        res = await self.clean_search_query(title=title, vendor_name=vendor_name)
-        if isinstance(res, tuple):
-            return str(res[0])
-        return str(res)
+        bundle = await self.decompose_search_query(title=title, vendor_name=vendor_name)
+        return bundle.marketing_model
 
     async def judge(
         self,

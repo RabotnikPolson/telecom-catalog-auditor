@@ -254,3 +254,65 @@ class TestResolveReferenceUseCase:
         assert res.status == "FOUND"
         assert res.scenario_applied == "SCENARIO_4_EXTERNAL_SEARCH"
         assert res.reference_url == "https://samsung.com/kz/smartphones/galaxy-s23/"
+
+    def test_heuristic_decompose_brackets(self):
+        from src.adapters.llm.openai_judge import OpenAIJudge
+        bundle = OpenAIJudge._heuristic_decompose("Yeelight Arwen 550S (YLXD013-A)")
+        assert bundle.brand == "Yeelight"
+        assert bundle.marketing_model == "Yeelight Arwen 550S"
+        assert bundle.model_code == "YLXD013-A"
+        assert bundle.brand_aliases == []
+
+    @pytest.mark.anyio
+    async def test_multi_vector_quota_guard_skips_vector_2_if_pool_sufficient(self, test_repo: SQLiteProductRepository):
+        product = Product(
+            product_id=201,
+            title="Потолочная лампа Yeelight Arwen 550S (YLXD013-A)",
+            vendor_name=None,
+            vendor_sku=None,
+        )
+        serper_client = SerperClient(api_key="mock")
+        # Vector 1 returns 2 valid candidate links
+        mock_v1 = [
+            {"title": "Kaspi Arwen 550S", "link": "https://kaspi.kz/shop/p/yeelight-arwen-550s/"},
+            {"title": "DNS Arwen 550S", "link": "https://www.dns-shop.kz/product/123/yeelight-arwen-550s/"},
+        ]
+        with patch.object(serper_client, "search_and_filter", new=AsyncMock(return_value=mock_v1)) as mock_search:
+            use_case = ResolveReferenceUseCase(
+                repository=test_repo,
+                vendor_resolver=VendorDirectResolver(),
+                serper_client=serper_client,
+            )
+            res = await use_case.execute(product)
+            # Only Vector 1 (kaspi + general concurrent = 2 calls) should have run
+            assert mock_search.call_count == 2
+            assert res.status == "FOUND"
+            assert len(res.candidate_urls) == 2
+
+    @pytest.mark.anyio
+    async def test_multi_vector_triggers_vector_2_when_pool_under_two(self, test_repo: SQLiteProductRepository):
+        product = Product(
+            product_id=202,
+            title="Потолочная лампа Yeelight Arwen 550S (YLXD013-A)",
+            vendor_name=None,
+            vendor_sku=None,
+        )
+        serper_client = SerperClient(api_key="mock")
+        
+        async def mock_search_fn(query: str, **kwargs):
+            if "YLXD013-A" in query:
+                return [{"title": "Kaspi YLXD013-A", "link": "https://kaspi.kz/shop/p/yeelight-ylxd013-a/"}]
+            return []  # Vector 1 returns empty
+
+        with patch.object(serper_client, "search_and_filter", side_effect=mock_search_fn) as mock_search:
+            use_case = ResolveReferenceUseCase(
+                repository=test_repo,
+                vendor_resolver=VendorDirectResolver(),
+                serper_client=serper_client,
+            )
+            res = await use_case.execute(product)
+            # Vector 1 (2 calls) + Vector 2 (1 call)
+            assert mock_search.call_count >= 3
+            assert res.status == "FOUND"
+            assert res.reference_url == "https://kaspi.kz/shop/p/yeelight-ylxd013-a/"
+

@@ -65,8 +65,8 @@ def is_whitelisted_domain(
 
 
 DOMAIN_PRIORITY_MAP: dict[str, int] = {
-    "kaspi.kz": 2,
-    "dns-shop.kz": 3,
+    "kaspi.kz": 1,
+    "dns-shop.kz": 2,
     "technodom.kz": 4,
     "shop.kz": 4,
     "mechta.kz": 4,
@@ -86,7 +86,15 @@ def get_domain_priority(url: str, brand: str | None = None) -> int:
     if not target_domain:
         return 10
 
-    # 1. PRIORITY 1: Official manufacturer website
+    # 1. PRIORITY 1: Kaspi marketplace (primary consumer catalog in Kazakhstan)
+    if target_domain == "kaspi.kz" or target_domain.endswith(".kaspi.kz"):
+        return 1
+
+    # 2. PRIORITY 2: DNS shop (secondary detailed retail catalog in Kazakhstan)
+    if target_domain == "dns-shop.kz" or target_domain.endswith(".dns-shop.kz"):
+        return 2
+
+    # 3. PRIORITY 3: Official manufacturer website
     if brand:
         b = brand.lower().strip()
         if len(b) >= 2:
@@ -95,19 +103,15 @@ def get_domain_priority(url: str, brand: str | None = None) -> int:
             for bv in variants:
                 if len(bv) >= 2:
                     if target_domain.startswith(f"{bv}.") or f".{bv}." in target_domain:
-                        return 1
+                        return 3
             # Check normalized domain without hyphens (e.g. tp-link.com vs tplink, or vice versa)
             norm_domain = target_domain.replace("-", "")
             norm_b = b.replace("-", "").replace(" ", "")
             if len(norm_b) >= 2:
                 if norm_domain.startswith(f"{norm_b}.") or f".{norm_b}." in norm_domain:
-                    return 1
+                    return 3
 
-    # 2. PRIORITY 2: Kaspi marketplace
-    if target_domain == "kaspi.kz" or target_domain.endswith(".kaspi.kz"):
-        return 2
-
-    # 3. Major retail & distributor stores
+    # 4. Major retail & distributor stores
     for domain_name, priority in DOMAIN_PRIORITY_MAP.items():
         if target_domain == domain_name or target_domain.endswith(f".{domain_name}"):
             return priority
