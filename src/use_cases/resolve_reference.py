@@ -208,38 +208,6 @@ class ResolveReferenceUseCase:
             product, scenario_override="SCENARIO_4_EXTERNAL_SEARCH", force_refresh=force_refresh, trace=trace
         )
 
-    def _build_title_query(self, product: Product) -> tuple[str, str]:
-        clean_title = product.title.strip()
-        parts = [clean_title]
-
-        if product.manufacturer_sku and product.manufacturer_sku.strip():
-            m_sku = product.manufacturer_sku.strip()
-            if m_sku.lower() not in clean_title.lower():
-                parts.append(m_sku)
-
-        is_internal_sku = False
-        if product.vendor_name:
-            v_lower = product.vendor_name.lower().strip()
-            if any(w in v_lower for w in ["основной склад", "главный склад", "собственный склад", "склад"]):
-                is_internal_sku = True
-        if product.shop_sku and product.vendor_sku and str(product.shop_sku).strip() == str(product.vendor_sku).strip():
-            is_internal_sku = True
-
-        if not is_internal_sku and product.vendor_sku and product.vendor_sku.strip():
-            v_sku = product.vendor_sku.strip()
-            if v_sku.lower() not in clean_title.lower():
-                parts.append(v_sku)
-
-        query = " ".join(parts).strip()
-        source_type = "PROVIDER_SKU_SEARCH" if (product.vendor_sku and not is_internal_sku) else "MODEL_SEARCH"
-        return query, source_type
-
-    def _build_search_query(self, product: Product) -> tuple[str, str]:
-        if product.barcode and product.barcode.strip():
-            clean_bc = product.barcode.strip()
-            return f'"{clean_bc}"', "BARCODE_SEARCH"
-        return self._build_title_query(product)
-
     def _sort_by_domain_priority(
         self,
         results: list[dict[str, Any]],
@@ -276,32 +244,18 @@ class ResolveReferenceUseCase:
             from src.adapters.llm.openai_judge import OpenAIJudge
             bundle = OpenAIJudge._heuristic_decompose(product.title, vendor_name=product.vendor_name)
 
-        is_internal_sku = False
-        if product.vendor_name:
-            v_lower = product.vendor_name.lower().strip()
-            if any(w in v_lower for w in ["основной склад", "главный склад", "собственный склад", "склад"]):
-                is_internal_sku = True
-        if product.shop_sku and product.vendor_sku and str(product.shop_sku).strip() == str(product.vendor_sku).strip():
-            is_internal_sku = True
-
-        source_type = "MODEL_SEARCH"
-        if not is_internal_sku and product.vendor_sku and product.vendor_sku.strip():
-            v_sku = product.vendor_sku.strip()
-            source_type = "PROVIDER_SKU_SEARCH"
-            if v_sku.lower() not in bundle.marketing_model.lower():
-                bundle = SearchQueryBundle(
-                    brand=bundle.brand,
-                    marketing_model=f"{bundle.marketing_model} {v_sku}".strip(),
-                    model_code=bundle.model_code,
-                    brand_aliases=bundle.brand_aliases,
-                )
-
-        clean_model_query = bundle.marketing_model
+        brand_prefix = (
+            f"{bundle.brand} "
+            if (bundle.brand and bundle.brand.lower() not in bundle.marketing_model.lower())
+            else ""
+        )
+        clean_model_query = f"{brand_prefix}{bundle.marketing_model}".strip()
         extracted_brand = bundle.brand
+        source_type = "MODEL_SEARCH"
 
         trace.append(
-            f"[Query Extraction] Marketing: '{bundle.marketing_model}', Code: '{bundle.model_code or 'N/A'}', "
-            f"Brand: '{bundle.brand or 'N/A'}', Aliases: {bundle.brand_aliases}"
+            f"[Query Extraction] Marketing: '{bundle.marketing_model}', Clean Query: '{clean_model_query}', "
+            f"Code: '{bundle.model_code or 'N/A'}', Brand: '{bundle.brand or 'N/A'}', Aliases: {bundle.brand_aliases}"
         )
 
         q_hash = self.compute_query_hash(product, clean_model_query)
@@ -331,8 +285,8 @@ class ResolveReferenceUseCase:
                 candidate_pool.append(url_clean)
 
         # VECTOR 1: Commercial Marketing Model Search (Kaspi + General, concurrent via asyncio.gather)
-        kaspi_query = f"site:kaspi.kz {bundle.marketing_model}"
-        general_query = bundle.marketing_model
+        kaspi_query = f"site:kaspi.kz {clean_model_query}"
+        general_query = clean_model_query
         trace.append(f"[Vector 1: Kaspi] Query: '{kaspi_query}'")
         trace.append(f"[Vector 1: General] Query: '{general_query}'")
 
@@ -363,7 +317,7 @@ class ResolveReferenceUseCase:
 
         if general_results:
             sorted_res = self._sort_by_domain_priority(
-                general_results, product, clean_query=bundle.marketing_model, brand=extracted_brand
+                general_results, product, clean_query=clean_model_query, brand=extracted_brand
             )
             general_links = [
                 str(item.get("link") or "").strip()

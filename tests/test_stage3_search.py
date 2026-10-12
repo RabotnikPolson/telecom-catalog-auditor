@@ -177,7 +177,7 @@ class TestResolveReferenceUseCase:
         assert res.reference_url == "https://dns-shop.kz/product/c6/"
 
     @pytest.mark.anyio
-    async def test_scenario_4_unknown_vendor_injects_sku(self, test_repo: SQLiteProductRepository):
+    async def test_scenario_4_unknown_vendor_external_search(self, test_repo: SQLiteProductRepository):
         product = Product(
             product_id=104,
             title="Наушники Hoco M1",
@@ -199,11 +199,12 @@ class TestResolveReferenceUseCase:
             res = await use_case.execute(product)
             assert mock_call.call_count >= 1
             called_query = mock_call.call_args_list[0][1]["query"]
-            assert "HOC-M1-BLK" in called_query
+            assert "Hoco M1" in called_query
+            assert "HOC-M1-BLK" not in called_query
 
         assert res.status == "FOUND"
         assert res.scenario_applied == "SCENARIO_4_EXTERNAL_SEARCH"
-        assert res.source_type == "PROVIDER_SKU_SEARCH"
+        assert res.source_type == "MODEL_SEARCH"
         assert res.reference_url == "https://kaspi.kz/shop/p/hoco-m1/"
 
     @pytest.mark.anyio
