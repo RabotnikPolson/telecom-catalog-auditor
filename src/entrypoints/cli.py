@@ -637,7 +637,7 @@ async def run_audit_command(args: argparse.Namespace) -> int:
         total_products_count = len(products)
 
         for idx, prod in enumerate(products, 1):
-            print(f"[{idx:02d}/{total_products_count}] Product ID #{prod.product_id} | {prod.title[:120]}")
+            print(f"[{idx:02d}/{total_products_count}] Product ID #{prod.product_id} | {prod.title[:150]}")
             print(f"      Shop SKU: {prod.shop_sku or 'N/A'} | Vendor SKU: {prod.vendor_sku or 'N/A'} | Barcode: {prod.barcode or 'N/A'}")
             print(f"      Shop URL: https://shop.telecom.kz/product/{prod.product_id}")
 

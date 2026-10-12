@@ -25,6 +25,24 @@ class ResolvedReference:
     is_cached: bool = False
     search_trace: list[str] = field(default_factory=list)
 
+def is_valid_model_code(code: str | None) -> bool:
+    """
+    Validates that a candidate string is an authentic factory model code / SKU
+    (at least 3 characters, contains alphanumeric characters, and at least one digit
+    or model separator like '-', '_', '/').
+    Rejects harmless Russian or English words (e.g. 'черный', 'белый', 'gold').
+    """
+    if not code:
+        return False
+    clean = code.strip()
+    if len(clean) < 3:
+        return False
+    has_alnum = any(c.isalnum() for c in clean)
+    has_digit = any(c.isdigit() for c in clean)
+    has_sep = any(c in "-_/" for c in clean)
+    has_latin_or_digit = any((c.isascii() and c.isalnum()) for c in clean)
+    return has_alnum and has_latin_or_digit and (has_digit or has_sep)
+
 
 class ResolveReferenceUseCase:
 
@@ -284,70 +302,94 @@ class ResolveReferenceUseCase:
                 seen_urls.add(url_clean)
                 candidate_pool.append(url_clean)
 
-        # VECTOR 1: Commercial Marketing Model Search (Kaspi + General, concurrent via asyncio.gather)
-        kaspi_query = f"site:kaspi.kz {clean_model_query}"
-        general_query = clean_model_query
-        trace.append(f"[Vector 1: Kaspi] Query: '{kaspi_query}'")
-        trace.append(f"[Vector 1: General] Query: '{general_query}'")
+        # VECTOR 1: Factory Model Code / Part Number (PINPOINT SEARCH)
+        has_valid_code = is_valid_model_code(bundle.model_code)
+        if has_valid_code and bundle.model_code:
+            code_clean = bundle.model_code.strip()
+            code_kaspi_query = f"site:kaspi.kz {code_clean}"
+            code_gen_query = f"{bundle.brand or ''} {code_clean}".strip()
+            trace.append(f"[Vector 1: Code Search] Kaspi: '{code_kaspi_query}' | General: '{code_gen_query}'")
 
-        kaspi_task = self.serper_client.search_and_filter(
-            query=kaspi_query,
-            whitelist_domains=self.whitelist_domains,
-            num_results=5,
-        )
-        general_task = self.serper_client.search_and_filter(
-            query=general_query,
-            whitelist_domains=self.whitelist_domains,
-            num_results=10,
-        )
-
-        kaspi_results, general_results = await asyncio.gather(kaspi_task, general_task)
-
-        if kaspi_results:
-            kaspi_candidate_links = [
-                str(item.get("link") or "").strip()
-                for item in kaspi_results
-                if str(item.get("link") or "").strip()
-                and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
-                and "/shop/p/" in str(item.get("link") or "").lower()
-            ]
-            trace.append(f"[Vector 1: Kaspi] Query returned {len(kaspi_results)} items, {len(kaspi_candidate_links)} valid Kaspi product cards")
-            for link in kaspi_candidate_links:
-                add_candidate(link)
-
-        if general_results:
-            sorted_res = self._sort_by_domain_priority(
-                general_results, product, clean_query=clean_model_query, brand=extracted_brand
-            )
-            general_links = [
-                str(item.get("link") or "").strip()
-                for item in sorted_res
-                if str(item.get("link") or "").strip()
-                and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
-            ]
-            trace.append(f"[Vector 1: General] Query returned {len(general_results)} items, {len(general_links)} whitelisted")
-            for link in general_links:
-                add_candidate(link)
-
-        # VECTOR 2: Factory Model Code / Part Number (STRICT QUOTA GUARD: len(candidate_pool) < 2)
-        if len(candidate_pool) < 2 and bundle.model_code:
-            code_query = f"site:kaspi.kz {bundle.brand or ''} {bundle.model_code}".strip()
-            trace.append(f"[Vector 2: Code Search] (Quota Guard: pool size {len(candidate_pool)} < 2) Query: '{code_query}'")
-            code_results = await self.serper_client.search_and_filter(
-                query=code_query,
+            code_kaspi_task = self.serper_client.search_and_filter(
+                query=code_kaspi_query,
                 whitelist_domains=self.whitelist_domains,
                 num_results=5,
             )
-            if code_results:
-                code_links = [
+            code_gen_task = self.serper_client.search_and_filter(
+                query=code_gen_query,
+                whitelist_domains=self.whitelist_domains,
+                num_results=5,
+            )
+            code_kaspi_results, code_gen_results = await asyncio.gather(code_kaspi_task, code_gen_task)
+
+            if code_kaspi_results:
+                kaspi_code_links = [
                     str(item.get("link") or "").strip()
-                    for item in code_results
+                    for item in code_kaspi_results
                     if str(item.get("link") or "").strip()
                     and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
                     and "/shop/p/" in str(item.get("link") or "").lower()
                 ]
-                trace.append(f"[Vector 2: Code Search] Query returned {len(code_results)} items, {len(code_links)} valid Kaspi cards")
-                for link in code_links:
+                trace.append(f"[Vector 1: Code Search] Kaspi query returned {len(code_kaspi_results)} items, {len(kaspi_code_links)} valid Kaspi cards")
+                for link in kaspi_code_links:
+                    add_candidate(link)
+
+            if code_gen_results:
+                sorted_code_gen = self._sort_by_domain_priority(
+                    code_gen_results, product, clean_query=code_gen_query, brand=extracted_brand
+                )
+                gen_code_links = [
+                    str(item.get("link") or "").strip()
+                    for item in sorted_code_gen
+                    if str(item.get("link") or "").strip()
+                    and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
+                ]
+                trace.append(f"[Vector 1: Code Search] General query returned {len(code_gen_results)} items, {len(gen_code_links)} whitelisted")
+                for link in gen_code_links:
+                    add_candidate(link)
+
+        # VECTOR 2: Commercial Marketing Model Search (FALLBACK: strictly when code search found 0 candidates)
+        if len(candidate_pool) == 0:
+            kaspi_query = f"site:kaspi.kz {clean_model_query}"
+            general_query = clean_model_query
+            trace.append(f"[Vector 2: Marketing Search] Kaspi: '{kaspi_query}' | General: '{general_query}'")
+
+            kaspi_task = self.serper_client.search_and_filter(
+                query=kaspi_query,
+                whitelist_domains=self.whitelist_domains,
+                num_results=5,
+            )
+            general_task = self.serper_client.search_and_filter(
+                query=general_query,
+                whitelist_domains=self.whitelist_domains,
+                num_results=10,
+            )
+            kaspi_results, general_results = await asyncio.gather(kaspi_task, general_task)
+
+            if kaspi_results:
+                kaspi_candidate_links = [
+                    str(item.get("link") or "").strip()
+                    for item in kaspi_results
+                    if str(item.get("link") or "").strip()
+                    and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
+                    and "/shop/p/" in str(item.get("link") or "").lower()
+                ]
+                trace.append(f"[Vector 2: Marketing Search] Kaspi returned {len(kaspi_results)} items, {len(kaspi_candidate_links)} valid Kaspi cards")
+                for link in kaspi_candidate_links:
+                    add_candidate(link)
+
+            if general_results:
+                sorted_res = self._sort_by_domain_priority(
+                    general_results, product, clean_query=clean_model_query, brand=extracted_brand
+                )
+                general_links = [
+                    str(item.get("link") or "").strip()
+                    for item in sorted_res
+                    if str(item.get("link") or "").strip()
+                    and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
+                ]
+                trace.append(f"[Vector 2: Marketing Search] General returned {len(general_results)} items, {len(general_links)} whitelisted")
+                for link in general_links:
                     add_candidate(link)
 
         # VECTOR 3: Ecosystem Brand Aliases (STRICT QUOTA GUARD: len(candidate_pool) < 2)

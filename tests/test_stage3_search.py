@@ -264,46 +264,58 @@ class TestResolveReferenceUseCase:
         assert bundle.model_code == "YLXD013-A"
         assert bundle.brand_aliases == []
 
+    def test_is_valid_model_code(self):
+        from src.use_cases.resolve_reference import is_valid_model_code
+        assert is_valid_model_code("N8028VN3510EMEA01_2201_UBU") is True
+        assert is_valid_model_code("82KD002SRU") is True
+        assert is_valid_model_code("YLXD013-A") is True
+        assert is_valid_model_code("4HDB1E") is True
+        assert is_valid_model_code("черный") is False
+        assert is_valid_model_code("белый") is False
+        assert is_valid_model_code("gold") is False
+        assert is_valid_model_code("12") is False
+        assert is_valid_model_code(None) is False
+
     @pytest.mark.anyio
-    async def test_multi_vector_quota_guard_skips_vector_2_if_pool_sufficient(self, test_repo: SQLiteProductRepository):
+    async def test_pinpoint_code_search_skips_marketing_when_match_found(self, test_repo: SQLiteProductRepository):
         product = Product(
             product_id=201,
-            title="Потолочная лампа Yeelight Arwen 550S (YLXD013-A)",
+            title="Ноутбук Dell Vostro 3510 [N8028VN3510EMEA01_2201_UBU]",
             vendor_name=None,
             vendor_sku=None,
         )
         serper_client = SerperClient(api_key="mock")
-        # Vector 1 returns 2 valid candidate links
-        mock_v1 = [
-            {"title": "Kaspi Arwen 550S", "link": "https://kaspi.kz/shop/p/yeelight-arwen-550s/"},
-            {"title": "DNS Arwen 550S", "link": "https://www.dns-shop.kz/product/123/yeelight-arwen-550s/"},
+        mock_code_hits = [
+            {"title": "Kaspi Dell 3510", "link": "https://kaspi.kz/shop/p/dell-vostro-3510-n8028vn3510emea01-2201-ubu-106603279/"}
         ]
-        with patch.object(serper_client, "search_and_filter", new=AsyncMock(return_value=mock_v1)) as mock_search:
+        with patch.object(serper_client, "search_and_filter", new=AsyncMock(return_value=mock_code_hits)) as mock_search:
             use_case = ResolveReferenceUseCase(
                 repository=test_repo,
                 vendor_resolver=VendorDirectResolver(),
                 serper_client=serper_client,
             )
             res = await use_case.execute(product)
-            # Only Vector 1 (kaspi + general concurrent = 2 calls) should have run
+            # Only Code Search (Kaspi code + General code = 2 calls) runs; Marketing fallback is SKIPPED
             assert mock_search.call_count == 2
             assert res.status == "FOUND"
-            assert len(res.candidate_urls) == 2
+            assert res.reference_url == "https://kaspi.kz/shop/p/dell-vostro-3510-n8028vn3510emea01-2201-ubu-106603279/"
 
     @pytest.mark.anyio
-    async def test_multi_vector_triggers_vector_2_when_pool_under_two(self, test_repo: SQLiteProductRepository):
+    async def test_marketing_fallback_triggers_when_code_search_finds_zero(self, test_repo: SQLiteProductRepository):
         product = Product(
             product_id=202,
-            title="Потолочная лампа Yeelight Arwen 550S (YLXD013-A)",
+            title="Ноутбук Dell Vostro 3510 [N8028VN3510EMEA01_2201_UBU]",
             vendor_name=None,
             vendor_sku=None,
         )
         serper_client = SerperClient(api_key="mock")
         
         async def mock_search_fn(query: str, **kwargs):
-            if "YLXD013-A" in query:
-                return [{"title": "Kaspi YLXD013-A", "link": "https://kaspi.kz/shop/p/yeelight-ylxd013-a/"}]
-            return []  # Vector 1 returns empty
+            if "N8028VN3510EMEA01_2201_UBU" in query:
+                return []  # Code search returns empty
+            if "Vostro 3510" in query:
+                return [{"title": "Kaspi Dell Vostro 3510", "link": "https://kaspi.kz/shop/p/dell-vostro-3510-106603279/"}]
+            return []
 
         with patch.object(serper_client, "search_and_filter", side_effect=mock_search_fn) as mock_search:
             use_case = ResolveReferenceUseCase(
@@ -312,8 +324,8 @@ class TestResolveReferenceUseCase:
                 serper_client=serper_client,
             )
             res = await use_case.execute(product)
-            # Vector 1 (2 calls) + Vector 2 (1 call)
+            # Code search (2 calls) + Marketing search (2 calls) = 4 calls
             assert mock_search.call_count >= 3
             assert res.status == "FOUND"
-            assert res.reference_url == "https://kaspi.kz/shop/p/yeelight-ylxd013-a/"
+            assert res.reference_url == "https://kaspi.kz/shop/p/dell-vostro-3510-106603279/"
 
