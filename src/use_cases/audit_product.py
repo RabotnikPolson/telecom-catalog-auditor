@@ -84,66 +84,106 @@ class AuditProductUseCase:
         last_result: AuditResult | None = None
         crawl_error: str | None = None
 
-        for cand_idx, cand_url in enumerate(urls_to_try, 1):
-            target_url = cand_url
-            external_markdown: str | None = None
-            search_trace.append(f"[Candidate {cand_idx}/{len(urls_to_try)}] Fetching specs: {cand_url}")
+        async def _evaluate_candidates(
+            candidates_list: list[str],
+            label_prefix: str,
+            max_to_test: int | None = None,
+        ) -> AuditResult | None:
+            nonlocal crawler_time_sec, last_result, crawl_error
+            to_test = candidates_list[:max_to_test] if max_to_test else candidates_list
+            for cand_idx, cand_url in enumerate(to_test, 1):
+                target_url = cand_url
+                external_markdown: str | None = None
+                search_trace.append(f"[{label_prefix} {cand_idx}/{len(to_test)}] Fetching specs: {cand_url}")
 
-            if not force_refresh:
-                cached_raw = self.product_repo.get_specs_cache(cand_url)
-                if cached_raw:
-                    try:
-                        parsed = json.loads(cached_raw)
-                        external_markdown = parsed.get("markdown", cached_raw) if isinstance(parsed, dict) else cached_raw
-                        search_trace.append(f"[Candidate {cand_idx}] Loaded specs from local specs_cache")
-                    except Exception:
-                        external_markdown = cached_raw
+                if not force_refresh:
+                    cached_raw = self.product_repo.get_specs_cache(cand_url)
+                    if cached_raw:
+                        try:
+                            parsed = json.loads(cached_raw)
+                            external_markdown = parsed.get("markdown", cached_raw) if isinstance(parsed, dict) else cached_raw
+                            search_trace.append(f"[{label_prefix} {cand_idx}] Loaded specs from local specs_cache")
+                        except Exception:
+                            external_markdown = cached_raw
 
-            if not external_markdown or len(external_markdown.strip()) == 0:
-                t_crawl_start = time.perf_counter()
-                crawl_res = await self.crawler.crawl(cand_url)
-                crawler_time_sec += (time.perf_counter() - t_crawl_start)
-                if crawl_res.success and crawl_res.markdown and len(crawl_res.markdown.strip()) > 0:
-                    external_markdown = crawl_res.markdown
-                    cache_payload = json.dumps(
-                        {
-                            "title": crawl_res.title,
-                            "markdown": crawl_res.markdown,
-                        },
-                        ensure_ascii=False,
-                    )
-                    self.product_repo.save_specs_cache(
-                        resolved_url=cand_url,
-                        specs_json=cache_payload,
-                        status_code=crawl_res.status_code,
-                    )
-                    search_trace.append(f"[Candidate {cand_idx}] Page crawled successfully (HTTP {crawl_res.status_code or 200})")
-                else:
-                    crawl_error = crawl_res.error or f"Failed crawling {cand_url}"
-                    search_trace.append(f"[Candidate {cand_idx}] Crawl failed: {crawl_error}")
+                if not external_markdown or len(external_markdown.strip()) == 0:
+                    t_crawl_start = time.perf_counter()
+                    crawl_res = await self.crawler.crawl(cand_url)
+                    crawler_time_sec += (time.perf_counter() - t_crawl_start)
+                    if crawl_res.success and crawl_res.markdown and len(crawl_res.markdown.strip()) > 0:
+                        external_markdown = crawl_res.markdown
+                        cache_payload = json.dumps(
+                            {
+                                "title": crawl_res.title,
+                                "markdown": crawl_res.markdown,
+                            },
+                            ensure_ascii=False,
+                        )
+                        self.product_repo.save_specs_cache(
+                            resolved_url=cand_url,
+                            specs_json=cache_payload,
+                            status_code=crawl_res.status_code,
+                        )
+                        search_trace.append(f"[{label_prefix} {cand_idx}] Page crawled successfully (HTTP {crawl_res.status_code or 200})")
+                    else:
+                        crawl_error = crawl_res.error or f"Failed crawling {cand_url}"
+                        search_trace.append(f"[{label_prefix} {cand_idx}] Crawl failed: {crawl_error}")
+                        continue
+
+                result = await self.judge.judge(
+                    product=product,
+                    reference_url=target_url,
+                    external_markdown=external_markdown,
+                )
+                result.crawler_time_sec = round(crawler_time_sec, 2)
+                result.execution_time_sec = round(time.perf_counter() - t_audit_start, 2)
+                search_trace.append(f"[{label_prefix} {cand_idx}] LLM Judge verdict: {result.status.value} (Confidence: {result.confidence_score:.2f})")
+                last_result = result
+
+                if result.status in (AuditStatus.NOT_FOUND, AuditStatus.ERROR):
+                    if target_url:
+                        self.product_repo.delete_url_cache_by_url(target_url)
+                        self.product_repo.delete_specs_cache(target_url)
+                    search_trace.append(f"[{label_prefix} {cand_idx}] Rejected as non-matching ({result.details or result.status.value}), cascading to next candidate...")
                     continue
 
-            result = await self.judge.judge(
-                product=product,
-                reference_url=target_url,
-                external_markdown=external_markdown,
+                search_trace.append(f"[{label_prefix} {cand_idx}] Accepted as authoritative reference ({result.status.value})")
+                return result
+
+            return None
+
+        winning_result: AuditResult | None = None
+        is_step1_code = (resolved.source_type == "CODE_PINPOINT")
+        step1_max = 2 if is_step1_code else None
+
+        if urls_to_try:
+            winning_result = await _evaluate_candidates(
+                urls_to_try,
+                label_prefix="Step 1 Candidate" if is_step1_code else "Candidate",
+                max_to_test=step1_max,
             )
-            result.crawler_time_sec = round(crawler_time_sec, 2)
-            result.execution_time_sec = round(time.perf_counter() - t_audit_start, 2)
-            search_trace.append(f"[Candidate {cand_idx}] LLM Judge verdict: {result.status.value} (Confidence: {result.confidence_score:.2f})")
-            last_result = result
 
-            if result.status in (AuditStatus.NOT_FOUND, AuditStatus.ERROR):
-                if target_url:
-                    self.product_repo.delete_url_cache_by_url(target_url)
-                    self.product_repo.delete_specs_cache(target_url)
-                search_trace.append(f"[Candidate {cand_idx}] Rejected as non-matching ({result.details or result.status.value}), cascading to next candidate...")
-                continue
+        # Escalate to Step 2 (Marketing Model Search) if Step 1 pinpoint candidates were rejected or exhausted
+        if winning_result is None and is_step1_code:
+            search_trace.append(
+                f"[Escalate] Step 1 pinpoint candidates rejected by AI Judge (tested {min(len(urls_to_try), step1_max or 2)}). "
+                "Escalating to Step 2 (Marketing Model Search)..."
+            )
+            if hasattr(self.reference_resolver, "resolve_marketing_fallback"):
+                resolved_step2 = await self.reference_resolver.resolve_marketing_fallback(
+                    product=product, force_refresh=force_refresh, trace=search_trace
+                )
+                if resolved_step2.candidate_urls:
+                    winning_result = await _evaluate_candidates(
+                        resolved_step2.candidate_urls,
+                        label_prefix="Step 2 Candidate",
+                        max_to_test=None,
+                    )
 
-            search_trace.append(f"[Candidate {cand_idx}] Accepted as authoritative reference ({result.status.value})")
-            result.search_trace = search_trace
-            self.product_repo.save_audit_result(result)
-            return result
+        if winning_result:
+            winning_result.search_trace = search_trace
+            self.product_repo.save_audit_result(winning_result)
+            return winning_result
 
         if last_result:
             search_trace.append("[Evaluation] All candidate URLs exhausted without a verified match.")

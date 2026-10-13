@@ -558,3 +558,90 @@ class TestAuditProductUseCase:
         assert len(results) == 3
         for r in results:
             assert r.status == AuditStatus.VERIFIED
+
+    @pytest.mark.anyio
+    async def test_audit_escalates_to_step2_when_step1_pinpoint_rejected(
+        self, temp_db: SQLiteProductRepository
+    ) -> None:
+        laptop = Product(product_id=3001, title="MacBook Air 13 M4 (A3240)")
+        temp_db.save_product(laptop)
+
+        mock_resolver = MagicMock()
+        mock_resolver.execute = AsyncMock(
+            return_value=ResolvedReference(
+                product_id=3001,
+                reference_url="https://kaspi.kz/shop/p/case-1",
+                source_type="CODE_PINPOINT",
+                query_used="A3240",
+                candidate_urls=[
+                    "https://kaspi.kz/shop/p/case-1",
+                    "https://kaspi.kz/shop/p/case-2",
+                    "https://kaspi.kz/shop/p/case-3",
+                ],
+                scenario_applied="SCENARIO_4",
+                status="FOUND",
+            )
+        )
+        mock_resolver.resolve_marketing_fallback = AsyncMock(
+            return_value=ResolvedReference(
+                product_id=3001,
+                reference_url="https://kaspi.kz/shop/p/macbook-real",
+                source_type="MODEL_SEARCH",
+                query_used="Apple MacBook Air 13 M4",
+                candidate_urls=["https://kaspi.kz/shop/p/macbook-real"],
+                scenario_applied="SCENARIO_4",
+                status="FOUND",
+            )
+        )
+
+        crawled_urls = []
+
+        async def fake_crawl(url: str):
+            crawled_urls.append(url)
+            return CrawlResult(url=url, markdown="# Specs", success=True, status_code=200)
+
+        mock_crawler = MagicMock()
+        mock_crawler.crawl = AsyncMock(side_effect=fake_crawl)
+
+        async def fake_judge(product, reference_url, external_markdown):
+            if "case" in reference_url:
+                return AuditResult(
+                    product_id=product.product_id,
+                    status=AuditStatus.NOT_FOUND,
+                    confidence_score=1.0,
+                    reference_url=reference_url,
+                    details="Accessory, not a laptop",
+                )
+            return AuditResult(
+                product_id=product.product_id,
+                status=AuditStatus.VERIFIED,
+                confidence_score=0.99,
+                reference_url=reference_url,
+                details="Exact MacBook match",
+            )
+
+        mock_judge = MagicMock()
+        mock_judge.judge = AsyncMock(side_effect=fake_judge)
+
+        use_case = AuditProductUseCase(
+            product_repo=temp_db,
+            reference_resolver=mock_resolver,
+            crawler=mock_crawler,
+            judge=mock_judge,
+        )
+
+        res = await use_case.audit_product(laptop, force_refresh=True)
+
+        assert res.status == AuditStatus.VERIFIED
+        assert res.reference_url == "https://kaspi.kz/shop/p/macbook-real"
+        # Step 1 tested at most 2 candidates
+        assert "https://kaspi.kz/shop/p/case-1" in crawled_urls
+        assert "https://kaspi.kz/shop/p/case-2" in crawled_urls
+        assert "https://kaspi.kz/shop/p/case-3" not in crawled_urls  # Third candidate skipped!
+        # Step 2 was escalated to and tested
+        assert "https://kaspi.kz/shop/p/macbook-real" in crawled_urls
+        assert mock_resolver.resolve_marketing_fallback.called is True
+        # Verify trace contains escalation marker
+        trace_str = " ".join(res.search_trace or [])
+        assert "[Escalate]" in trace_str
+

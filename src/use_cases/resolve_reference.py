@@ -244,13 +244,7 @@ class ResolveReferenceUseCase:
             key=lambda item: get_domain_priority(str(item.get("link") or ""), brand=target_brand),
         )
 
-    async def _execute_search_cascade(
-        self, product: Product, scenario_override: str, force_refresh: bool = False, trace: list[str] | None = None
-    ) -> ResolvedReference:
-        if trace is None:
-            trace = []
-
-        # STEP 1 (PRIMARY): Deconstruct Brand, Marketing Model, and Model Code
+    async def _get_search_bundle(self, product: Product) -> SearchQueryBundle:
         bundle: SearchQueryBundle | None = None
         if self.judge and hasattr(self.judge, "decompose_search_query"):
             try:
@@ -261,6 +255,32 @@ class ResolveReferenceUseCase:
         if not bundle:
             from src.adapters.llm.openai_judge import OpenAIJudge
             bundle = OpenAIJudge._heuristic_decompose(product.title, vendor_name=product.vendor_name)
+        return bundle
+
+    async def resolve_marketing_fallback(
+        self,
+        product: Product,
+        force_refresh: bool = False,
+        trace: list[str] | None = None,
+    ) -> ResolvedReference:
+        if trace is None:
+            trace = []
+        bundle = await self._get_search_bundle(product)
+        return await self._execute_marketing_search_cascade(
+            product=product,
+            bundle=bundle,
+            scenario_override="SCENARIO_4_EXTERNAL_SEARCH",
+            force_refresh=force_refresh,
+            trace=trace,
+        )
+
+    async def _execute_search_cascade(
+        self, product: Product, scenario_override: str, force_refresh: bool = False, trace: list[str] | None = None
+    ) -> ResolvedReference:
+        if trace is None:
+            trace = []
+
+        bundle = await self._get_search_bundle(product)
 
         brand_prefix = (
             f"{bundle.brand} "
@@ -269,7 +289,6 @@ class ResolveReferenceUseCase:
         )
         clean_model_query = f"{brand_prefix}{bundle.marketing_model}".strip()
         extracted_brand = bundle.brand
-        source_type = "MODEL_SEARCH"
 
         trace.append(
             f"[Query Extraction] Marketing: '{bundle.marketing_model}', Clean Query: '{clean_model_query}', "
@@ -302,7 +321,7 @@ class ResolveReferenceUseCase:
                 seen_urls.add(url_clean)
                 candidate_pool.append(url_clean)
 
-        # VECTOR 1: Factory Model Code / Part Number (PINPOINT SEARCH)
+        # STEP 1 (PRIMARY): Factory Model Code / Part Number (PINPOINT SEARCH)
         has_valid_code = is_valid_model_code(bundle.model_code)
         if has_valid_code and bundle.model_code:
             code_clean = bundle.model_code.strip()
@@ -348,49 +367,104 @@ class ResolveReferenceUseCase:
                 for link in gen_code_links:
                     add_candidate(link)
 
-        # VECTOR 2: Commercial Marketing Model Search (FALLBACK: strictly when code search found 0 candidates)
-        if len(candidate_pool) == 0:
-            kaspi_query = f"site:kaspi.kz {clean_model_query}"
-            general_query = clean_model_query
-            trace.append(f"[Vector 2: Marketing Search] Kaspi: '{kaspi_query}' | General: '{general_query}'")
-
-            kaspi_task = self.serper_client.search_and_filter(
-                query=kaspi_query,
-                whitelist_domains=self.whitelist_domains,
-                num_results=5,
-            )
-            general_task = self.serper_client.search_and_filter(
-                query=general_query,
-                whitelist_domains=self.whitelist_domains,
-                num_results=10,
-            )
-            kaspi_results, general_results = await asyncio.gather(kaspi_task, general_task)
-
-            if kaspi_results:
-                kaspi_candidate_links = [
-                    str(item.get("link") or "").strip()
-                    for item in kaspi_results
-                    if str(item.get("link") or "").strip()
-                    and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
-                    and "/shop/p/" in str(item.get("link") or "").lower()
-                ]
-                trace.append(f"[Vector 2: Marketing Search] Kaspi returned {len(kaspi_results)} items, {len(kaspi_candidate_links)} valid Kaspi cards")
-                for link in kaspi_candidate_links:
-                    add_candidate(link)
-
-            if general_results:
-                sorted_res = self._sort_by_domain_priority(
-                    general_results, product, clean_query=clean_model_query, brand=extracted_brand
+            if candidate_pool:
+                target_brand = extracted_brand or (clean_model_query.split()[0].strip() if clean_model_query else None)
+                candidate_pool.sort(key=lambda u: get_domain_priority(u, brand=target_brand))
+                best_link = candidate_pool[0]
+                trace.append(f"[Resolved: Step 1 Code] Candidate pool created with {len(candidate_pool)} URLs. Primary: {best_link}")
+                return ResolvedReference(
+                    product_id=product.product_id,
+                    reference_url=best_link,
+                    source_type="CODE_PINPOINT",
+                    query_used=code_clean,
+                    scenario_applied=scenario_override,
+                    status="FOUND",
+                    candidate_urls=candidate_pool,
+                    is_cached=False,
+                    search_trace=trace,
                 )
-                general_links = [
-                    str(item.get("link") or "").strip()
-                    for item in sorted_res
-                    if str(item.get("link") or "").strip()
-                    and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
-                ]
-                trace.append(f"[Vector 2: Marketing Search] General returned {len(general_results)} items, {len(general_links)} whitelisted")
-                for link in general_links:
-                    add_candidate(link)
+
+            trace.append("[Vector 1: Code Search] Found 0 candidates, immediately falling back to Step 2 Marketing Search")
+
+        # STEP 2 (or direct when no model_code): Marketing Model Search Cascade
+        return await self._execute_marketing_search_cascade(
+            product=product,
+            bundle=bundle,
+            scenario_override=scenario_override,
+            force_refresh=force_refresh,
+            trace=trace,
+        )
+
+    async def _execute_marketing_search_cascade(
+        self,
+        product: Product,
+        bundle: SearchQueryBundle,
+        scenario_override: str,
+        force_refresh: bool = False,
+        trace: list[str] | None = None,
+    ) -> ResolvedReference:
+        if trace is None:
+            trace = []
+
+        brand_prefix = (
+            f"{bundle.brand} "
+            if (bundle.brand and bundle.brand.lower() not in bundle.marketing_model.lower())
+            else ""
+        )
+        clean_model_query = f"{brand_prefix}{bundle.marketing_model}".strip()
+        extracted_brand = bundle.brand
+        source_type = "MODEL_SEARCH"
+
+        candidate_pool: list[str] = []
+        seen_urls: set[str] = set()
+
+        def add_candidate(url: str) -> None:
+            url_clean = url.strip()
+            if url_clean and url_clean not in seen_urls:
+                seen_urls.add(url_clean)
+                candidate_pool.append(url_clean)
+
+        kaspi_query = f"site:kaspi.kz {clean_model_query}"
+        general_query = clean_model_query
+        trace.append(f"[Vector 2: Marketing Search] Kaspi: '{kaspi_query}' | General: '{general_query}'")
+
+        kaspi_task = self.serper_client.search_and_filter(
+            query=kaspi_query,
+            whitelist_domains=self.whitelist_domains,
+            num_results=5,
+        )
+        general_task = self.serper_client.search_and_filter(
+            query=general_query,
+            whitelist_domains=self.whitelist_domains,
+            num_results=10,
+        )
+        kaspi_results, general_results = await asyncio.gather(kaspi_task, general_task)
+
+        if kaspi_results:
+            kaspi_candidate_links = [
+                str(item.get("link") or "").strip()
+                for item in kaspi_results
+                if str(item.get("link") or "").strip()
+                and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
+                and "/shop/p/" in str(item.get("link") or "").lower()
+            ]
+            trace.append(f"[Vector 2: Marketing Search] Kaspi returned {len(kaspi_results)} items, {len(kaspi_candidate_links)} valid Kaspi cards")
+            for link in kaspi_candidate_links:
+                add_candidate(link)
+
+        if general_results:
+            sorted_res = self._sort_by_domain_priority(
+                general_results, product, clean_query=clean_model_query, brand=extracted_brand
+            )
+            general_links = [
+                str(item.get("link") or "").strip()
+                for item in sorted_res
+                if str(item.get("link") or "").strip()
+                and is_whitelisted_domain(str(item.get("link") or "").strip(), extra_domains=self.whitelist_domains)
+            ]
+            trace.append(f"[Vector 2: Marketing Search] General returned {len(general_results)} items, {len(general_links)} whitelisted")
+            for link in general_links:
+                add_candidate(link)
 
         # VECTOR 3: Ecosystem Brand Aliases (STRICT QUOTA GUARD: len(candidate_pool) < 2)
         if len(candidate_pool) < 2 and bundle.brand_aliases:
@@ -439,17 +513,12 @@ class ResolveReferenceUseCase:
                 for link in bc_links:
                     add_candidate(link)
 
-        target_brand = extracted_brand
-        if not target_brand and clean_model_query:
-            parts = clean_model_query.split()
-            if parts:
-                target_brand = parts[0].strip()
-
+        target_brand = extracted_brand or (clean_model_query.split()[0].strip() if clean_model_query else None)
         candidate_pool.sort(key=lambda u: get_domain_priority(u, brand=target_brand))
 
         if candidate_pool:
             best_link = candidate_pool[0]
-            trace.append(f"[Resolved] Candidate pool created with {len(candidate_pool)} URLs. Primary: {best_link}")
+            trace.append(f"[Resolved: Step 2 Marketing] Candidate pool created with {len(candidate_pool)} URLs. Primary: {best_link}")
             return ResolvedReference(
                 product_id=product.product_id,
                 reference_url=best_link,

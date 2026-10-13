@@ -443,7 +443,7 @@ async def run_live_test_command(args: argparse.Namespace) -> int:
         ref = await use_case.execute(prod)
         if ref.source_type == "VENDOR_DIRECT":
             direct_found += 1
-        elif ref.source_type in ("BARCODE_SEARCH", "PROVIDER_SKU_SEARCH", "MODEL_SEARCH"):
+        elif ref.source_type in ("BARCODE_SEARCH", "PROVIDER_SKU_SEARCH", "MODEL_SEARCH", "CODE_PINPOINT"):
             search_found += 1
         elif ref.source_type == "CACHE":
             cached_hits += 1
