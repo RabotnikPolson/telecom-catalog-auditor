@@ -43,12 +43,16 @@ CREATE TABLE IF NOT EXISTS specs_cache (
     specs_json TEXT NOT NULL,
     fetched_at TEXT NOT NULL,
     raw_html_hash TEXT,
-    status_code INTEGER DEFAULT 200
+    status_code INTEGER DEFAULT 200,
+    expires_at TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_url_cache_expires ON url_cache(expires_at);
+CREATE INDEX IF NOT EXISTS idx_specs_cache_expires ON specs_cache(expires_at);
 
 CREATE TABLE IF NOT EXISTS audit_results (
     audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_id INTEGER NOT NULL,
+    product_id INTEGER NOT NULL UNIQUE,
     status TEXT NOT NULL,
     confidence_score REAL NOT NULL,
     reference_url TEXT,
@@ -68,7 +72,7 @@ CREATE TABLE IF NOT EXISTS audit_results (
     FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_audit_results_product ON audit_results(product_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_results_product_unique ON audit_results(product_id);
 CREATE INDEX IF NOT EXISTS idx_audit_results_status ON audit_results(status);
 
 CREATE TABLE IF NOT EXISTS crawler_state (
@@ -109,7 +113,20 @@ def init_db(db_path: Union[str, Path]) -> None:
             if "shop_sku" not in columns:
                 conn.execute("ALTER TABLE products ADD COLUMN shop_sku TEXT;")
 
-        # Migrate audit_results table if missing metrics columns
+        # Migrate specs_cache table if missing expires_at and backfill
+        specs_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='specs_cache';")
+        if specs_cursor.fetchone():
+            s_cols = [row["name"] for row in conn.execute("PRAGMA table_info(specs_cache);").fetchall()]
+            if "expires_at" not in s_cols:
+                conn.execute("ALTER TABLE specs_cache ADD COLUMN expires_at TEXT;")
+            conn.execute("UPDATE specs_cache SET expires_at = datetime(fetched_at, '+30 days') WHERE expires_at IS NULL;")
+
+        # Backfill url_cache if expires_at is NULL
+        url_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='url_cache';")
+        if url_cursor.fetchone():
+            conn.execute("UPDATE url_cache SET expires_at = datetime(created_at, '+30 days') WHERE expires_at IS NULL;")
+
+        # Migrate audit_results table if missing metrics columns and deduplicate
         audit_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit_results';")
         if audit_cursor.fetchone():
             a_cols = [row["name"] for row in conn.execute("PRAGMA table_info(audit_results);").fetchall()]
@@ -127,6 +144,15 @@ def init_db(db_path: Union[str, Path]) -> None:
                 conn.execute("ALTER TABLE audit_results ADD COLUMN estimated_cost_usd REAL DEFAULT 0.0;")
             if "search_trace_json" not in a_cols:
                 conn.execute("ALTER TABLE audit_results ADD COLUMN search_trace_json TEXT;")
+
+            # Deduplicate existing records: keep latest MAX(audit_id) per product_id
+            conn.execute("""
+                DELETE FROM audit_results 
+                WHERE audit_id NOT IN (
+                    SELECT MAX(audit_id) FROM audit_results GROUP BY product_id
+                );
+            """)
+            conn.execute("DROP INDEX IF EXISTS idx_audit_results_product;")
 
         conn.executescript(SCHEMA_SQL)
         conn.commit()

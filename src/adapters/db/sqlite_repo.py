@@ -1,10 +1,13 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import json
 from pathlib import Path
 import sqlite3
 from typing import Sequence, Union
 from src.domain.entities import AuditResult, AuditStatus, DiscrepancyItem, MissingSpecItem, Product
 from .schema import get_sqlite_connection, init_db
+
+DEFAULT_CACHE_TTL_DAYS: int = 14
+DEFAULT_CACHE_MAX_RECORDS: int = 30000
 
 
 class SQLiteProductRepository:
@@ -18,6 +21,7 @@ class SQLiteProductRepository:
                 conn.commit()
             except Exception:
                 pass
+        self.prune_expired_cache()
 
     def _row_to_product(self, row: sqlite3.Row) -> Product:
         specs_dict = json.loads(row["current_specs"]) if row["current_specs"] else {}
@@ -75,7 +79,10 @@ class SQLiteProductRepository:
             parent_sku = excluded.parent_sku,
             master_key = excluded.master_key,
             is_master = excluded.is_master,
-            status = excluded.status,
+            status = CASE 
+                WHEN products.content_hash = excluded.content_hash THEN products.status 
+                ELSE excluded.status 
+            END,
             updated_at = excluded.updated_at;
         """
         payload = {
@@ -128,7 +135,10 @@ class SQLiteProductRepository:
             parent_sku = excluded.parent_sku,
             master_key = excluded.master_key,
             is_master = excluded.is_master,
-            status = excluded.status,
+            status = CASE 
+                WHEN products.content_hash = excluded.content_hash THEN products.status 
+                ELSE excluded.status 
+            END,
             updated_at = excluded.updated_at;
         """
 
@@ -276,8 +286,13 @@ class SQLiteProductRepository:
         query_hash: str,
         resolved_url: str,
         source_type: str,
-        expires_at: str | None = None
+        ttl_days: int = DEFAULT_CACHE_TTL_DAYS,
+        expires_at: str | None = None,
     ) -> None:
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        if expires_at is None:
+            expires_at = (now_dt + timedelta(days=ttl_days)).isoformat()
         sql = """
         INSERT INTO url_cache (query_hash, resolved_url, source_type, created_at, expires_at)
         VALUES (?, ?, ?, ?, ?)
@@ -287,15 +302,15 @@ class SQLiteProductRepository:
             created_at = excluded.created_at,
             expires_at = excluded.expires_at;
         """
-        now = datetime.now(timezone.utc).isoformat()
         with get_sqlite_connection(self.db_path) as conn:
             conn.execute(sql, (query_hash, resolved_url, source_type, now, expires_at))
             conn.commit()
 
     def get_url_cache(self, query_hash: str) -> str | None:
-        sql = "SELECT resolved_url FROM url_cache WHERE query_hash = ?;"
+        now = datetime.now(timezone.utc).isoformat()
+        sql = "SELECT resolved_url FROM url_cache WHERE query_hash = ? AND (expires_at IS NULL OR expires_at > ?);"
         with get_sqlite_connection(self.db_path) as conn:
-            cursor = conn.execute(sql, (query_hash,))
+            cursor = conn.execute(sql, (query_hash, now))
             row = cursor.fetchone()
             return row["resolved_url"] if row else None
 
@@ -310,26 +325,33 @@ class SQLiteProductRepository:
         resolved_url: str,
         specs_json: str,
         raw_html_hash: str | None = None,
-        status_code: int = 200
+        status_code: int = 200,
+        ttl_days: int = DEFAULT_CACHE_TTL_DAYS,
+        expires_at: str | None = None,
     ) -> None:
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        if expires_at is None:
+            expires_at = (now_dt + timedelta(days=ttl_days)).isoformat()
         sql = """
-        INSERT INTO specs_cache (resolved_url, specs_json, fetched_at, raw_html_hash, status_code)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO specs_cache (resolved_url, specs_json, fetched_at, raw_html_hash, status_code, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(resolved_url) DO UPDATE SET
             specs_json = excluded.specs_json,
             fetched_at = excluded.fetched_at,
             raw_html_hash = excluded.raw_html_hash,
-            status_code = excluded.status_code;
+            status_code = excluded.status_code,
+            expires_at = excluded.expires_at;
         """
-        now = datetime.now(timezone.utc).isoformat()
         with get_sqlite_connection(self.db_path) as conn:
-            conn.execute(sql, (resolved_url, specs_json, now, raw_html_hash, status_code))
+            conn.execute(sql, (resolved_url, specs_json, now, raw_html_hash, status_code, expires_at))
             conn.commit()
 
     def get_specs_cache(self, resolved_url: str) -> str | None:
-        sql = "SELECT specs_json FROM specs_cache WHERE resolved_url = ?;"
+        now = datetime.now(timezone.utc).isoformat()
+        sql = "SELECT specs_json FROM specs_cache WHERE resolved_url = ? AND (expires_at IS NULL OR expires_at > ?);"
         with get_sqlite_connection(self.db_path) as conn:
-            cursor = conn.execute(sql, (resolved_url,))
+            cursor = conn.execute(sql, (resolved_url, now))
             row = cursor.fetchone()
             return row["specs_json"] if row else None
 
@@ -338,6 +360,60 @@ class SQLiteProductRepository:
         with get_sqlite_connection(self.db_path) as conn:
             conn.execute(sql, (resolved_url,))
             conn.commit()
+
+    def prune_expired_cache(self, max_records: int = DEFAULT_CACHE_MAX_RECORDS) -> dict[str, int]:
+        """
+        Prunes expired cache entries and enforces a hard FIFO capacity cap (max_records).
+        Returns a dictionary with pruned count statistics.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        stats = {
+            "url_cache_expired": 0,
+            "url_cache_fifo": 0,
+            "specs_cache_expired": 0,
+            "specs_cache_fifo": 0,
+        }
+        with get_sqlite_connection(self.db_path) as conn:
+            # 1. Prune time-expired records
+            cur = conn.execute("DELETE FROM url_cache WHERE expires_at IS NOT NULL AND expires_at <= ?;", (now,))
+            stats["url_cache_expired"] = cur.rowcount
+
+            cur = conn.execute("DELETE FROM specs_cache WHERE expires_at IS NOT NULL AND expires_at <= ?;", (now,))
+            stats["specs_cache_expired"] = cur.rowcount
+
+            # 2. Enforce FIFO Cap on url_cache
+            count_url = conn.execute("SELECT COUNT(*) FROM url_cache;").fetchone()[0]
+            if count_url > max_records:
+                excess_url = count_url - max_records
+                cur = conn.execute(
+                    """
+                    DELETE FROM url_cache 
+                    WHERE query_hash IN (
+                        SELECT query_hash FROM url_cache ORDER BY created_at ASC LIMIT ?
+                    );
+                    """,
+                    (excess_url,),
+                )
+                stats["url_cache_fifo"] = cur.rowcount
+
+            # 3. Enforce FIFO Cap on specs_cache
+            count_specs = conn.execute("SELECT COUNT(*) FROM specs_cache;").fetchone()[0]
+            if count_specs > max_records:
+                excess_specs = count_specs - max_records
+                cur = conn.execute(
+                    """
+                    DELETE FROM specs_cache 
+                    WHERE resolved_url IN (
+                        SELECT resolved_url FROM specs_cache ORDER BY fetched_at ASC LIMIT ?
+                    );
+                    """,
+                    (excess_specs,),
+                )
+                stats["specs_cache_fifo"] = cur.rowcount
+
+            conn.commit()
+
+        return stats
 
     def check_wal_mode(self) -> bool:
         with get_sqlite_connection(self.db_path) as conn:
@@ -451,7 +527,24 @@ class SQLiteProductRepository:
             discrepancies_json, missing_specs_json, matched_specs_count, total_specs_count,
             audited_at, details, execution_time_sec, crawler_time_sec, llm_time_sec,
             input_tokens, output_tokens, estimated_cost_usd, search_trace_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(product_id) DO UPDATE SET
+            status = excluded.status,
+            confidence_score = excluded.confidence_score,
+            reference_url = excluded.reference_url,
+            discrepancies_json = excluded.discrepancies_json,
+            missing_specs_json = excluded.missing_specs_json,
+            matched_specs_count = excluded.matched_specs_count,
+            total_specs_count = excluded.total_specs_count,
+            audited_at = excluded.audited_at,
+            details = excluded.details,
+            execution_time_sec = excluded.execution_time_sec,
+            crawler_time_sec = excluded.crawler_time_sec,
+            llm_time_sec = excluded.llm_time_sec,
+            input_tokens = excluded.input_tokens,
+            output_tokens = excluded.output_tokens,
+            estimated_cost_usd = excluded.estimated_cost_usd,
+            search_trace_json = excluded.search_trace_json;
         """
         disc_json = json.dumps(
             [d.model_dump() for d in result.discrepancies],
@@ -487,6 +580,13 @@ class SQLiteProductRepository:
                 ),
             )
             audit_id = cursor.lastrowid
+            if not audit_id:
+                row = conn.execute(
+                    "SELECT audit_id FROM audit_results WHERE product_id = ?;",
+                    (result.product_id,),
+                ).fetchone()
+                audit_id = row[0] if row else 0
+
             conn.execute(
                 "UPDATE products SET status = ?, updated_at = ? WHERE product_id = ?;",
                 (result.status.value, now_iso, result.product_id),

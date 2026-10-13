@@ -181,12 +181,14 @@ class AuditProductUseCase:
                     )
 
         if winning_result:
+            winning_result.product_id = product.product_id
             winning_result.search_trace = search_trace
             self.product_repo.save_audit_result(winning_result)
             return winning_result
 
         if last_result:
             search_trace.append("[Evaluation] All candidate URLs exhausted without a verified match.")
+            last_result.product_id = product.product_id
             last_result.search_trace = search_trace
             self.product_repo.save_audit_result(last_result)
             return last_result

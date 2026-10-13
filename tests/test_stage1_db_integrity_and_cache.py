@@ -1,0 +1,159 @@
+from datetime import datetime, timezone, timedelta
+import json
+from pathlib import Path
+import pytest
+import sqlite3
+
+from src.adapters.db.schema import init_db, get_sqlite_connection
+from src.adapters.db.sqlite_repo import SQLiteProductRepository
+from src.domain.entities import Product, AuditResult, AuditStatus, DiscrepancyItem
+
+
+@pytest.fixture
+def temp_repo(tmp_path: Path) -> SQLiteProductRepository:
+    db_file = tmp_path / "test_stage1.db"
+    return SQLiteProductRepository(db_file)
+
+
+def test_status_preservation_on_sync(temp_repo: SQLiteProductRepository) -> None:
+    p = Product(
+        product_id=101,
+        title="Test Router AX3000",
+        shop_sku="SKU-101",
+        current_specs={"speed": "3000Mbps"},
+        status=AuditStatus.VERIFIED,
+    )
+    temp_repo.save_product(p)
+    saved = temp_repo.get_product_by_id(101)
+    assert saved is not None
+    assert saved.status == AuditStatus.VERIFIED
+
+    # Re-sync with exact same specs (content_hash matches) but incoming status is PENDING
+    incoming_same = Product(
+        product_id=101,
+        title="Test Router AX3000",
+        shop_sku="SKU-101",
+        current_specs={"speed": "3000Mbps"},
+        status=AuditStatus.PENDING,
+    )
+    temp_repo.save_product(incoming_same)
+    after_resync = temp_repo.get_product_by_id(101)
+    assert after_resync is not None
+    assert after_resync.status == AuditStatus.VERIFIED  # PRESERVED!
+
+    # Re-sync with modified specs (content_hash changed)
+    incoming_changed = Product(
+        product_id=101,
+        title="Test Router AX3000 V2",
+        shop_sku="SKU-101",
+        current_specs={"speed": "5400Mbps"},
+        status=AuditStatus.PENDING,
+    )
+    temp_repo.save_product(incoming_changed)
+    after_change = temp_repo.get_product_by_id(101)
+    assert after_change is not None
+    assert after_change.status == AuditStatus.PENDING  # RESET!
+
+
+def test_batch_upsert_status_preservation(temp_repo: SQLiteProductRepository) -> None:
+    p1 = Product(product_id=201, title="Switch 1", current_specs={"ports": "8"}, status=AuditStatus.VERIFIED)
+    p2 = Product(product_id=202, title="Switch 2", current_specs={"ports": "16"}, status=AuditStatus.MISMATCH)
+    temp_repo.batch_upsert([p1, p2])
+
+    # Re-sync batch with PENDING status
+    resync_p1 = Product(product_id=201, title="Switch 1", current_specs={"ports": "8"}, status=AuditStatus.PENDING)
+    resync_p2_changed = Product(product_id=202, title="Switch 2 NEW", current_specs={"ports": "24"}, status=AuditStatus.PENDING)
+    temp_repo.batch_upsert([resync_p1, resync_p2_changed])
+
+    assert temp_repo.get_product_by_id(201).status == AuditStatus.VERIFIED
+    assert temp_repo.get_product_by_id(202).status == AuditStatus.PENDING
+
+
+def test_audit_results_deduplication_upsert(temp_repo: SQLiteProductRepository) -> None:
+    p = Product(product_id=301, title="Camera Pro", current_specs={})
+    temp_repo.save_product(p)
+
+    res1 = AuditResult(
+        product_id=301,
+        status=AuditStatus.MISMATCH,
+        confidence_score=0.8,
+        details="First run verdict",
+        discrepancies=[
+            DiscrepancyItem(
+                spec_name="res",
+                shop_value="1080p",
+                reference_value="4K",
+                proof_quote="Supports 4K UHD video output",
+                source_url="https://vendor.kz/spec",
+            )
+        ],
+    )
+    audit_id_1 = temp_repo.save_audit_result(res1)
+    assert audit_id_1 > 0
+
+    # Repeat audit for same product
+    res2 = AuditResult(
+        product_id=301,
+        status=AuditStatus.VERIFIED,
+        confidence_score=0.98,
+        details="Second run verified",
+    )
+    audit_id_2 = temp_repo.save_audit_result(res2)
+    assert audit_id_2 > 0
+
+    with get_sqlite_connection(temp_repo.db_path) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM audit_results WHERE product_id = 301;").fetchone()[0]
+        assert count == 1  # Strictly 1 result!
+
+    latest = temp_repo.get_latest_audit_result(301)
+    assert latest is not None
+    assert latest.status == AuditStatus.VERIFIED
+    assert latest.details == "Second run verified"
+    assert latest.confidence_score == 0.98
+
+
+def test_cache_ttl_and_expiration(temp_repo: SQLiteProductRepository) -> None:
+    # 1. URL cache expired
+    past_iso = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+    future_iso = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+
+    temp_repo.save_url_cache("hash_expired", "https://old.kz", "TEST", expires_at=past_iso)
+    temp_repo.save_url_cache("hash_valid", "https://new.kz", "TEST", expires_at=future_iso)
+
+    assert temp_repo.get_url_cache("hash_expired") is None
+    assert temp_repo.get_url_cache("hash_valid") == "https://new.kz"
+
+    # 2. Specs cache expired
+    temp_repo.save_specs_cache("https://old.kz", '{"test": 1}', expires_at=past_iso)
+    temp_repo.save_specs_cache("https://new.kz", '{"test": 2}', expires_at=future_iso)
+
+    assert temp_repo.get_specs_cache("https://old.kz") is None
+    assert temp_repo.get_specs_cache("https://new.kz") == '{"test": 2}'
+
+
+def test_fifo_capacity_and_pruning(temp_repo: SQLiteProductRepository) -> None:
+    now_dt = datetime.now(timezone.utc)
+    past_iso = (now_dt - timedelta(days=1)).isoformat()
+
+    # Insert 1 expired item
+    temp_repo.save_url_cache("hash_exp", "https://exp.kz", "TEST", expires_at=past_iso)
+    temp_repo.save_specs_cache("https://exp.kz", "{}", expires_at=past_iso)
+
+    # Insert 10 valid items (expiring tomorrow)
+    for i in range(10):
+        t_iso = (now_dt + timedelta(days=1, minutes=i)).isoformat()
+        temp_repo.save_url_cache(f"hash_{i}", f"https://site.kz/{i}", "TEST", expires_at=t_iso)
+        temp_repo.save_specs_cache(f"https://site.kz/{i}", json.dumps({"idx": i}), expires_at=t_iso)
+
+    # Prune with max_records=4
+    stats = temp_repo.prune_expired_cache(max_records=4)
+    assert stats["url_cache_expired"] == 1
+    assert stats["specs_cache_expired"] == 1
+    assert stats["url_cache_fifo"] == 6  # 10 remaining - 4 limit = 6 deleted
+    assert stats["specs_cache_fifo"] == 6
+
+    with get_sqlite_connection(temp_repo.db_path) as conn:
+        url_count = conn.execute("SELECT COUNT(*) FROM url_cache;").fetchone()[0]
+        specs_count = conn.execute("SELECT COUNT(*) FROM specs_cache;").fetchone()[0]
+        assert url_count == 4
+        assert specs_count == 4
