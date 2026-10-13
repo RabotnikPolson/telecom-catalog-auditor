@@ -15,6 +15,11 @@ except ImportError:
     pass
 
 from config.settings import get_settings
+from rich.console import Console
+from rich.live import Live
+from rich.markup import escape
+from rich.panel import Panel
+
 from src.adapters.catalog.mysql_reader import MySQLCatalogReader
 from src.adapters.catalog.telecom_crawler import TelecomShopCrawler
 from src.adapters.crawler.web_crawler import WebCrawler
@@ -22,7 +27,7 @@ from src.adapters.db.sqlite_repo import SQLiteProductRepository
 from src.adapters.llm.openai_judge import OpenAIJudge, GeminiJudge
 from src.adapters.search.serper_client import SerperClient
 from src.adapters.search.vendor_direct import VendorDirectResolver
-from src.domain.entities import AuditStatus, Product
+from src.domain.entities import AuditResult, AuditStatus, Product
 from src.domain.services import ParentChildGrouper
 from src.use_cases.audit_product import AuditProductUseCase
 from src.use_cases.crawl_shop_catalog import CrawlShopCatalogUseCase
@@ -465,6 +470,116 @@ async def run_live_test_command(args: argparse.Namespace) -> int:
     return 0
 
 
+class AuditTUI:
+    def __init__(self, console: Console, total_products: int, concurrency: int) -> None:
+        self.console = console
+        self.total = total_products
+        self.concurrency = concurrency
+        self.completed = 0
+        self.verified_count = 0
+        self.mismatch_count = 0
+        self.missing_specs_count = 0
+        self.not_found_count = 0
+        self.error_count = 0
+        self.worker_status: dict[int, str] = {w: "Waiting..." for w in range(1, concurrency + 1)}
+
+    def set_worker_status(self, worker_id: int, status_text: str) -> None:
+        self.worker_status[worker_id] = status_text
+
+    def record_completed(self, status: AuditStatus) -> None:
+        self.completed += 1
+        if status == AuditStatus.VERIFIED:
+            self.verified_count += 1
+        elif status == AuditStatus.MISMATCH:
+            self.mismatch_count += 1
+        elif status == AuditStatus.MISSING_SPECS:
+            self.missing_specs_count += 1
+        elif status == AuditStatus.NOT_FOUND:
+            self.not_found_count += 1
+        else:
+            self.error_count += 1
+
+    def render_live_panel(self) -> Panel:
+        pct = int((self.completed / self.total) * 100) if self.total else 0
+        bar_len = 24
+        filled = int((pct / 100) * bar_len)
+        bar = "█" * filled + "░" * (bar_len - filled)
+
+        lines = [
+            f"[bold cyan]Progress:[/bold cyan] \\[{self.completed:02d}/{self.total:02d}] \\[{bar}] {pct}% | "
+            f"[bold green]Verified: {self.verified_count}[/bold green] | "
+            f"[bold red]Mismatch: {self.mismatch_count}[/bold red] | "
+            f"[bold yellow]Missing: {self.missing_specs_count}[/bold yellow] | "
+            f"[bold magenta]Not Found: {self.not_found_count}[/bold magenta] | "
+            f"[bold red]Errors: {self.error_count}[/bold red]"
+        ]
+        if self.concurrency > 1:
+            lines.append("")
+            for w in range(1, self.concurrency + 1):
+                w_status = escape(self.worker_status.get(w, "Idle"))
+                lines.append(f"[bold cyan]Worker #{w}:[/bold cyan] {w_status}")
+        else:
+            w_status = escape(self.worker_status.get(1, "Idle"))
+            lines.append(f"[bold cyan]Status:[/bold cyan] {w_status}")
+
+        return Panel(
+            "\n".join(lines),
+            title=f"[bold white]TELECOM AUDITOR :: LIVE AUDIT MONITOR[/bold white] [dim](Concurrency: {self.concurrency})[/dim]",
+            border_style="cyan",
+        )
+
+
+def format_audit_card(idx: int, total_count: int, prod: Product, result: AuditResult) -> str:
+    lines = []
+    lines.append(f"\\[{idx:02d}/{total_count}] Product ID #{prod.product_id} | {escape(prod.title[:150])}")
+    lines.append(f"      Shop SKU: {escape(prod.shop_sku or 'N/A')} | Vendor SKU: {escape(prod.vendor_sku or 'N/A')} | Barcode: {escape(prod.barcode or 'N/A')}")
+    lines.append(f"      Shop URL: https://shop.telecom.kz/product/{prod.product_id}")
+
+    if result.status == AuditStatus.VERIFIED:
+        lines.append(f"      STATUS: [bold green]\\[VERIFIED][/bold green] (Confidence: {result.confidence_score:.2f} | Matched: {result.matched_specs_count}/{result.total_specs_count})")
+        lines.append(f"      Ref URL: {escape(result.reference_url or '')}")
+        if result.details:
+            lines.append(f"      Details: {escape(result.details)}")
+    elif result.status == AuditStatus.MISMATCH:
+        lines.append(f"      STATUS: [bold red]\\[MISMATCH][/bold red] (Confidence: {result.confidence_score:.2f} | Discrepancies: {len(result.discrepancies)})")
+        lines.append(f"      Ref URL: {escape(result.reference_url or '')}")
+        for d in result.discrepancies:
+            lines.append(f"        * Spec: '{escape(d.spec_name)}' \\[{escape(d.severity.upper())}]")
+            lines.append(f"          Shop Value     : {escape(d.shop_value)}")
+            lines.append(f"          Reference Value: {escape(d.reference_value)}")
+        if result.details:
+            lines.append(f"      Details: {escape(result.details)}")
+    elif result.status == AuditStatus.MISSING_SPECS:
+        lines.append(f"      STATUS: [bold yellow]\\[MISSING_SPECS][/bold yellow] (Confidence: {result.confidence_score:.2f})")
+        lines.append(f"      Ref URL: {escape(result.reference_url or '')}")
+        if result.details:
+            lines.append(f"      Details: {escape(result.details)}")
+    elif result.status == AuditStatus.NOT_FOUND:
+        lines.append(f"      STATUS: [bold magenta]\\[NOT_FOUND][/bold magenta] - {escape(result.details or '')}")
+        if result.search_trace:
+            lines.append("      SEARCH TRACE:")
+            for trace_step in result.search_trace:
+                lines.append(f"        > {escape(trace_step)}")
+    else:
+        lines.append(f"      STATUS: [bold red]\\[ERROR][/bold red] - {escape(result.details or '')}")
+        if result.search_trace:
+            lines.append("      SEARCH TRACE:")
+            for trace_step in result.search_trace:
+                lines.append(f"        > {escape(trace_step)}")
+
+    if result.missing_specs:
+        lines.append("      * MISSING SPECS (В эталоне найдены важные ТХ, отсутствующие на витрине):")
+        for m in result.missing_specs:
+            lines.append(f"        + {escape(m.spec_name)}: {escape(m.reference_value)}")
+
+    if result.execution_time_sec or result.input_tokens:
+        total_tok = result.input_tokens + result.output_tokens
+        lines.append(f"      Metrics: Time: {result.execution_time_sec:.2f}s (Crawler: {result.crawler_time_sec:.2f}s | LLM: {result.llm_time_sec:.2f}s) | Tokens: {total_tok:,} (in: {result.input_tokens:,} | out: {result.output_tokens:,}) | Cost: ~${result.estimated_cost_usd:.5f}")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
 async def run_audit_command(args: argparse.Namespace) -> int:
     setup_utf8_terminal()
 
@@ -600,8 +715,11 @@ async def run_audit_command(args: argparse.Namespace) -> int:
         judge=judge,
     )
 
+    raw_concurrency = getattr(args, "concurrency", 1) or 1
+    effective_concurrency = max(1, min(raw_concurrency, len(products)))
+
     crawler = WebCrawler(
-        max_concurrent=2,
+        max_concurrent=effective_concurrency,
         headless=not args.no_headless,
         timeout_ms=30000,
     )
@@ -612,105 +730,125 @@ async def run_audit_command(args: argparse.Namespace) -> int:
         judge=judge,
     )
 
+    console = Console()
+    tui = AuditTUI(console=console, total_products=len(products), concurrency=effective_concurrency)
+
     print("=" * 80)
     print("TELECOM CATALOG AUDITOR :: STAGE 4 FACTUAL ARBITER")
     print("=" * 80)
     print(f"Target DB     : {db_path.resolve()}")
     print(f"Products Count: {len(products)}")
     print(f"LLM Engine    : OpenAI (model: {settings.OPENAI_MODEL})")
+    print(f"Workers       : {effective_concurrency}")
     print(f"Headless      : {not args.no_headless}")
     print(f"Force Refresh : {args.force_refresh}")
-    # print("-" * 80)
+    print("=" * 80)
 
     try:
         await crawler.start()
-        verified_count = 0
-        mismatch_count = 0
-        missing_specs_count = 0
-        not_found_count = 0
-        error_count = 0
 
+        queue: asyncio.Queue[tuple[int, Product]] = asyncio.Queue()
+        for idx, prod in enumerate(products, 1):
+            await queue.put((idx, prod))
+
+        print_lock = asyncio.Lock()
+        completed_cards: dict[int, str] = {}
+        next_to_print = 1
         total_time_all = 0.0
         total_tokens_all = 0
         total_cost_all = 0.0
         start_time_all = time.perf_counter()
         total_products_count = len(products)
 
-        for idx, prod in enumerate(products, 1):
-            print(f"[{idx:02d}/{total_products_count}] Product ID #{prod.product_id} | {prod.title[:150]}")
-            print(f"      Shop SKU: {prod.shop_sku or 'N/A'} | Vendor SKU: {prod.vendor_sku or 'N/A'} | Barcode: {prod.barcode or 'N/A'}")
-            print(f"      Shop URL: https://shop.telecom.kz/product/{prod.product_id}")
+        async def worker_loop(worker_id: int, live_ctx: Live | None) -> None:
+            nonlocal total_time_all, total_tokens_all, total_cost_all, next_to_print
+            while not queue.empty():
+                try:
+                    idx, prod = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
 
-            result = await audit_use_case.audit_product(
-                product=prod,
-                reference_url=args.reference_url if len(products) == 1 else None,
-                force_refresh=args.force_refresh,
-            )
-            if prod.master_key:
-                audited_master_keys.add(prod.master_key)
+                tui.set_worker_status(worker_id, f"Auditing #{prod.product_id} | {prod.title[:45]}...")
+                if live_ctx:
+                    live_ctx.update(tui.render_live_panel())
 
-            if result.status == AuditStatus.VERIFIED:
-                verified_count += 1
-                print(f"      STATUS: [VERIFIED] (Confidence: {result.confidence_score:.2f} | Matched: {result.matched_specs_count}/{result.total_specs_count})")
-                print(f"      Ref URL: {result.reference_url}")
-                if result.details:
-                    print(f"      Details: {result.details}")
-            elif result.status == AuditStatus.MISMATCH:
-                mismatch_count += 1
-                print(f"      STATUS: [MISMATCH] (Confidence: {result.confidence_score:.2f} | Discrepancies: {len(result.discrepancies)})")
-                print(f"      Ref URL: {result.reference_url}")
-                for d in result.discrepancies:
-                    print(f"        * Spec: '{d.spec_name}' [{d.severity.upper()}]")
-                    print(f"          Shop Value     : {d.shop_value}")
-                    print(f"          Reference Value: {d.reference_value}")
-                if result.details:
-                    print(f"      Details: {result.details}")
-            elif result.status == AuditStatus.MISSING_SPECS:
-                missing_specs_count += 1
-                print(f"      STATUS: [MISSING_SPECS] (Confidence: {result.confidence_score:.2f})")
-                print(f"      Ref URL: {result.reference_url}")
-                if result.details:
-                    print(f"      Details: {result.details}")
-            elif result.status == AuditStatus.NOT_FOUND:
-                not_found_count += 1
-                print(f"      STATUS: [NOT_FOUND] - {result.details}")
-                if result.search_trace:
-                    print("      SEARCH TRACE:")
-                    for trace_step in result.search_trace:
-                        print(f"        > {trace_step}")
-            else:
-                error_count += 1
-                print(f"      STATUS: [ERROR] - {result.details}")
-                if result.search_trace:
-                    print("      SEARCH TRACE:")
-                    for trace_step in result.search_trace:
-                        print(f"        > {trace_step}")
+                try:
+                    result = await audit_use_case.audit_product(
+                        product=prod,
+                        reference_url=args.reference_url if len(products) == 1 else None,
+                        force_refresh=args.force_refresh,
+                    )
+                except Exception as exc:
+                    result = AuditResult(
+                        product_id=prod.product_id,
+                        status=AuditStatus.ERROR,
+                        confidence_score=0.0,
+                        reference_url=None,
+                        discrepancies=[],
+                        matched_specs_count=0,
+                        total_specs_count=len(prod.current_specs),
+                        details=f"Unexpected error: {exc}",
+                        execution_time_sec=0.0,
+                    )
 
-            if result.missing_specs:
-                print(f"      * MISSING SPECS (В эталоне найдены важные ТХ, отсутствующие на витрине):")
-                for m in result.missing_specs:
-                    print(f"        + {m.spec_name}: {m.reference_value}")
+                if prod.master_key:
+                    audited_master_keys.add(prod.master_key)
 
-            if result.execution_time_sec or result.input_tokens:
-                total_tok = result.input_tokens + result.output_tokens
-                print(f"      Metrics: Time: {result.execution_time_sec:.2f}s (Crawler: {result.crawler_time_sec:.2f}s | LLM: {result.llm_time_sec:.2f}s) | Tokens: {total_tok:,} (in: {result.input_tokens:,} | out: {result.output_tokens:,}) | Cost: ~${result.estimated_cost_usd:.5f}")
+                tui.record_completed(result.status)
+                if result.execution_time_sec:
+                    total_time_all += result.execution_time_sec
+                if result.input_tokens:
+                    total_tokens_all += (result.input_tokens + result.output_tokens)
+                if result.estimated_cost_usd:
+                    total_cost_all += result.estimated_cost_usd
 
-            if result.execution_time_sec:
-                total_time_all += result.execution_time_sec
-            if result.input_tokens:
-                total_tokens_all += (result.input_tokens + result.output_tokens)
-            if result.estimated_cost_usd:
-                total_cost_all += result.estimated_cost_usd
-            print()
+                card_str = format_audit_card(idx, total_products_count, prod, result)
+                async with print_lock:
+                    completed_cards[idx] = card_str
+                    while next_to_print in completed_cards:
+                        card_to_emit = completed_cards.pop(next_to_print)
+                        if live_ctx:
+                            live_ctx.console.print(card_to_emit)
+                        else:
+                            console.print(card_to_emit)
+                        next_to_print += 1
 
+                queue.task_done()
+                tui.set_worker_status(worker_id, "Idle")
+                if live_ctx:
+                    live_ctx.update(tui.render_live_panel())
+
+        if console.is_terminal:
+            with Live(tui.render_live_panel(), console=console, refresh_per_second=4, transient=True) as live:
+                tasks = [
+                    asyncio.create_task(worker_loop(w_id, live))
+                    for w_id in range(1, effective_concurrency + 1)
+                ]
+                await asyncio.gather(*tasks)
+        else:
+            tasks = [
+                asyncio.create_task(worker_loop(w_id, None))
+                for w_id in range(1, effective_concurrency + 1)
+            ]
+            await asyncio.gather(*tasks)
+
+        # Flush any remaining cards if sequence had any gaps
+        async with print_lock:
+            for rem_idx in sorted(completed_cards.keys()):
+                card_to_emit = completed_cards.pop(rem_idx)
+                console.print(card_to_emit)
+
+        wall_time = time.perf_counter() - start_time_all
+        speedup = (total_time_all / wall_time) if wall_time > 0 else 1.0
         print("-" * 80)
-        print(f"AUDIT SUMMARY: Total: {len(products)} | Verified: {verified_count} | Mismatches: {mismatch_count} | Missing Specs: {missing_specs_count} | Not Found: {not_found_count} | Errors: {error_count}")
+        print(f"AUDIT SUMMARY: Total: {len(products)} | Verified: {tui.verified_count} | Mismatches: {tui.mismatch_count} | Missing Specs: {tui.missing_specs_count} | Not Found: {tui.not_found_count} | Errors: {tui.error_count}")
         if len(products) > 1 and total_tokens_all > 0:
-            print(f"BATCH METRICS: Total Time: {total_time_all:.2f}s | Total Tokens: {total_tokens_all:,} | Total Est. Cost: ~${total_cost_all:.5f}")
+            print(f"BATCH METRICS: Wall Time: {wall_time:.2f}s | Total Time: {total_time_all:.2f}s | Total Tokens: {total_tokens_all:,} | Total Est. Cost: ~${total_cost_all:.5f}")
         print("=" * 80)
         return 0
     finally:
         await crawler.close()
+        await judge.aclose()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -925,6 +1063,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="Max products to audit (default: 5)",
+    )
+    audit_parser.add_argument(
+        "--concurrency",
+        type=int,
+        choices=list(range(1, 16)),
+        default=1,
+        help="Number of concurrent audit workers (1-10, default: 1)",
     )
     audit_parser.add_argument(
         "--reference-url",

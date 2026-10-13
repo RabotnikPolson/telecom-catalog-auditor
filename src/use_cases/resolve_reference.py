@@ -6,6 +6,7 @@ from typing import Any, Optional
 from config.vendor_profiles import find_vendor_profile
 from config.whitelist_domains import extract_domain, get_domain_priority, is_whitelisted_domain
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
+from src.adapters.search.kaspi_client import KaspiSearchClient
 from src.adapters.search.serper_client import SerperClient
 from src.adapters.search.vendor_direct import VendorDirectResolver
 from src.domain.entities import Product
@@ -67,6 +68,7 @@ class ResolveReferenceUseCase:
         verify_direct_urls: bool = False,
         judge: Optional[Any] = None,
         use_url_cache: bool = True,
+        kaspi_client: Optional[KaspiSearchClient] = None,
     ) -> None:
         self.repo = repository
         self.vendor_resolver = vendor_resolver
@@ -75,6 +77,7 @@ class ResolveReferenceUseCase:
         self.verify_direct_urls = verify_direct_urls
         self.judge = judge
         self.use_url_cache = use_url_cache
+        self.kaspi_client = kaspi_client or KaspiSearchClient()
 
     def is_nameless_generic_product(self, product: Product) -> bool:
         if product.barcode and product.barcode.strip():
@@ -367,6 +370,20 @@ class ResolveReferenceUseCase:
                 for link in gen_code_links:
                     add_candidate(link)
 
+            # LAZY FALLBACK: If external search returned 0 candidates for this model code, query Kaspi directly
+            if not candidate_pool:
+                direct_kaspi_links = await self.kaspi_client.search(
+                    query=code_clean,
+                    brand=extracted_brand or product.vendor_name,
+                    limit=2,
+                )
+                if direct_kaspi_links:
+                    trace.append(
+                        f"[Vector 1: Kaspi Direct Fallback] Direct API found {len(direct_kaspi_links)} valid card(s) for code '{code_clean}'"
+                    )
+                    for link in direct_kaspi_links:
+                        add_candidate(link)
+
             if candidate_pool:
                 target_brand = extracted_brand or (clean_model_query.split()[0].strip() if clean_model_query else None)
                 candidate_pool.sort(key=lambda u: get_domain_priority(u, brand=target_brand))
@@ -468,14 +485,20 @@ class ResolveReferenceUseCase:
 
         # VECTOR 3: Ecosystem Brand Aliases (STRICT QUOTA GUARD: len(candidate_pool) < 2)
         if len(candidate_pool) < 2 and bundle.brand_aliases:
-            for alias in bundle.brand_aliases[:2]:
-                alias_query = f"site:kaspi.kz {alias} {bundle.marketing_model}"
-                trace.append(f"[Vector 3: Alias Search] (Quota Guard: pool size {len(candidate_pool)} < 2) Query: '{alias_query}'")
-                alias_results = await self.serper_client.search_and_filter(
-                    query=alias_query,
+            alias_targets = bundle.brand_aliases[:2]
+            alias_queries = [f"site:kaspi.kz {alias} {bundle.marketing_model}" for alias in alias_targets]
+            for q in alias_queries:
+                trace.append(f"[Vector 3: Alias Search] (Quota Guard: pool size {len(candidate_pool)} < 2) Query: '{q}'")
+            alias_tasks = [
+                self.serper_client.search_and_filter(
+                    query=q,
                     whitelist_domains=self.whitelist_domains,
                     num_results=5,
                 )
+                for q in alias_queries
+            ]
+            alias_results_list = await asyncio.gather(*alias_tasks)
+            for alias_results in alias_results_list:
                 if alias_results:
                     alias_links = [
                         str(item.get("link") or "").strip()
@@ -487,8 +510,6 @@ class ResolveReferenceUseCase:
                     trace.append(f"[Vector 3: Alias Search] Query returned {len(alias_results)} items, {len(alias_links)} valid Kaspi cards")
                     for link in alias_links:
                         add_candidate(link)
-                if len(candidate_pool) >= 2:
-                    break
 
         # VECTOR 4: Barcode Search (STRICT QUOTA GUARD: len(candidate_pool) < 2)
         if len(candidate_pool) < 2 and product.barcode and product.barcode.strip():
@@ -511,6 +532,20 @@ class ResolveReferenceUseCase:
                 ]
                 trace.append(f"[Vector 4: Barcode Search] Query returned {len(bc_results)} items, {len(bc_links)} whitelisted")
                 for link in bc_links:
+                    add_candidate(link)
+
+        # LAZY FALLBACK: If candidate pool is still empty after all Serper vectors, query Kaspi directly with marketing model
+        if not candidate_pool:
+            direct_kaspi_links = await self.kaspi_client.search(
+                query=bundle.marketing_model or clean_model_query,
+                brand=extracted_brand or product.vendor_name,
+                limit=2,
+            )
+            if direct_kaspi_links:
+                trace.append(
+                    f"[Vector 5: Kaspi Direct Fallback] Direct API found {len(direct_kaspi_links)} valid card(s) for '{bundle.marketing_model}'"
+                )
+                for link in direct_kaspi_links:
                     add_candidate(link)
 
         target_brand = extracted_brand or (clean_model_query.split()[0].strip() if clean_model_query else None)

@@ -34,7 +34,7 @@ class SerperClient:
         self,
         api_key: Optional[str] = None,
         timeout: float = 15.0,
-        max_concurrency: int = 3,
+        max_concurrency: int = 15,
         client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         if api_key is not None:
@@ -47,9 +47,16 @@ class SerperClient:
         self._external_client = client
         self._client: Optional[httpx.AsyncClient] = client
 
+    def _create_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(self.timeout, connect=5.0),
+            http2=True,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=40, keepalive_expiry=30.0),
+        )
+
     async def __aenter__(self) -> "SerperClient":
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout))
+            self._client = self._create_client()
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
@@ -61,8 +68,8 @@ class SerperClient:
             self._client = None
 
     def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout))
+        if self._client is None or self._client.is_closed:
+            self._client = self._create_client()
         return self._client
 
     def is_spam_or_unwanted(self, url: str) -> bool:
@@ -94,17 +101,27 @@ class SerperClient:
 
         client = self._get_client()
         async with self._semaphore:
-            try:
-                response = await client.post(self.BASE_URL, json=payload, headers=headers)
-                response.raise_for_status()
-                data = response.json()
-                return data.get("organic", [])
-            except httpx.HTTPStatusError as exc:
-                logger.error(f"Serper API HTTP error: {exc.response.status_code}")
-                return []
-            except Exception as exc:
-                logger.error(f"Serper API search error: {exc}")
-                return []
+            for attempt in range(3):
+                try:
+                    response = await client.post(self.BASE_URL, json=payload, headers=headers)
+                    if response.status_code == 200:
+                        data = response.json()
+                        return data.get("organic", [])
+                    elif response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                        continue
+                    else:
+                        response.raise_for_status()
+                except (httpx.RequestError, httpx.HTTPStatusError, OSError) as exc:
+                    if attempt < 2:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                        continue
+                    logger.error(f"Serper API search error for '{clean_query}': {exc}")
+                    return []
+                except Exception as exc:
+                    logger.error(f"Serper API unexpected error for '{clean_query}': {exc}")
+                    return []
+            return []
 
     async def search_and_filter(
         self,

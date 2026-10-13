@@ -167,6 +167,22 @@ class OpenAIJudge:
             or settings.OPENAI_REASONING_EFFORT
             or "low"
         )
+        self._client: httpx.AsyncClient | None = None
+        self._decompose_cache: dict[tuple[str, str], SearchQueryBundle] = {}
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, connect=10.0),
+                http2=True,
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+            )
+        return self._client
+
+    async def aclose(self) -> None:
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
 
     @classmethod
     def _heuristic_decompose(cls, title: str, vendor_name: str | None = None) -> SearchQueryBundle:
@@ -244,8 +260,14 @@ class OpenAIJudge:
         Uses LLM with fallback to local regex heuristic parser.
         """
         clean_title = title.strip()
+        cache_key = (clean_title.lower(), (vendor_name or "").strip().lower())
+        if cache_key in self._decompose_cache:
+            return self._decompose_cache[cache_key]
+
         if not self.api_key:
-            return self._heuristic_decompose(clean_title, vendor_name)
+            fallback = self._heuristic_decompose(clean_title, vendor_name)
+            self._decompose_cache[cache_key] = fallback
+            return fallback
 
         system_msg = (
             "You are an expert e-commerce search query assistant. Your task is to extract from a raw product title "
@@ -279,29 +301,32 @@ class OpenAIJudge:
             "Content-Type": "application/json",
         }
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            for attempt in range(3):
-                try:
-                    resp = await client.post(self.API_URL, json=payload, headers=headers)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        raw_content = str(data["choices"][0]["message"]["content"]).strip()
-                        parsed = self._safe_parse_bundle(raw_content, clean_title, vendor_name)
-                        if parsed:
-                            return parsed
-                    elif resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
-                        await asyncio.sleep(2.0 * (attempt + 1))
-                        continue
-                    else:
-                        break
-                except Exception as exc:
-                    if attempt < 2:
-                        await asyncio.sleep(2.0 * (attempt + 1))
-                        continue
-                    logger.warning(f"decompose_search_query exception: {exc}")
+        client = self._get_client()
+        for attempt in range(3):
+            try:
+                resp = await client.post(self.API_URL, json=payload, headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    raw_content = str(data["choices"][0]["message"]["content"]).strip()
+                    parsed = self._safe_parse_bundle(raw_content, clean_title, vendor_name)
+                    if parsed:
+                        self._decompose_cache[cache_key] = parsed
+                        return parsed
+                elif resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                    await asyncio.sleep(2.0 * (attempt + 1))
+                    continue
+                else:
                     break
+            except Exception as exc:
+                if attempt < 2:
+                    await asyncio.sleep(2.0 * (attempt + 1))
+                    continue
+                logger.warning(f"decompose_search_query exception: {exc}")
+                break
 
-        return self._heuristic_decompose(clean_title, vendor_name)
+        fallback = self._heuristic_decompose(clean_title, vendor_name)
+        self._decompose_cache[cache_key] = fallback
+        return fallback
 
     async def clean_search_query(
         self, title: str, vendor_name: str | None = None
@@ -376,30 +401,30 @@ class OpenAIJudge:
         cached_tokens = 0
 
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                for attempt in range(3):
-                    try:
-                        resp = await client.post(self.API_URL, json=payload, headers=headers)
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            raw_text = data["choices"][0]["message"]["content"] or "{}"
-                            usage = data.get("usage", {})
-                            input_tokens = usage.get("prompt_tokens", 0) or 0
-                            output_tokens = usage.get("completion_tokens", 0) or 0
-                            cached_tokens = (
-                                usage.get("prompt_tokens_details", {}).get("cached_tokens", 0) or 0
-                            )
-                            break
-                        elif resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
-                            await asyncio.sleep(2.0 * (attempt + 1))
-                            continue
-                        else:
-                            resp.raise_for_status()
-                    except Exception as req_err:
-                        if attempt < 2:
-                            await asyncio.sleep(2.0 * (attempt + 1))
-                            continue
-                        raise req_err
+            client = self._get_client()
+            for attempt in range(3):
+                try:
+                    resp = await client.post(self.API_URL, json=payload, headers=headers)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        raw_text = data["choices"][0]["message"]["content"] or "{}"
+                        usage = data.get("usage", {})
+                        input_tokens = usage.get("prompt_tokens", 0) or 0
+                        output_tokens = usage.get("completion_tokens", 0) or 0
+                        cached_tokens = (
+                            usage.get("prompt_tokens_details", {}).get("cached_tokens", 0) or 0
+                        )
+                        break
+                    elif resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                        await asyncio.sleep(2.0 * (attempt + 1))
+                        continue
+                    else:
+                        resp.raise_for_status()
+                except Exception as req_err:
+                    if attempt < 2:
+                        await asyncio.sleep(2.0 * (attempt + 1))
+                        continue
+                    raise req_err
 
             llm_time_sec = time.perf_counter() - t_llm_start
 

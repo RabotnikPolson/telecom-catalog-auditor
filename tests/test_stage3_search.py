@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
+from src.adapters.search.kaspi_client import KaspiSearchClient, is_kaspi_card_relevant
 from src.adapters.search.serper_client import SerperClient
 from src.adapters.search.vendor_direct import VendorDirectResolver
 from src.domain.entities import Product
@@ -328,4 +329,105 @@ class TestResolveReferenceUseCase:
             assert mock_search.call_count >= 3
             assert res.status == "FOUND"
             assert res.reference_url == "https://kaspi.kz/shop/p/dell-vostro-3510-106603279/"
+
+    @pytest.mark.anyio
+    async def test_kaspi_direct_fallback_triggered_when_serper_misses_kaspi(self, test_repo: SQLiteProductRepository):
+        product = Product(
+            product_id=40124,
+            title="Коммутатор Dahua DH-LR2226-24ET-360",
+            vendor_name="Dahua",
+            vendor_sku=None,
+        )
+        serper_client = SerperClient(api_key="mock")
+        # Serper returns empty for Kaspi (unindexed page)
+        with patch.object(serper_client, "search_and_filter", new=AsyncMock(return_value=[])):
+            kaspi_client = KaspiSearchClient()
+            mock_direct_cards = ["https://kaspi.kz/shop/p/dahua-dh-lr2226-24et-360-chernyi-100946358/"]
+            with patch.object(kaspi_client, "search", new=AsyncMock(return_value=mock_direct_cards)) as mock_kaspi_search:
+                use_case = ResolveReferenceUseCase(
+                    repository=test_repo,
+                    vendor_resolver=VendorDirectResolver(),
+                    serper_client=serper_client,
+                    kaspi_client=kaspi_client,
+                )
+                res = await use_case.execute(product)
+                assert res.status == "FOUND"
+                assert res.reference_url == "https://kaspi.kz/shop/p/dahua-dh-lr2226-24et-360-chernyi-100946358/"
+                assert mock_kaspi_search.called
+                assert any("Kaspi Direct Fallback" in step for step in res.search_trace)
+
+    @pytest.mark.anyio
+    async def test_kaspi_direct_fallback_lazy_skipped_when_serper_finds_kaspi(self, test_repo: SQLiteProductRepository):
+        product = Product(
+            product_id=50001,
+            title="Коммутатор TP-Link TL-SG108E",
+            vendor_name="TP-Link",
+            vendor_sku=None,
+        )
+        serper_client = SerperClient(api_key="mock")
+        mock_kaspi_hit = [{"title": "Kaspi TP-Link", "link": "https://kaspi.kz/shop/p/kommutator-tp-link-tl-sg108e-100569490/"}]
+        with patch.object(serper_client, "search_and_filter", new=AsyncMock(return_value=mock_kaspi_hit)):
+            kaspi_client = KaspiSearchClient()
+            with patch.object(kaspi_client, "search", new=AsyncMock(return_value=[])) as mock_kaspi_search:
+                use_case = ResolveReferenceUseCase(
+                    repository=test_repo,
+                    vendor_resolver=VendorDirectResolver(),
+                    serper_client=serper_client,
+                    kaspi_client=kaspi_client,
+                )
+                res = await use_case.execute(product)
+                assert res.status == "FOUND"
+                assert res.reference_url == "https://kaspi.kz/shop/p/kommutator-tp-link-tl-sg108e-100569490/"
+                # Kaspi direct search must NOT be called because Serper already found a Kaspi card (Lazy execution!)
+                assert not mock_kaspi_search.called
+
+
+class TestKaspiSearchClient:
+
+    def test_is_kaspi_card_relevant_brand_guard(self):
+        # Matching brand and model
+        card_ok = {"title": "Dahua DH-LR2226-24ET-360 черный", "shopLink": "/p/dahua-dh-lr2226-24et-360-chernyi-100946358/"}
+        assert is_kaspi_card_relevant(card_ok, "DH-LR2226-24ET-360", brand="Dahua") is True
+
+        # Unrelated camera matching only '360'
+        card_unrelated = {"title": "Экшн-камера Insta360 X5", "shopLink": "/p/insta360-x5-12345/"}
+        assert is_kaspi_card_relevant(card_unrelated, "DH-LR2226-24ET-360", brand="Dahua") is False
+
+        # Random socks or accessories without brand
+        card_socks = {"title": "Носки 35-40", "shopLink": "/p/noski-99999/"}
+        assert is_kaspi_card_relevant(card_socks, "DH-LR2226-24ET-360", brand="Dahua") is False
+
+    @pytest.mark.anyio
+    async def test_kaspi_search_client_parses_response_correctly(self):
+        client = KaspiSearchClient()
+        mock_response = httpx.Response(
+            status_code=200,
+            json={
+                "data": [
+                    {
+                        "title": "Dahua DH-LR2226-24ET-360 черный",
+                        "shopLink": "/p/dahua-dh-lr2226-24et-360-chernyi-100946358/?c=750000000",
+                    },
+                    {
+                        "title": "Insta360 X5",
+                        "shopLink": "/p/insta360-x5-12345/",
+                    },
+                ]
+            },
+        )
+        http_client = httpx.AsyncClient()
+        with patch.object(http_client, "get", new=AsyncMock(return_value=mock_response)):
+            urls = await client.search("DH-LR2226-24ET-360", brand="Dahua", client=http_client)
+            assert len(urls) == 1
+            assert urls[0] == "https://kaspi.kz/shop/p/dahua-dh-lr2226-24et-360-chernyi-100946358/?c=750000000"
+
+    @pytest.mark.anyio
+    async def test_kaspi_search_client_handles_network_failure_cleanly(self):
+        client = KaspiSearchClient()
+        http_client = httpx.AsyncClient()
+        with patch.object(http_client, "get", new=AsyncMock(side_effect=httpx.ConnectTimeout("Kaspi timeout"))):
+            urls = await client.search("DH-LR2226-24ET-360", client=http_client)
+            # Never crashes on network error, returns clean empty list
+            assert urls == []
+
 

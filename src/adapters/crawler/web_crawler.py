@@ -159,28 +159,34 @@ class WebCrawler:
                 # Brief debounce for JavaScript hydration
                 await page.wait_for_timeout(300)
 
-                spoiler_selectors = [
-                    "button:has-text('Все характеристики')",
-                    "button:has-text('все характеристики')",
-                    "button:has-text('Характеристики')",
-                    "button:has-text('характеристики')",
-                    "button:has-text('Подробнее')",
-                    "button:has-text('Показать все')",
-                    "a:has-text('Все характеристики')",
-                    "a:has-text('Характеристики')",
-                    "a:has-text('Подробнее')",
-                    "[data-tab='specifications']",
-                    "[data-tab='specs']",
-                    "[role='tab']:has-text('Характеристики')",
-                ]
-                for selector in spoiler_selectors:
-                    try:
-                        locator = page.locator(selector).first
-                        if await locator.is_visible():
-                            await locator.click(timeout=600)
-                            await page.wait_for_timeout(250)
-                    except Exception:
-                        continue
+                # Fast accordion / spoiler expansion via 2 combined locators (tabs first, then expand buttons)
+                tab_sel = "[data-tab='specifications'], [data-tab='specs'], [role='tab']:has-text('Характеристики')"
+                try:
+                    tab_loc = page.locator(tab_sel).first
+                    if await tab_loc.is_visible():
+                        await tab_loc.click(timeout=600)
+                        await page.wait_for_timeout(150)
+                except Exception:
+                    pass
+
+                expand_sel = (
+                    "button:has-text('Все характеристики'), "
+                    "button:has-text('все характеристики'), "
+                    "button:has-text('Показать все'), "
+                    "a:has-text('Все характеристики'), "
+                    "a:has-text('Показать все'), "
+                    "button:has-text('Характеристики'), "
+                    "a:has-text('Характеристики'), "
+                    "button:has-text('Подробнее'), "
+                    "a:has-text('Подробнее')"
+                )
+                try:
+                    expand_loc = page.locator(expand_sel).first
+                    if await expand_loc.is_visible():
+                        await expand_loc.click(timeout=600)
+                        await page.wait_for_timeout(150)
+                except Exception:
+                    pass
 
                 extracted = await page.evaluate(
                     """() => {
