@@ -6,7 +6,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-LATEST_SCHEMA_VERSION: int = 2
+LATEST_SCHEMA_VERSION: int = 3
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS products (
@@ -63,7 +63,7 @@ CREATE INDEX IF NOT EXISTS idx_specs_cache_expires ON specs_cache(expires_at);
 
 CREATE TABLE IF NOT EXISTS audit_results (
     audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_id INTEGER NOT NULL UNIQUE,
+    product_id INTEGER NOT NULL,
     status TEXT NOT NULL,
     confidence_score REAL NOT NULL,
     reference_url TEXT,
@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS audit_results (
     FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE CASCADE
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_results_product_unique ON audit_results(product_id);
 CREATE INDEX IF NOT EXISTS idx_audit_results_status ON audit_results(status);
 
 CREATE TABLE IF NOT EXISTS crawler_state (
@@ -198,7 +199,6 @@ def init_db(db_path: str | Path) -> None:
                     );
                 """)
                 conn.execute("DROP INDEX IF EXISTS idx_audit_results_product;")
-                conn.execute("DROP INDEX IF EXISTS idx_audit_results_product_unique;")
 
         conn.executescript(SCHEMA_SQL)
         if current_version < LATEST_SCHEMA_VERSION:

@@ -199,7 +199,7 @@ def test_atomic_jit_save_product_and_audit_result(temp_repo: SQLiteProductReposi
 def test_cache_indexes_and_user_version_exist(temp_repo: SQLiteProductRepository) -> None:
     with get_sqlite_connection(temp_repo.db_path) as conn:
         ver = conn.execute("PRAGMA user_version;").fetchone()[0]
-        assert ver >= 2
+        assert ver >= 3
 
         idx_rows = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index';"
@@ -208,5 +208,83 @@ def test_cache_indexes_and_user_version_exist(temp_repo: SQLiteProductRepository
         assert "idx_url_cache_resolved_url" in idx_names
         assert "idx_url_cache_created_at" in idx_names
         assert "idx_specs_cache_fetched_at" in idx_names
-        assert "idx_audit_results_product_unique" not in idx_names
+        assert "idx_audit_results_product_unique" in idx_names
+
+
+def test_legacy_schema_without_inline_unique_migrates_and_upserts(tmp_path: Path) -> None:
+    db_file = tmp_path / "legacy_catalog_audit.db"
+    conn = sqlite3.connect(str(db_file))
+    conn.executescript(
+        """
+        CREATE TABLE products (
+            product_id INTEGER PRIMARY KEY,
+            shop_sku TEXT,
+            title TEXT NOT NULL,
+            barcode TEXT,
+            vendor_name TEXT,
+            vendor_sku TEXT,
+            manufacturer_sku TEXT,
+            description TEXT,
+            images_count INTEGER NOT NULL DEFAULT 0,
+            current_specs TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            parent_sku TEXT,
+            master_key TEXT,
+            is_master INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE audit_results (
+            audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            confidence_score REAL NOT NULL,
+            reference_url TEXT,
+            discrepancies_json TEXT,
+            missing_specs_json TEXT,
+            matched_specs_count INTEGER NOT NULL,
+            total_specs_count INTEGER NOT NULL,
+            audited_at TEXT NOT NULL,
+            details TEXT,
+            FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE CASCADE
+        );
+        PRAGMA user_version = 2;
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    repo = SQLiteProductRepository(db_file)
+    prod = Product(
+        product_id=3180,
+        title="Defender Forsage GTR",
+        shop_sku="3180",
+        current_specs={"Диаметр руля": "24 см"},
+    )
+    res1 = AuditResult(
+        product_id=3180,
+        status=AuditStatus.MISMATCH,
+        confidence_score=0.99,
+        details="First audit on legacy schema",
+        search_trace=["[Step 1] Tested candidate"],
+    )
+    aid1 = repo.save_product_and_audit_result(prod, res1)
+    assert aid1 > 0
+
+    res2 = AuditResult(
+        product_id=3180,
+        status=AuditStatus.VERIFIED,
+        confidence_score=0.98,
+        details="Updated audit on legacy schema",
+        search_trace=["[Step 1] Re-verified"],
+    )
+    aid2 = repo.save_product_and_audit_result(prod, res2)
+    assert aid2 == aid1
+
+    latest = repo.get_latest_audit_result(3180)
+    assert latest is not None
+    assert latest.status == AuditStatus.VERIFIED
+    assert latest.search_trace == ["[Step 1] Re-verified"]
+
 
