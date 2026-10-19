@@ -4,7 +4,7 @@ import hashlib
 import re
 from typing import Any, Optional
 from config.vendor_profiles import find_vendor_profile
-from config.whitelist_domains import extract_domain, get_domain_priority, is_whitelisted_domain
+from config.whitelist_domains import get_domain_priority, is_whitelisted_domain
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
 from src.adapters.search.kaspi_client import KaspiSearchClient
 from src.adapters.search.serper_client import SerperClient

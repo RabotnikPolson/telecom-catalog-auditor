@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS products (
     vendor_name TEXT,
     vendor_sku TEXT,
     manufacturer_sku TEXT,
+    description TEXT,
+    images_count INTEGER NOT NULL DEFAULT 0,
     current_specs TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     parent_sku TEXT,
@@ -60,6 +62,11 @@ CREATE TABLE IF NOT EXISTS audit_results (
     missing_specs_json TEXT,
     matched_specs_count INTEGER NOT NULL,
     total_specs_count INTEGER NOT NULL,
+    images_count INTEGER NOT NULL DEFAULT 0,
+    reference_images_count INTEGER NOT NULL DEFAULT 0,
+    images_status TEXT NOT NULL DEFAULT 'OK',
+    description_discrepancies_json TEXT,
+    description_quality TEXT NOT NULL DEFAULT 'GOOD',
     audited_at TEXT NOT NULL,
     details TEXT,
     execution_time_sec REAL DEFAULT 0.0,
@@ -109,16 +116,35 @@ def init_db(db_path: Union[str, Path]) -> None:
             col_cursor = conn.execute("PRAGMA table_info(products);")
             columns = [row["name"] for row in col_cursor.fetchall()]
             if "barcode" not in columns:
-                conn.execute("ALTER TABLE products ADD COLUMN barcode TEXT;")
+                try:
+                    conn.execute("ALTER TABLE products ADD COLUMN barcode TEXT;")
+                except Exception:
+                    pass
             if "shop_sku" not in columns:
-                conn.execute("ALTER TABLE products ADD COLUMN shop_sku TEXT;")
+                try:
+                    conn.execute("ALTER TABLE products ADD COLUMN shop_sku TEXT;")
+                except Exception:
+                    pass
+            if "description" not in columns:
+                try:
+                    conn.execute("ALTER TABLE products ADD COLUMN description TEXT;")
+                except Exception:
+                    pass
+            if "images_count" not in columns:
+                try:
+                    conn.execute("ALTER TABLE products ADD COLUMN images_count INTEGER NOT NULL DEFAULT 0;")
+                except Exception:
+                    pass
 
         # Migrate specs_cache table if missing expires_at and backfill
         specs_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='specs_cache';")
         if specs_cursor.fetchone():
             s_cols = [row["name"] for row in conn.execute("PRAGMA table_info(specs_cache);").fetchall()]
             if "expires_at" not in s_cols:
-                conn.execute("ALTER TABLE specs_cache ADD COLUMN expires_at TEXT;")
+                try:
+                    conn.execute("ALTER TABLE specs_cache ADD COLUMN expires_at TEXT;")
+                except Exception:
+                    pass
             conn.execute("UPDATE specs_cache SET expires_at = datetime(fetched_at, '+30 days') WHERE expires_at IS NULL;")
 
         # Backfill url_cache if expires_at is NULL
@@ -126,24 +152,70 @@ def init_db(db_path: Union[str, Path]) -> None:
         if url_cursor.fetchone():
             conn.execute("UPDATE url_cache SET expires_at = datetime(created_at, '+30 days') WHERE expires_at IS NULL;")
 
-        # Migrate audit_results table if missing metrics columns and deduplicate
+        # Migrate audit_results table if missing metrics/photos/description columns and deduplicate
         audit_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit_results';")
         if audit_cursor.fetchone():
             a_cols = [row["name"] for row in conn.execute("PRAGMA table_info(audit_results);").fetchall()]
             if "execution_time_sec" not in a_cols:
-                conn.execute("ALTER TABLE audit_results ADD COLUMN execution_time_sec REAL DEFAULT 0.0;")
+                try:
+                    conn.execute("ALTER TABLE audit_results ADD COLUMN execution_time_sec REAL DEFAULT 0.0;")
+                except Exception:
+                    pass
             if "crawler_time_sec" not in a_cols:
-                conn.execute("ALTER TABLE audit_results ADD COLUMN crawler_time_sec REAL DEFAULT 0.0;")
+                try:
+                    conn.execute("ALTER TABLE audit_results ADD COLUMN crawler_time_sec REAL DEFAULT 0.0;")
+                except Exception:
+                    pass
             if "llm_time_sec" not in a_cols:
-                conn.execute("ALTER TABLE audit_results ADD COLUMN llm_time_sec REAL DEFAULT 0.0;")
+                try:
+                    conn.execute("ALTER TABLE audit_results ADD COLUMN llm_time_sec REAL DEFAULT 0.0;")
+                except Exception:
+                    pass
             if "input_tokens" not in a_cols:
-                conn.execute("ALTER TABLE audit_results ADD COLUMN input_tokens INTEGER DEFAULT 0;")
+                try:
+                    conn.execute("ALTER TABLE audit_results ADD COLUMN input_tokens INTEGER DEFAULT 0;")
+                except Exception:
+                    pass
             if "output_tokens" not in a_cols:
-                conn.execute("ALTER TABLE audit_results ADD COLUMN output_tokens INTEGER DEFAULT 0;")
+                try:
+                    conn.execute("ALTER TABLE audit_results ADD COLUMN output_tokens INTEGER DEFAULT 0;")
+                except Exception:
+                    pass
             if "estimated_cost_usd" not in a_cols:
-                conn.execute("ALTER TABLE audit_results ADD COLUMN estimated_cost_usd REAL DEFAULT 0.0;")
+                try:
+                    conn.execute("ALTER TABLE audit_results ADD COLUMN estimated_cost_usd REAL DEFAULT 0.0;")
+                except Exception:
+                    pass
             if "search_trace_json" not in a_cols:
-                conn.execute("ALTER TABLE audit_results ADD COLUMN search_trace_json TEXT;")
+                try:
+                    conn.execute("ALTER TABLE audit_results ADD COLUMN search_trace_json TEXT;")
+                except Exception:
+                    pass
+            if "images_count" not in a_cols:
+                try:
+                    conn.execute("ALTER TABLE audit_results ADD COLUMN images_count INTEGER NOT NULL DEFAULT 0;")
+                except Exception:
+                    pass
+            if "reference_images_count" not in a_cols:
+                try:
+                    conn.execute("ALTER TABLE audit_results ADD COLUMN reference_images_count INTEGER NOT NULL DEFAULT 0;")
+                except Exception:
+                    pass
+            if "images_status" not in a_cols:
+                try:
+                    conn.execute("ALTER TABLE audit_results ADD COLUMN images_status TEXT NOT NULL DEFAULT 'OK';")
+                except Exception:
+                    pass
+            if "description_discrepancies_json" not in a_cols:
+                try:
+                    conn.execute("ALTER TABLE audit_results ADD COLUMN description_discrepancies_json TEXT;")
+                except Exception:
+                    pass
+            if "description_quality" not in a_cols:
+                try:
+                    conn.execute("ALTER TABLE audit_results ADD COLUMN description_quality TEXT NOT NULL DEFAULT 'GOOD';")
+                except Exception:
+                    pass
 
             # Deduplicate existing records: keep latest MAX(audit_id) per product_id
             conn.execute("""

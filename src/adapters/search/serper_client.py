@@ -134,7 +134,6 @@ class SerperClient:
             return []
 
         whitelisted: list[dict[str, Any]] = []
-        organic_clean: list[dict[str, Any]] = []
 
         for item in organic_results:
             link = str(item.get("link") or "").strip()

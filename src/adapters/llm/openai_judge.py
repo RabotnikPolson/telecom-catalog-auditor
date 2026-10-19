@@ -76,6 +76,9 @@ class LLMJudgeOutput(BaseModel):
     total_specs_count: int = Field(default=0)
     discrepancies: list[LLMDiscrepancy] = Field(default_factory=list)
     missing_specs: list[LLMMissingSpec] = Field(default_factory=list)
+    description_conflicts: list[Any] = Field(default_factory=list)
+    description_phantom_features: list[Any] = Field(default_factory=list)
+    description_quality: str = Field(default="GOOD")
     details: str = Field(default="")
 
 
@@ -351,6 +354,7 @@ class OpenAIJudge:
         product: Product,
         reference_url: str,
         external_markdown: str,
+        skip_desc: bool = False,
     ) -> AuditResult:
         """
         Compares store product specifications against reference markdown using gpt-6-luna.
@@ -366,8 +370,10 @@ class OpenAIJudge:
                 matched_specs_count=0,
                 total_specs_count=len(product.current_specs),
                 details="OPENAI_API_KEY is not configured",
+                images_count=product.images_count,
             )
 
+        desc_to_audit = None if skip_desc else product.description
         user_prompt = build_audit_user_prompt(
             product_title=product.title,
             shop_sku=product.shop_sku,
@@ -376,6 +382,7 @@ class OpenAIJudge:
             current_specs=product.current_specs,
             reference_url=reference_url,
             external_markdown=external_markdown,
+            description=desc_to_audit,
         )
 
         payload = {
@@ -568,6 +575,14 @@ class OpenAIJudge:
                 for m in output.missing_specs
             ]
 
+            from .description_evaluator import parse_description_audit
+            desc_discrepancies, desc_quality = parse_description_audit(
+                raw_conflicts=output.description_conflicts,
+                raw_phantom=output.description_phantom_features,
+                raw_quality=output.description_quality,
+                original_description=desc_to_audit,
+            )
+
             return AuditResult(
                 product_id=product.product_id,
                 status=audit_status,
@@ -583,6 +598,11 @@ class OpenAIJudge:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 estimated_cost_usd=round(cost_usd, 6),
+                images_count=product.images_count,
+                reference_images_count=0,
+                images_status="OK",
+                description_discrepancies=desc_discrepancies,
+                description_quality=desc_quality,
             )
         except Exception as e:
             return AuditResult(
@@ -591,9 +611,11 @@ class OpenAIJudge:
                 confidence_score=0.0,
                 reference_url=reference_url,
                 discrepancies=[],
+                missing_specs=[],
                 matched_specs_count=0,
                 total_specs_count=len(product.current_specs),
                 details=f"LLM Judge error: {e}",
+                images_count=product.images_count,
             )
 
 

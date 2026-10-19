@@ -12,6 +12,7 @@ class CrawlResult:
     status_code: int = 200
     success: bool = True
     error: str | None = None
+    images_count: int = 0
 
 
 class WebCrawler:
@@ -147,11 +148,11 @@ class WebCrawler:
                 )
                 status_code = response.status if response else 200
 
-                # Fast selector wait: wait for content/specs rather than hanging 3s on networkidle
+                # Fast selector wait: wait for content/specs or gallery rather than hanging 3s on networkidle
                 try:
                     await page.wait_for_selector(
-                        "table, dl, .specifications, [itemprop='description'], h1",
-                        timeout=2000,
+                        "table, dl, .specifications, .item__slider-slide, .item__slider-thumb, .gallery, [data-gallery]",
+                        timeout=1800,
                     )
                 except Exception:
                     pass
@@ -280,15 +281,38 @@ class WebCrawler:
                             lines.push(cleanedBody.substring(0, 5000));
                         }
 
+                        let imagesCount = 0;
+                        const kaspiSlides = document.querySelectorAll('.item__slider-slide, .gallery__slider-item');
+                        if (kaspiSlides.length > 0) {
+                            imagesCount = kaspiSlides.length;
+                        } else {
+                            const kaspiThumbs = document.querySelectorAll('.item__slider-thumb, .gallery__thumb');
+                            if (kaspiThumbs.length > 0) {
+                                imagesCount = kaspiThumbs.length;
+                            } else {
+                                const galleryItems = document.querySelectorAll(
+                                    '.product-images-slider__item, .product-card__gallery img, .swiper-slide img, [data-gallery] img, .gallery img, .product-gallery img, .fotorama img'
+                                );
+                                if (galleryItems.length > 0) {
+                                    imagesCount = galleryItems.length;
+                                } else {
+                                    const prodImgs = document.querySelectorAll('img[itemprop="image"], .main-image img, #main-image, img[src*="cdn-kaspi.kz/img/m/p/"]');
+                                    imagesCount = prodImgs.length > 0 ? prodImgs.length : (document.querySelectorAll('img').length > 0 ? 1 : 0);
+                                }
+                            }
+                        }
+
                         return {
                             title: title,
-                            markdown: lines.join('\\n').trim()
+                            markdown: lines.join('\\n').trim(),
+                            imagesCount: imagesCount
                         };
                     }"""
                 )
 
                 title = extracted.get("title", "")
                 markdown = extracted.get("markdown", "")
+                ref_images_cnt = int(extracted.get("imagesCount", 0))
 
                 md_lower = markdown.lower()
                 is_cf = (
@@ -307,6 +331,7 @@ class WebCrawler:
                         status_code=403,
                         success=False,
                         error="Cloudflare anti-bot verification challenge page",
+                        images_count=ref_images_cnt,
                     )
 
                 is_error_page = (
@@ -323,6 +348,7 @@ class WebCrawler:
                         status_code=status_code,
                         success=False,
                         error=f"HTTP {status_code} Page Not Found" if status_code >= 400 else "Content indicates Page Not Found",
+                        images_count=ref_images_cnt,
                     )
 
                 return CrawlResult(
@@ -332,6 +358,7 @@ class WebCrawler:
                     status_code=status_code,
                     success=True,
                     error=None,
+                    images_count=ref_images_cnt,
                 )
             except Exception as e:
                 return CrawlResult(

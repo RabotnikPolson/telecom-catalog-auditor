@@ -24,7 +24,7 @@ from src.adapters.catalog.mysql_reader import MySQLCatalogReader
 from src.adapters.catalog.telecom_crawler import TelecomShopCrawler
 from src.adapters.crawler.web_crawler import WebCrawler
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
-from src.adapters.llm.openai_judge import OpenAIJudge, GeminiJudge
+from src.adapters.llm.openai_judge import OpenAIJudge
 from src.adapters.search.serper_client import SerperClient
 from src.adapters.search.vendor_direct import VendorDirectResolver
 from src.domain.entities import AuditResult, AuditStatus, Product
@@ -238,7 +238,6 @@ async def _live_sync_products(
                             product_id=details.product_id,
                             shop_sku=details.shop_sku,
                             title=details.title,
-                            url=details.detail_url,
                             vendor_name=details.vendor_name,
                             vendor_sku=details.vendor_sku,
                             manufacturer_sku=details.manufacturer_sku,
@@ -418,7 +417,6 @@ async def run_live_test_command(args: argparse.Namespace) -> int:
                     product_id=details.product_id,
                     shop_sku=details.shop_sku,
                     title=details.title,
-                    url=details.detail_url,
                     vendor_name=details.vendor_name,
                     vendor_sku=details.vendor_sku,
                     manufacturer_sku=details.manufacturer_sku,
@@ -534,6 +532,11 @@ def format_audit_card(idx: int, total_count: int, prod: Product, result: AuditRe
     lines.append(f"\\[{idx:02d}/{total_count}] Product ID #{prod.product_id} | {escape(prod.title[:150])}")
     lines.append(f"      Shop SKU: {escape(prod.shop_sku or 'N/A')} | Vendor SKU: {escape(prod.vendor_sku or 'N/A')} | Barcode: {escape(prod.barcode or 'N/A')}")
     lines.append(f"      Shop URL: https://shop.telecom.kz/product/{prod.product_id}")
+    photo_badge = f"[bold green]\\[{result.images_status}][/bold green]" if result.images_status == "OK" else (
+        f"[bold red]\\[{result.images_status}][/bold red]" if result.images_status == "NO_IMAGES" else f"[bold yellow]\\[{result.images_status}][/bold yellow]"
+    )
+    ref_photo_str = f"/{result.reference_images_count}" if result.reference_images_count else ""
+    lines.append(f"      Photos: {result.images_count}{ref_photo_str} {photo_badge} | Description: {result.description_quality}")
 
     if result.status == AuditStatus.VERIFIED:
         lines.append(f"      STATUS: [bold green]\\[VERIFIED][/bold green] (Confidence: {result.confidence_score:.2f} | Matched: {result.matched_specs_count}/{result.total_specs_count})")
@@ -571,6 +574,12 @@ def format_audit_card(idx: int, total_count: int, prod: Product, result: AuditRe
         lines.append("      * MISSING SPECS (В эталоне найдены важные ТХ, отсутствующие на витрине):")
         for m in result.missing_specs:
             lines.append(f"        + {escape(m.spec_name)}: {escape(m.reference_value)}")
+
+    if result.description_discrepancies:
+        lines.append("      * DESCRIPTION DISCREPANCIES (Ошибки в описании товара):")
+        for dd in result.description_discrepancies:
+            lines.append(f"        - Описание: \"{escape(dd.claim_in_description)}\"")
+            lines.append(f"          Фактически: \"{escape(dd.factual_truth)}\" \\[{escape(dd.contradiction_type)}]")
 
     if result.execution_time_sec or result.input_tokens:
         total_tok = result.input_tokens + result.output_tokens
@@ -690,7 +699,7 @@ async def run_audit_command(args: argparse.Namespace) -> int:
                         break
 
         if not products:
-            print(f"[*] No un-audited master products found (all audited or none match filter).")
+            print("[*] No un-audited master products found (all audited or none match filter).")
             return 0
 
     settings = get_settings()
@@ -768,7 +777,7 @@ async def run_audit_command(args: argparse.Namespace) -> int:
                 except asyncio.QueueEmpty:
                     break
 
-                tui.set_worker_status(worker_id, f"Auditing #{prod.product_id} | {prod.title[:45]}...")
+                tui.set_worker_status(worker_id, f"Auditing #{prod.product_id} | {prod.title[:150]}...")
                 if live_ctx:
                     live_ctx.update(tui.render_live_panel())
 
@@ -777,6 +786,9 @@ async def run_audit_command(args: argparse.Namespace) -> int:
                         product=prod,
                         reference_url=args.reference_url if len(products) == 1 else None,
                         force_refresh=args.force_refresh,
+                        skip_desc=getattr(args, "skip_desc", False),
+                        skip_tech=getattr(args, "skip_tech", False),
+                        photos_only=getattr(args, "photos_only", False),
                     )
                 except Exception as exc:
                     result = AuditResult(
@@ -843,7 +855,7 @@ async def run_audit_command(args: argparse.Namespace) -> int:
         print("-" * 80)
         print(f"AUDIT SUMMARY: Total: {len(products)} | Verified: {tui.verified_count} | Mismatches: {tui.mismatch_count} | Missing Specs: {tui.missing_specs_count} | Not Found: {tui.not_found_count} | Errors: {tui.error_count}")
         if len(products) > 1 and total_tokens_all > 0:
-            print(f"BATCH METRICS: Wall Time: {wall_time:.2f}s | Total Time: {total_time_all:.2f}s | Total Tokens: {total_tokens_all:,} | Total Est. Cost: ~${total_cost_all:.5f}")
+            print(f"BATCH METRICS: Wall Time: {wall_time:.2f}s | Total Time: {total_time_all:.2f}s | Speedup: {speedup:.1f}x | Total Tokens: {total_tokens_all:,} | Total Est. Cost: ~${total_cost_all:.5f}")
         print("=" * 80)
         return 0
     finally:
@@ -1098,6 +1110,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--force-refresh",
         action="store_true",
         help="Bypass specs_cache and refetch external page",
+    )
+    audit_parser.add_argument(
+        "--skip-desc",
+        action="store_true",
+        help="Skip description audit (audit specs & photos only)",
+    )
+    audit_parser.add_argument(
+        "--skip-tech",
+        action="store_true",
+        help="Skip specs arbitration (audit photos & description only)",
+    )
+    audit_parser.add_argument(
+        "--photos-only",
+        action="store_true",
+        help="Fast offline check of product photos without web search or LLM",
     )
     audit_parser.add_argument(
         "--source",

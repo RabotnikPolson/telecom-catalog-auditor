@@ -148,6 +148,7 @@ class MySQLCatalogReader:
                         p.base_id as shop_sku,
                         p.barcode,
                         p.name as title,
+                        p.description as description,
                         b.name as brand_name
                     FROM products p
                     LEFT JOIN brand b ON p.brand_id = b.id
@@ -162,6 +163,7 @@ class MySQLCatalogReader:
                 pid = row["product_id"]
                 specs = await self._fetch_specs_for_ids(cur, [pid])
                 partners = await self._fetch_partners_for_ids(cur, [pid])
+                img_counts = await self._fetch_images_for_ids(cur, [pid])
 
                 partner_info = partners.get(pid, {})
                 title = (row["title"] or "").strip() or f"Product #{pid}"
@@ -178,6 +180,8 @@ class MySQLCatalogReader:
                     vendor_name=vendor_name,
                     vendor_sku=partner_info.get("vendor_sku"),
                     manufacturer_sku=None,
+                    description=row.get("description"),
+                    images_count=img_counts.get(pid, 0),
                     current_specs=specs.get(pid, {}),
                     status=AuditStatus.PENDING,
                 )
@@ -256,6 +260,28 @@ class MySQLCatalogReader:
                     "vendor_sku": v_sku,
                 }
 
+        return result
+
+    async def _fetch_images_for_ids(
+        self, cur: aiomysql.Cursor, product_ids: list[int]
+    ) -> dict[int, int]:
+        """Batch fetch images count from images table for given product IDs."""
+        if not product_ids:
+            return {}
+
+        format_strings = ",".join(["%s"] * len(product_ids))
+        query = f"""
+            SELECT product_id, COUNT(*) as img_cnt
+            FROM images
+            WHERE product_id IN ({format_strings})
+            GROUP BY product_id;
+        """
+        await cur.execute(query, tuple(product_ids))
+        rows = await cur.fetchall()
+
+        result: dict[int, int] = {}
+        for r in rows:
+            result[int(r["product_id"])] = int(r["img_cnt"])
         return result
 
     async def count_products(
@@ -416,6 +442,7 @@ class MySQLCatalogReader:
                             p.base_id as shop_sku,
                             p.barcode,
                             p.name as title,
+                            p.description as description,
                             b.name as brand_name
                         FROM products p
                         LEFT JOIN brand b ON p.brand_id = b.id
@@ -433,6 +460,7 @@ class MySQLCatalogReader:
                     pids = [r["product_id"] for r in rows]
                     specs = await self._fetch_specs_for_ids(cur, pids)
                     partners = await self._fetch_partners_for_ids(cur, pids)
+                    img_counts = await self._fetch_images_for_ids(cur, pids)
 
                     batch_products: list[Product] = []
                     for r in rows:
@@ -452,6 +480,8 @@ class MySQLCatalogReader:
                             vendor_name=vendor_name,
                             vendor_sku=partner_info.get("vendor_sku"),
                             manufacturer_sku=None,
+                            description=r.get("description"),
+                            images_count=img_counts.get(pid, 0),
                             current_specs=specs.get(pid, {}),
                             status=AuditStatus.PENDING,
                         )

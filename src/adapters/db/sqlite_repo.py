@@ -3,7 +3,14 @@ import json
 from pathlib import Path
 import sqlite3
 from typing import Sequence, Union
-from src.domain.entities import AuditResult, AuditStatus, DiscrepancyItem, MissingSpecItem, Product
+from src.domain.entities import (
+    AuditResult,
+    AuditStatus,
+    DescriptionDiscrepancyItem,
+    DiscrepancyItem,
+    MissingSpecItem,
+    Product,
+)
 from .schema import get_sqlite_connection, init_db
 
 DEFAULT_CACHE_TTL_DAYS: int = 14
@@ -37,6 +44,8 @@ class SQLiteProductRepository:
         )
         barcode = row["barcode"] if "barcode" in row.keys() else None
         shop_sku = row["shop_sku"] if "shop_sku" in row.keys() else None
+        description = row["description"] if "description" in row.keys() else None
+        images_count = int(row["images_count"]) if "images_count" in row.keys() and row["images_count"] is not None else 0
 
         return Product(
             product_id=row["product_id"],
@@ -46,6 +55,8 @@ class SQLiteProductRepository:
             vendor_name=row["vendor_name"],
             vendor_sku=row["vendor_sku"],
             manufacturer_sku=row["manufacturer_sku"],
+            description=description,
+            images_count=images_count,
             current_specs=specs_dict,
             content_hash=row["content_hash"],
             parent_sku=row["parent_sku"],
@@ -60,10 +71,12 @@ class SQLiteProductRepository:
         sql = """
         INSERT INTO products (
             product_id, shop_sku, title, barcode, vendor_name, vendor_sku, manufacturer_sku,
+            description, images_count,
             current_specs, content_hash, parent_sku, master_key, is_master,
             status, created_at, updated_at
         ) VALUES (
             :product_id, :shop_sku, :title, :barcode, :vendor_name, :vendor_sku, :manufacturer_sku,
+            :description, :images_count,
             :current_specs, :content_hash, :parent_sku, :master_key, :is_master,
             :status, :created_at, :updated_at
         )
@@ -74,6 +87,8 @@ class SQLiteProductRepository:
             vendor_name = excluded.vendor_name,
             vendor_sku = excluded.vendor_sku,
             manufacturer_sku = excluded.manufacturer_sku,
+            description = excluded.description,
+            images_count = excluded.images_count,
             current_specs = excluded.current_specs,
             content_hash = excluded.content_hash,
             parent_sku = excluded.parent_sku,
@@ -93,6 +108,8 @@ class SQLiteProductRepository:
             "vendor_name": product.vendor_name,
             "vendor_sku": product.vendor_sku,
             "manufacturer_sku": product.manufacturer_sku,
+            "description": product.description,
+            "images_count": product.images_count,
             "current_specs": json.dumps(product.current_specs, ensure_ascii=False),
             "content_hash": product.content_hash or product.recalculate_content_hash(),
             "parent_sku": product.parent_sku,
@@ -116,10 +133,12 @@ class SQLiteProductRepository:
         sql = """
         INSERT INTO products (
             product_id, shop_sku, title, barcode, vendor_name, vendor_sku, manufacturer_sku,
+            description, images_count,
             current_specs, content_hash, parent_sku, master_key, is_master,
             status, created_at, updated_at
         ) VALUES (
             :product_id, :shop_sku, :title, :barcode, :vendor_name, :vendor_sku, :manufacturer_sku,
+            :description, :images_count,
             :current_specs, :content_hash, :parent_sku, :master_key, :is_master,
             :status, :created_at, :updated_at
         )
@@ -130,6 +149,8 @@ class SQLiteProductRepository:
             vendor_name = excluded.vendor_name,
             vendor_sku = excluded.vendor_sku,
             manufacturer_sku = excluded.manufacturer_sku,
+            description = excluded.description,
+            images_count = excluded.images_count,
             current_specs = excluded.current_specs,
             content_hash = excluded.content_hash,
             parent_sku = excluded.parent_sku,
@@ -151,6 +172,8 @@ class SQLiteProductRepository:
                 "vendor_name": p.vendor_name,
                 "vendor_sku": p.vendor_sku,
                 "manufacturer_sku": p.manufacturer_sku,
+                "description": p.description,
+                "images_count": p.images_count,
                 "current_specs": json.dumps(p.current_specs, ensure_ascii=False),
                 "content_hash": p.content_hash or p.recalculate_content_hash(),
                 "parent_sku": p.parent_sku,
@@ -498,6 +521,15 @@ class SQLiteProductRepository:
             else datetime.now(timezone.utc)
         )
         keys = row.keys()
+        images_count = int(row["images_count"]) if "images_count" in keys and row["images_count"] is not None else 0
+        ref_images_count = int(row["reference_images_count"]) if "reference_images_count" in keys and row["reference_images_count"] is not None else 0
+        images_status = str(row["images_status"]) if "images_status" in keys and row["images_status"] else "OK"
+        desc_disc_raw = row["description_discrepancies_json"] if "description_discrepancies_json" in keys else None
+        description_discrepancies = [
+            DescriptionDiscrepancyItem(**item) for item in json.loads(desc_disc_raw)
+        ] if desc_disc_raw else []
+        description_quality = str(row["description_quality"]) if "description_quality" in keys and row["description_quality"] else "GOOD"
+
         trace_raw = row["search_trace_json"] if "search_trace_json" in keys else None
         search_trace = [str(x) for x in json.loads(trace_raw)] if trace_raw else []
         return AuditResult(
@@ -518,6 +550,11 @@ class SQLiteProductRepository:
             input_tokens=row["input_tokens"] if "input_tokens" in keys and row["input_tokens"] is not None else 0,
             output_tokens=row["output_tokens"] if "output_tokens" in keys and row["output_tokens"] is not None else 0,
             estimated_cost_usd=row["estimated_cost_usd"] if "estimated_cost_usd" in keys and row["estimated_cost_usd"] is not None else 0.0,
+            images_count=images_count,
+            reference_images_count=ref_images_count,
+            images_status=images_status,
+            description_discrepancies=description_discrepancies,
+            description_quality=description_quality,
         )
 
     def save_audit_result(self, result: AuditResult) -> int:
@@ -525,9 +562,11 @@ class SQLiteProductRepository:
         INSERT INTO audit_results (
             product_id, status, confidence_score, reference_url,
             discrepancies_json, missing_specs_json, matched_specs_count, total_specs_count,
+            images_count, reference_images_count, images_status,
+            description_discrepancies_json, description_quality,
             audited_at, details, execution_time_sec, crawler_time_sec, llm_time_sec,
             input_tokens, output_tokens, estimated_cost_usd, search_trace_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(product_id) DO UPDATE SET
             status = excluded.status,
             confidence_score = excluded.confidence_score,
@@ -536,6 +575,11 @@ class SQLiteProductRepository:
             missing_specs_json = excluded.missing_specs_json,
             matched_specs_count = excluded.matched_specs_count,
             total_specs_count = excluded.total_specs_count,
+            images_count = excluded.images_count,
+            reference_images_count = excluded.reference_images_count,
+            images_status = excluded.images_status,
+            description_discrepancies_json = excluded.description_discrepancies_json,
+            description_quality = excluded.description_quality,
             audited_at = excluded.audited_at,
             details = excluded.details,
             execution_time_sec = excluded.execution_time_sec,
@@ -554,6 +598,10 @@ class SQLiteProductRepository:
             [m.model_dump() for m in result.missing_specs],
             ensure_ascii=False
         )
+        desc_disc_json = json.dumps(
+            [d.model_dump() for d in result.description_discrepancies],
+            ensure_ascii=False
+        ) if result.description_discrepancies else None
         trace_json = json.dumps(result.search_trace, ensure_ascii=False) if result.search_trace else None
         now_iso = result.audited_at.isoformat()
         with get_sqlite_connection(self.db_path) as conn:
@@ -568,6 +616,11 @@ class SQLiteProductRepository:
                     missing_json,
                     result.matched_specs_count,
                     result.total_specs_count,
+                    result.images_count,
+                    result.reference_images_count,
+                    result.images_status,
+                    desc_disc_json,
+                    result.description_quality,
                     now_iso,
                     result.details,
                     result.execution_time_sec,

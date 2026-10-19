@@ -86,7 +86,14 @@ RULES:
      * "Несовпадение аппаратной ревизии/модели: эталон описывает модификацию <Ref Model>, тогда как на витрине заявлена <Store Model>."
      * "Эталонная страница не найдена или описывает другое устройство."
 
-6. OUTPUT JSON FORMAT (STRICT):
+7. DESCRIPTION FACTUAL AUDIT (WHEN STORE DESCRIPTION IS PROVIDED):
+   If "SHOP PRODUCT DESCRIPTION" is present in user prompt:
+   - Check if any factual claims in the store description directly contradict the verified specs or reference reality (e.g. text says "battery 5000 mAh" or "PoE on 24 ports", but specs/reference show "4000 mAh" or "no PoE"). Put into "description_conflicts" with "claim_in_description" (verbatim quote from description) and "factual_truth".
+   - Check if the description claims non-existent phantom features the device physically lacks (e.g. claiming Wi-Fi 6 or 4K or NFC for a device that does not have it). Put into "description_phantom_features" with "claim_in_description" and "factual_truth".
+   - Evaluate text quality in "description_quality": "RICH_MARKETING" (good readable overview), "SPEC_DUMP" (raw list/table of specs pasted as text), "POOR" (too brief / uninformative), or "GOOD".
+   - If description has no errors or is absent, "description_conflicts" and "description_phantom_features" MUST be empty arrays [].
+
+OUTPUT JSON FORMAT (STRICT):
 Output a single valid JSON object strictly matching this schema:
 {
   "status": "VERIFIED" | "MISMATCH" | "MISSING_SPECS" | "NOT_FOUND",
@@ -110,6 +117,19 @@ Output a single valid JSON object strictly matching this schema:
       "proof_quote": "exact quote from reference"
     }
   ],
+  "description_conflicts": [
+    {
+      "claim_in_description": "verbatim quote from description text",
+      "factual_truth": "actual factual capability or spec"
+    }
+  ],
+  "description_phantom_features": [
+    {
+      "claim_in_description": "verbatim quote from description text",
+      "factual_truth": "proof why device does not have this feature"
+    }
+  ],
+  "description_quality": "RICH_MARKETING" | "SPEC_DUMP" | "POOR" | "GOOD",
   "details": "1-sentence summary in Russian"
 }
 CRITICAL RULES:
@@ -127,9 +147,15 @@ def build_audit_user_prompt(
     current_specs: dict[str, str],
     reference_url: str,
     external_markdown: str,
+    description: str | None = None,
 ) -> str:
     specs_formatted = json.dumps(current_specs, ensure_ascii=False, indent=2)
     truncated_markdown = external_markdown[:25000]
+
+    desc_section = ""
+    if description:
+        from .description_evaluator import build_description_prompt_section
+        desc_section = build_description_prompt_section(description)
 
     return f"""### STORE PRODUCT TO AUDIT:
 - Title: {product_title}
@@ -142,7 +168,7 @@ def build_audit_user_prompt(
 {specs_formatted}
 ```
 
-### EXTERNAL REFERENCE PAGE:
+{desc_section}### EXTERNAL REFERENCE PAGE:
 - URL: {reference_url}
 - Content:
 ```markdown

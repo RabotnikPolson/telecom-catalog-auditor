@@ -45,6 +45,15 @@ class MissingSpecItem(BaseModel):
     source_url: str = Field(...)
 
 
+class DescriptionDiscrepancyItem(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    claim_in_description: str = Field(...)
+    factual_truth: str = Field(...)
+    contradiction_type: str = Field(default="CONFLICT_WITH_SPECS")
+    severity: str = Field(default="critical")
+
+
 class AuditResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -67,6 +76,11 @@ class AuditResult(BaseModel):
     input_tokens: int = Field(default=0)
     output_tokens: int = Field(default=0)
     estimated_cost_usd: float = Field(default=0.0)
+    images_count: int = Field(default=0, ge=0)
+    reference_images_count: int = Field(default=0, ge=0)
+    images_status: str = Field(default="OK")
+    description_discrepancies: list[DescriptionDiscrepancyItem] = Field(default_factory=list)
+    description_quality: str = Field(default="GOOD")
 
 
 class Product(BaseModel):
@@ -79,6 +93,8 @@ class Product(BaseModel):
     vendor_name: str | None = Field(default=None)
     vendor_sku: str | None = Field(default=None)
     manufacturer_sku: str | None = Field(default=None)
+    description: str | None = Field(default=None)
+    images_count: int = Field(default=0, ge=0)
     current_specs: dict[str, str] = Field(default_factory=dict)
     content_hash: str = Field(default="")
     parent_sku: str | None = Field(default=None)
