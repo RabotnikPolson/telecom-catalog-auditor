@@ -1,7 +1,9 @@
 import asyncio
 import logging
-from typing import Any, Optional
+from typing import Any
+
 import httpx
+
 from config.settings import get_settings
 from config.whitelist_domains import is_whitelisted_domain
 
@@ -32,10 +34,10 @@ class SerperClient:
 
     def __init__(
         self,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         timeout: float = 15.0,
         max_concurrency: int = 15,
-        client: Optional[httpx.AsyncClient] = None,
+        client: httpx.AsyncClient | None = None,
     ) -> None:
         if api_key is not None:
             self.api_key = api_key.strip()
@@ -45,7 +47,7 @@ class SerperClient:
         self.timeout = timeout
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._external_client = client
-        self._client: Optional[httpx.AsyncClient] = client
+        self._client: httpx.AsyncClient | None = client
 
     def _create_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -126,7 +128,7 @@ class SerperClient:
     async def search_and_filter(
         self,
         query: str,
-        whitelist_domains: Optional[list[str]] = None,
+        whitelist_domains: list[str] | None = None,
         num_results: int = 10,
     ) -> list[dict[str, Any]]:
         organic_results = await self.search(query, num_results=num_results)

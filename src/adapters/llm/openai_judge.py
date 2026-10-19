@@ -4,13 +4,21 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
+
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from config.settings import get_settings
-from src.domain.entities import AuditResult, AuditStatus, DiscrepancyItem, MissingSpecItem, Product
+from src.domain.entities import (
+    AuditResult,
+    AuditStatus,
+    DiscrepancyItem,
+    MissingSpecItem,
+    Product,
+)
+
 from .prompts import AUDIT_SYSTEM_PROMPT, build_audit_user_prompt
 
 logger = logging.getLogger(__name__)
@@ -592,7 +600,7 @@ class OpenAIJudge:
                 missing_specs=missing_items,
                 matched_specs_count=output.matched_specs_count,
                 total_specs_count=output.total_specs_count or len(product.current_specs),
-                audited_at=datetime.now(timezone.utc),
+                audited_at=datetime.now(UTC),
                 details=output.details,
                 llm_time_sec=round(llm_time_sec, 2),
                 input_tokens=input_tokens,

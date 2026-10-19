@@ -1,8 +1,8 @@
 import asyncio
-from datetime import datetime, timezone
 import json
 import time
-from typing import Sequence
+from collections.abc import Sequence
+from datetime import UTC, datetime
 
 from src.adapters.crawler.web_crawler import WebCrawler
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
@@ -81,7 +81,7 @@ class AuditProductUseCase:
                 missing_specs=[],
                 matched_specs_count=len(product.current_specs),
                 total_specs_count=len(product.current_specs),
-                audited_at=datetime.now(timezone.utc),
+                audited_at=datetime.now(UTC),
                 details=f"Photos-only audit: {product.images_count} photos on store ({img_status})",
                 images_count=product.images_count,
                 reference_images_count=0,
@@ -122,7 +122,7 @@ class AuditProductUseCase:
                     discrepancies=[],
                     matched_specs_count=0,
                     total_specs_count=len(product.current_specs),
-                    audited_at=datetime.now(timezone.utc),
+                    audited_at=datetime.now(UTC),
                     details="Reference URL could not be resolved from suppliers or search",
                     search_trace=search_trace,
                     execution_time_sec=round(time.perf_counter() - t_audit_start, 2),
@@ -273,7 +273,7 @@ class AuditProductUseCase:
             discrepancies=[],
             matched_specs_count=0,
             total_specs_count=len(product.current_specs),
-            audited_at=datetime.now(timezone.utc),
+            audited_at=datetime.now(UTC),
             details=f"Crawler error: {crawl_error or 'No candidates accessible'}",
             search_trace=search_trace,
             crawler_time_sec=round(crawler_time_sec, 2),

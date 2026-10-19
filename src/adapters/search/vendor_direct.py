@@ -1,15 +1,16 @@
-from dataclasses import dataclass
 import re
-from typing import Optional
+from dataclasses import dataclass
+
 import httpx
+
 from config.vendor_profiles import find_vendor_profile
 
 
 @dataclass
 class VendorResolutionResult:
     is_available: bool
-    reference_url: Optional[str]
-    kaspi_code: Optional[str] = None
+    reference_url: str | None
+    kaspi_code: str | None = None
 
 
 class VendorDirectResolver:
@@ -19,8 +20,8 @@ class VendorDirectResolver:
         self._last_checked_response: tuple[str, httpx.Response] | None = None
 
     def build_direct_url(
-        self, vendor_name: Optional[str], vendor_sku: Optional[str]
-    ) -> Optional[str]:
+        self, vendor_name: str | None, vendor_sku: str | None
+    ) -> str | None:
         if not vendor_name or not vendor_sku:
             return None
 
@@ -40,9 +41,9 @@ class VendorDirectResolver:
 
     async def resolve_vendor_card(
         self,
-        vendor_name: Optional[str],
-        vendor_sku: Optional[str],
-        client: Optional[httpx.AsyncClient] = None,
+        vendor_name: str | None,
+        vendor_sku: str | None,
+        client: httpx.AsyncClient | None = None,
     ) -> VendorResolutionResult:
         search_url = self.build_direct_url(vendor_name, vendor_sku)
         if not search_url:
@@ -124,7 +125,7 @@ class VendorDirectResolver:
                 await client.aclose()
 
     async def verify_url_availability(
-        self, url: str, client: Optional[httpx.AsyncClient] = None
+        self, url: str, client: httpx.AsyncClient | None = None
     ) -> bool:
         should_close = False
         if client is None:

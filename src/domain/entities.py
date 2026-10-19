@@ -1,6 +1,7 @@
-from datetime import datetime, timezone
-from enum import Enum
 import hashlib
+from datetime import UTC, datetime
+from enum import Enum
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
@@ -66,7 +67,7 @@ class AuditResult(BaseModel):
     matched_specs_count: int = Field(default=0, ge=0)
     total_specs_count: int = Field(default=0, ge=0)
     audited_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
+        default_factory=lambda: datetime.now(UTC)
     )
     details: str | None = Field(default=None)
     search_trace: list[str] = Field(default_factory=list)
@@ -102,10 +103,10 @@ class Product(BaseModel):
     is_master: bool = Field(default=False)
     status: AuditStatus = Field(default=AuditStatus.PENDING)
     created_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
+        default_factory=lambda: datetime.now(UTC)
     )
     updated_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
+        default_factory=lambda: datetime.now(UTC)
     )
 
     @field_validator("title")
@@ -135,7 +136,7 @@ class Product(BaseModel):
 
     def recalculate_content_hash(self) -> str:
         self.content_hash = self.compute_content_hash(self.title, self.current_specs)
-        self.updated_at = datetime.now(timezone.utc)
+        self.updated_at = datetime.now(UTC)
         return self.content_hash
 
     def is_content_matching(self, target_hash: str) -> bool:

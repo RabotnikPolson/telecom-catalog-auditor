@@ -1,6 +1,7 @@
 import html
 import re
 from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.domain.entities import DescriptionDiscrepancyItem

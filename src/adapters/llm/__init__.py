@@ -1,9 +1,9 @@
 from .openai_judge import (
-    OpenAIJudge,
     GeminiJudge,
     LLMDiscrepancy,
-    LLMMissingSpec,
     LLMJudgeOutput,
+    LLMMissingSpec,
+    OpenAIJudge,
 )
 from .prompts import AUDIT_SYSTEM_PROMPT, build_audit_user_prompt
 

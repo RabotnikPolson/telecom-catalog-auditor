@@ -1,7 +1,8 @@
+import logging
 from collections import defaultdict
 from collections.abc import AsyncIterator
-import logging
 from typing import Any
+
 import aiomysql
 
 from config.settings import Settings, get_settings

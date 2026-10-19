@@ -1,27 +1,28 @@
 import asyncio
-from dataclasses import dataclass, field
 import hashlib
 import re
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any
+
 from config.vendor_profiles import find_vendor_profile
 from config.whitelist_domains import get_domain_priority, is_whitelisted_domain
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
+from src.adapters.llm.openai_judge import SearchQueryBundle
 from src.adapters.search.kaspi_client import KaspiSearchClient
 from src.adapters.search.serper_client import SerperClient
 from src.adapters.search.vendor_direct import VendorDirectResolver
 from src.domain.entities import Product
-from src.adapters.llm.openai_judge import SearchQueryBundle
 
 
 @dataclass
 class ResolvedReference:
     product_id: int
-    reference_url: Optional[str]
+    reference_url: str | None
     source_type: str
-    query_used: Optional[str]
+    query_used: str | None
     scenario_applied: str
     status: str
-    kaspi_code: Optional[str] = None
+    kaspi_code: str | None = None
     candidate_urls: list[str] = field(default_factory=list)
     is_cached: bool = False
     search_trace: list[str] = field(default_factory=list)
@@ -64,11 +65,11 @@ class ResolveReferenceUseCase:
         repository: SQLiteProductRepository,
         vendor_resolver: VendorDirectResolver,
         serper_client: SerperClient,
-        whitelist_domains: Optional[list[str]] = None,
+        whitelist_domains: list[str] | None = None,
         verify_direct_urls: bool = False,
-        judge: Optional[Any] = None,
+        judge: Any | None = None,
         use_url_cache: bool = True,
-        kaspi_client: Optional[KaspiSearchClient] = None,
+        kaspi_client: KaspiSearchClient | None = None,
     ) -> None:
         self.repo = repository
         self.vendor_resolver = vendor_resolver

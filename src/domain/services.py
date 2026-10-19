@@ -1,6 +1,7 @@
-from dataclasses import dataclass, field
 import re
-from typing import Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+
 from .entities import Product
 from .exceptions import GroupingError
 

@@ -1,7 +1,8 @@
 import logging
 import re
-from typing import Any
 import urllib.parse
+from typing import Any
+
 import httpx
 
 logger = logging.getLogger(__name__)

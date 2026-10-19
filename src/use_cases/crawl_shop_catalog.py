@@ -1,7 +1,8 @@
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import logging
-from typing import Callable, Optional
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+
 from src.adapters.catalog.mysql_reader import MySQLCatalogReader
 from src.adapters.catalog.telecom_crawler import LeafCategory, TelecomShopCrawler
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
@@ -25,10 +26,10 @@ class CrawlShopCatalogUseCase:
 
     def __init__(
         self,
-        crawler: Optional[TelecomShopCrawler] = None,
-        repository: Optional[SQLiteProductRepository] = None,
-        mysql_reader: Optional[MySQLCatalogReader] = None,
-        progress_callback: Optional[Callable[[str], None]] = None,
+        crawler: TelecomShopCrawler | None = None,
+        repository: SQLiteProductRepository | None = None,
+        mysql_reader: MySQLCatalogReader | None = None,
+        progress_callback: Callable[[str], None] | None = None,
     ) -> None:
         self.crawler = crawler
         self.repo = repository
@@ -75,8 +76,8 @@ class CrawlShopCatalogUseCase:
 
     async def execute(
         self,
-        category_path: Optional[str] = None,
-        limit: Optional[int] = None,
+        category_path: str | None = None,
+        limit: int | None = None,
         force_rescan: bool = False,
         source: str = "mysql",
     ) -> CrawlRunStats:
@@ -120,7 +121,7 @@ class CrawlShopCatalogUseCase:
         self,
         category: LeafCategory,
         stats: CrawlRunStats,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         force_rescan: bool = False,
     ) -> None:
         cat_key = category.category_key
@@ -208,7 +209,7 @@ class CrawlShopCatalogUseCase:
 
     async def _process_product(
         self, preview
-    ) -> tuple[Optional[Product], bool, bool]:
+    ) -> tuple[Product | None, bool, bool]:
         existing = self.repo.get_product_by_id(preview.product_id)
 
         try:
@@ -245,7 +246,7 @@ class CrawlShopCatalogUseCase:
             existing.manufacturer_sku = manufacturer_sku or existing.manufacturer_sku
             existing.content_hash = calculated_hash
             existing.status = AuditStatus.PENDING
-            existing.updated_at = datetime.now(timezone.utc)
+            existing.updated_at = datetime.now(UTC)
             return existing, True, False
 
         new_product = Product(

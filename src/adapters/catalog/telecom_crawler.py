@@ -1,10 +1,11 @@
 import asyncio
-from dataclasses import dataclass, field
 import html
 import json
 import random
 import re
-from typing import Any, Optional, Union
+from dataclasses import dataclass, field
+from typing import Any
+
 import httpx
 
 
@@ -22,7 +23,7 @@ class CatalogItemPreview:
     slug: str
     title: str
     detail_url: str
-    vendor_sku: Optional[str] = None
+    vendor_sku: str | None = None
 
 
 @dataclass
@@ -38,13 +39,13 @@ class CategoryPageResult:
 class ProductDetailResult:
     product_id: int
     title: str
-    vendor_name: Optional[str]
-    vendor_sku: Optional[str]
-    manufacturer_sku: Optional[str]
+    vendor_name: str | None
+    vendor_sku: str | None
+    manufacturer_sku: str | None
     current_specs: dict[str, str]
     detail_url: str
-    shop_sku: Optional[str] = None
-    barcode: Optional[str] = None
+    shop_sku: str | None = None
+    barcode: str | None = None
 
 
 
@@ -64,7 +65,7 @@ class TelecomShopCrawler:
         delay_max: float = 1.5,
         max_concurrency: int = 2,
         timeout: float = 20.0,
-        client: Optional[httpx.AsyncClient] = None,
+        client: httpx.AsyncClient | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.delay_min = delay_min
@@ -72,7 +73,7 @@ class TelecomShopCrawler:
         self.timeout = timeout
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._external_client = client
-        self._client: Optional[httpx.AsyncClient] = client
+        self._client: httpx.AsyncClient | None = client
 
     async def __aenter__(self) -> "TelecomShopCrawler":
         if self._client is None:
@@ -258,7 +259,7 @@ class TelecomShopCrawler:
         return max(max(page_numbers), current_page)
 
     async def fetch_product_details(
-        self, product_url_or_id: Union[str, int]
+        self, product_url_or_id: str | int
     ) -> ProductDetailResult:
         if isinstance(product_url_or_id, int) or (
             isinstance(product_url_or_id, str) and product_url_or_id.isdigit()
@@ -451,7 +452,7 @@ class TelecomShopCrawler:
             except Exception:
                 return []
 
-    async def fetch_product_on_the_fly(self, target: Union[str, int]) -> Optional[ProductDetailResult]:
+    async def fetch_product_on_the_fly(self, target: str | int) -> ProductDetailResult | None:
         """
         Find and fetch product details directly from shop.telecom.kz.
         target can be a full product URL, internal product_id, or store SKU / query.

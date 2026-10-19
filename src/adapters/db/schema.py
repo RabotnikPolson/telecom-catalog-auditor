@@ -1,6 +1,5 @@
-from pathlib import Path
 import sqlite3
-from typing import Union
+from pathlib import Path
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS products (
@@ -94,7 +93,7 @@ CREATE INDEX IF NOT EXISTS idx_crawler_state_completed ON crawler_state(is_compl
 """
 
 
-def get_sqlite_connection(db_path: Union[str, Path]) -> sqlite3.Connection:
+def get_sqlite_connection(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -109,7 +108,7 @@ def get_sqlite_connection(db_path: Union[str, Path]) -> sqlite3.Connection:
     return conn
 
 
-def init_db(db_path: Union[str, Path]) -> None:
+def init_db(db_path: str | Path) -> None:
     with get_sqlite_connection(db_path) as conn:
         cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='products';")
         if cursor.fetchone():

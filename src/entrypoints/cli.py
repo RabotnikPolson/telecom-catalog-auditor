@@ -2,10 +2,10 @@ import argparse
 import asyncio
 import io
 import os
-from pathlib import Path
 import sys
 import time
 import warnings
+from pathlib import Path
 
 warnings.filterwarnings("ignore", message=".*urllib3.*or chardet.*doesn't match a supported version.*")
 try:
@@ -14,12 +14,12 @@ try:
 except ImportError:
     pass
 
-from config.settings import get_settings
 from rich.console import Console
 from rich.live import Live
 from rich.markup import escape
 from rich.panel import Panel
 
+from config.settings import get_settings
 from src.adapters.catalog.mysql_reader import MySQLCatalogReader
 from src.adapters.catalog.telecom_crawler import TelecomShopCrawler
 from src.adapters.crawler.web_crawler import WebCrawler

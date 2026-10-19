@@ -1,8 +1,9 @@
-from datetime import datetime, timezone, timedelta
 import json
-from pathlib import Path
 import sqlite3
-from typing import Sequence, Union
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
 from src.domain.entities import (
     AuditResult,
     AuditStatus,
@@ -11,6 +12,7 @@ from src.domain.entities import (
     MissingSpecItem,
     Product,
 )
+
 from .schema import get_sqlite_connection, init_db
 
 DEFAULT_CACHE_TTL_DAYS: int = 14
@@ -19,7 +21,7 @@ DEFAULT_CACHE_MAX_RECORDS: int = 30000
 
 class SQLiteProductRepository:
 
-    def __init__(self, db_path: Union[str, Path]) -> None:
+    def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         init_db(self.db_path)
         with get_sqlite_connection(self.db_path) as conn:
@@ -35,12 +37,12 @@ class SQLiteProductRepository:
         created_at = (
             datetime.fromisoformat(row["created_at"])
             if row["created_at"]
-            else datetime.now(timezone.utc)
+            else datetime.now(UTC)
         )
         updated_at = (
             datetime.fromisoformat(row["updated_at"])
             if row["updated_at"]
-            else datetime.now(timezone.utc)
+            else datetime.now(UTC)
         )
         barcode = row["barcode"] if "barcode" in row.keys() else None
         shop_sku = row["shop_sku"] if "shop_sku" in row.keys() else None
@@ -312,7 +314,7 @@ class SQLiteProductRepository:
         ttl_days: int = DEFAULT_CACHE_TTL_DAYS,
         expires_at: str | None = None,
     ) -> None:
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.now(UTC)
         now = now_dt.isoformat()
         if expires_at is None:
             expires_at = (now_dt + timedelta(days=ttl_days)).isoformat()
@@ -330,7 +332,7 @@ class SQLiteProductRepository:
             conn.commit()
 
     def get_url_cache(self, query_hash: str) -> str | None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         sql = "SELECT resolved_url FROM url_cache WHERE query_hash = ? AND (expires_at IS NULL OR expires_at > ?);"
         with get_sqlite_connection(self.db_path) as conn:
             cursor = conn.execute(sql, (query_hash, now))
@@ -352,7 +354,7 @@ class SQLiteProductRepository:
         ttl_days: int = DEFAULT_CACHE_TTL_DAYS,
         expires_at: str | None = None,
     ) -> None:
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.now(UTC)
         now = now_dt.isoformat()
         if expires_at is None:
             expires_at = (now_dt + timedelta(days=ttl_days)).isoformat()
@@ -371,7 +373,7 @@ class SQLiteProductRepository:
             conn.commit()
 
     def get_specs_cache(self, resolved_url: str) -> str | None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         sql = "SELECT specs_json FROM specs_cache WHERE resolved_url = ? AND (expires_at IS NULL OR expires_at > ?);"
         with get_sqlite_connection(self.db_path) as conn:
             cursor = conn.execute(sql, (resolved_url, now))
@@ -389,7 +391,7 @@ class SQLiteProductRepository:
         Prunes expired cache entries and enforces a hard FIFO capacity cap (max_records).
         Returns a dictionary with pruned count statistics.
         """
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         stats = {
             "url_cache_expired": 0,
             "url_cache_fifo": 0,
@@ -460,7 +462,7 @@ class SQLiteProductRepository:
             is_completed = excluded.is_completed,
             updated_at = excluded.updated_at;
         """
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         with get_sqlite_connection(self.db_path) as conn:
             conn.execute(
                 sql,
@@ -518,7 +520,7 @@ class SQLiteProductRepository:
         audited_at = (
             datetime.fromisoformat(row["audited_at"])
             if row["audited_at"]
-            else datetime.now(timezone.utc)
+            else datetime.now(UTC)
         )
         keys = row.keys()
         images_count = int(row["images_count"]) if "images_count" in keys and row["images_count"] is not None else 0

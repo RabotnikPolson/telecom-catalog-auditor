@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import dataclass
 from typing import Any
+
 from playwright.async_api import Browser, Playwright, async_playwright
 
 
