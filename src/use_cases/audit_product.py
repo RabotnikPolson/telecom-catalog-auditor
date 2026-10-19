@@ -49,6 +49,14 @@ class AuditProductUseCase:
         self.crawler = crawler
         self.judge = judge
 
+    def _persist_audit(self, product: Product, result: AuditResult) -> None:
+        if hasattr(self.product_repo, "save_product_and_audit_result"):
+            self.product_repo.save_product_and_audit_result(product, result)
+        else:
+            if hasattr(self.product_repo, "save_product"):
+                self.product_repo.save_product(product)
+            self.product_repo.save_audit_result(result)
+
     async def audit_product(
         self,
         product: Product,
@@ -60,13 +68,6 @@ class AuditProductUseCase:
     ) -> AuditResult:
         t_audit_start = time.perf_counter()
         crawler_time_sec = 0.0
-
-        # Just-in-Time: ensure audited product exists in local repo for audit_results foreign key
-        if hasattr(self.product_repo, "save_product"):
-            try:
-                self.product_repo.save_product(product)
-            except Exception:
-                pass
 
         # Fast path: photos-only audit (zero network or LLM calls)
         if photos_only:
@@ -88,7 +89,7 @@ class AuditProductUseCase:
                 images_status=img_status,
                 description_quality="GOOD",
             )
-            self.product_repo.save_audit_result(res)
+            self._persist_audit(product, res)
             return res
 
         urls_to_try: list[str] = []
@@ -129,7 +130,7 @@ class AuditProductUseCase:
                     images_count=product.images_count,
                     images_status=evaluate_photos_status(product.images_count, 0),
                 )
-                self.product_repo.save_audit_result(result)
+                self._persist_audit(product, result)
                 return result
             urls_to_try = candidates
 
@@ -254,14 +255,14 @@ class AuditProductUseCase:
         if winning_result:
             winning_result.product_id = product.product_id
             winning_result.search_trace = search_trace
-            self.product_repo.save_audit_result(winning_result)
+            self._persist_audit(product, winning_result)
             return winning_result
 
         if last_result:
             search_trace.append("[Evaluation] All candidate URLs exhausted without a verified match.")
             last_result.product_id = product.product_id
             last_result.search_trace = search_trace
-            self.product_repo.save_audit_result(last_result)
+            self._persist_audit(product, last_result)
             return last_result
 
         search_trace.append(f"[Evaluation] All candidates failed. Crawler error: {crawl_error or 'No candidates accessible'}")
@@ -281,7 +282,7 @@ class AuditProductUseCase:
             images_count=product.images_count,
             images_status=evaluate_photos_status(product.images_count, 0),
         )
-        self.product_repo.save_audit_result(result)
+        self._persist_audit(product, result)
         return result
 
     async def audit_by_product_id(

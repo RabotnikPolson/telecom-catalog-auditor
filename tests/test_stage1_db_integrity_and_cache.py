@@ -1,12 +1,13 @@
-from datetime import datetime, timezone, timedelta
 import json
-from pathlib import Path
-import pytest
 import sqlite3
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
-from src.adapters.db.schema import init_db, get_sqlite_connection
+import pytest
+
+from src.adapters.db.schema import get_sqlite_connection
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
-from src.domain.entities import Product, AuditResult, AuditStatus, DiscrepancyItem
+from src.domain.entities import AuditResult, AuditStatus, DiscrepancyItem, Product
 
 
 @pytest.fixture
@@ -65,8 +66,10 @@ def test_batch_upsert_status_preservation(temp_repo: SQLiteProductRepository) ->
     resync_p2_changed = Product(product_id=202, title="Switch 2 NEW", current_specs={"ports": "24"}, status=AuditStatus.PENDING)
     temp_repo.batch_upsert([resync_p1, resync_p2_changed])
 
-    assert temp_repo.get_product_by_id(201).status == AuditStatus.VERIFIED
-    assert temp_repo.get_product_by_id(202).status == AuditStatus.PENDING
+    res1 = temp_repo.get_product_by_id(201)
+    res2 = temp_repo.get_product_by_id(202)
+    assert res1 is not None and res1.status == AuditStatus.VERIFIED
+    assert res2 is not None and res2.status == AuditStatus.PENDING
 
 
 def test_audit_results_deduplication_upsert(temp_repo: SQLiteProductRepository) -> None:
@@ -114,8 +117,8 @@ def test_audit_results_deduplication_upsert(temp_repo: SQLiteProductRepository) 
 
 def test_cache_ttl_and_expiration(temp_repo: SQLiteProductRepository) -> None:
     # 1. URL cache expired
-    past_iso = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
-    future_iso = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+    past_iso = (datetime.now(UTC) - timedelta(days=5)).isoformat()
+    future_iso = (datetime.now(UTC) + timedelta(days=5)).isoformat()
 
     temp_repo.save_url_cache("hash_expired", "https://old.kz", "TEST", expires_at=past_iso)
     temp_repo.save_url_cache("hash_valid", "https://new.kz", "TEST", expires_at=future_iso)
@@ -132,7 +135,7 @@ def test_cache_ttl_and_expiration(temp_repo: SQLiteProductRepository) -> None:
 
 
 def test_fifo_capacity_and_pruning(temp_repo: SQLiteProductRepository) -> None:
-    now_dt = datetime.now(timezone.utc)
+    now_dt = datetime.now(UTC)
     past_iso = (now_dt - timedelta(days=1)).isoformat()
 
     # Insert 1 expired item
@@ -157,3 +160,53 @@ def test_fifo_capacity_and_pruning(temp_repo: SQLiteProductRepository) -> None:
         specs_count = conn.execute("SELECT COUNT(*) FROM specs_cache;").fetchone()[0]
         assert url_count == 4
         assert specs_count == 4
+
+
+def test_sqlite_connection_closes_on_context_exit(temp_repo: SQLiteProductRepository) -> None:
+    with get_sqlite_connection(temp_repo.db_path) as conn:
+        row = conn.execute("SELECT 1;").fetchone()
+        assert row[0] == 1
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1;")
+
+
+def test_atomic_jit_save_product_and_audit_result(temp_repo: SQLiteProductRepository) -> None:
+    p = Product(
+        product_id=9901,
+        title="JIT Atomic Test Router",
+        shop_sku="JIT-9901",
+        current_specs={"wifi": "Wi-Fi 7"},
+    )
+    res = AuditResult(
+        product_id=9901,
+        status=AuditStatus.VERIFIED,
+        confidence_score=0.97,
+        details="JIT saved atomically",
+    )
+    audit_id = temp_repo.save_product_and_audit_result(p, res)
+    assert audit_id > 0
+
+    saved_prod = temp_repo.get_product_by_id(9901)
+    assert saved_prod is not None
+    assert saved_prod.status == AuditStatus.VERIFIED
+
+    saved_res = temp_repo.get_latest_audit_result(9901)
+    assert saved_res is not None
+    assert saved_res.status == AuditStatus.VERIFIED
+
+
+def test_cache_indexes_and_user_version_exist(temp_repo: SQLiteProductRepository) -> None:
+    with get_sqlite_connection(temp_repo.db_path) as conn:
+        ver = conn.execute("PRAGMA user_version;").fetchone()[0]
+        assert ver >= 2
+
+        idx_rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index';"
+        ).fetchall()
+        idx_names = {r[0] for r in idx_rows}
+        assert "idx_url_cache_resolved_url" in idx_names
+        assert "idx_url_cache_created_at" in idx_names
+        assert "idx_specs_cache_fetched_at" in idx_names
+        assert "idx_audit_results_product_unique" not in idx_names
+

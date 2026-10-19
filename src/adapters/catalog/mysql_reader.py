@@ -1,7 +1,8 @@
 import logging
 from collections import defaultdict
-from collections.abc import AsyncIterator
-from typing import Any, cast
+from collections.abc import AsyncIterator, Sequence
+from types import TracebackType
+from typing import TypedDict
 
 import aiomysql  # type: ignore[import-untyped]
 
@@ -12,9 +13,28 @@ from src.domain.exceptions import DomainError
 logger = logging.getLogger(__name__)
 
 
+class CategorySummaryDict(TypedDict):
+    id: int
+    name: str
+    urlkey: str
+    active_count: int
+    total_count: int
+
+
+class GroupSummaryDict(TypedDict):
+    group_id: int
+    group_name: str
+    group_urlkey: str
+    cat_id: int
+    cat_name: str
+    sub_id: int
+    sub_name: str
+    active_count: int
+    total_count: int
+
+
 class MySQLReaderError(DomainError):
     """Raised when an error occurs during MySQL catalog reading."""
-    pass
 
 
 class MySQLCatalogReader:
@@ -69,6 +89,11 @@ class MySQLCatalogReader:
                 minsize=1,
                 maxsize=5,
                 connect_timeout=self.connect_timeout,
+                pool_recycle=1800,
+                init_command=(
+                    "SET SESSION TRANSACTION READ ONLY; "
+                    "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;"
+                ),
             )
             logger.info("Connected to MySQL catalog at %s:%s/%s (READ-ONLY)", self.host, self.port, self.database)
         except Exception as e:
@@ -90,7 +115,7 @@ class MySQLCatalogReader:
         self,
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
-        exc_tb: Any | None,
+        exc_tb: TracebackType | None,
     ) -> None:
         await self.close()
 
@@ -111,11 +136,9 @@ class MySQLCatalogReader:
     async def fetch_product_by_sku(self, shop_sku: str) -> Product | None:
         """Fetch single product by base_id (shop_sku)."""
         clean_sku = str(shop_sku).strip()
-        # First try exact match on base_id
         prod = await self._fetch_single_by_condition("p.base_id = %s", (clean_sku,))
         if prod:
             return prod
-        # Fallback to ID if numeric
         if clean_sku.isdigit():
             return await self.fetch_product_by_id(int(clean_sku))
         return None
@@ -124,20 +147,19 @@ class MySQLCatalogReader:
         """Fetch product by either SKU (base_id), barcode, or product_id."""
         clean_id = str(identifier).strip()
         if clean_id.isdigit():
-            # Try by product_id first
             prod = await self.fetch_product_by_id(int(clean_id))
             if prod:
                 return prod
 
-        # Try by shop_sku (base_id)
-        prod = await self.fetch_product_by_sku(clean_id)
+        prod = await self._fetch_single_by_condition("p.base_id = %s", (clean_id,))
         if prod:
             return prod
 
-        # Try by barcode
         return await self._fetch_single_by_condition("p.barcode = %s", (clean_id,))
 
-    async def _fetch_single_by_condition(self, condition: str, params: tuple[Any, ...]) -> Product | None:
+    async def _fetch_single_by_condition(
+        self, condition: str, params: Sequence[str | int]
+    ) -> Product | None:
         pool = self._ensure_connected()
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -156,12 +178,12 @@ class MySQLCatalogReader:
                     WHERE {condition}
                     LIMIT 1;
                 """
-                await cur.execute(query, params)
+                await cur.execute(query, tuple(params))
                 row = await cur.fetchone()
                 if not row:
                     return None
 
-                pid = row["product_id"]
+                pid = int(row["product_id"])
                 specs = await self._fetch_specs_for_ids(cur, [pid])
                 partners = await self._fetch_partners_for_ids(cur, [pid])
                 img_counts = await self._fetch_images_for_ids(cur, [pid])
@@ -188,9 +210,9 @@ class MySQLCatalogReader:
                 )
 
     async def _fetch_specs_for_ids(
-        self, cur: aiomysql.Cursor, product_ids: list[int]
+        self, cur: aiomysql.Cursor, product_ids: list[int], chunk_size: int = 500
     ) -> dict[int, dict[str, str]]:
-        """Batch fetch specifications for given product IDs."""
+        """Batch fetch specifications for given product IDs using fetchmany."""
         if not product_ids:
             return {}
 
@@ -205,27 +227,30 @@ class MySQLCatalogReader:
             WHERE pa.product_id IN ({format_strings})
         """
         await cur.execute(query, tuple(product_ids))
-        rows = await cur.fetchall()
 
         result: dict[int, dict[str, str]] = defaultdict(dict)
-        for r in rows:
-            pid = r["product_id"]
-            name = (r["attr_name"] or "").strip()
-            val = (r["attr_value"] or "").strip()
-            if not name or not val:
-                continue
+        while True:
+            rows = await cur.fetchmany(chunk_size)
+            if not rows:
+                break
+            for r in rows:
+                pid = int(r["product_id"])
+                name = (r["attr_name"] or "").strip()
+                val = (r["attr_value"] or "").strip()
+                if not name or not val:
+                    continue
 
-            if name in result[pid]:
-                result[pid][name] = f"{result[pid][name]}, {val}"
-            else:
-                result[pid][name] = val
+                if name in result[pid]:
+                    result[pid][name] = f"{result[pid][name]}, {val}"
+                else:
+                    result[pid][name] = val
 
         return result
 
     async def _fetch_partners_for_ids(
-        self, cur: aiomysql.Cursor, product_ids: list[int]
+        self, cur: aiomysql.Cursor, product_ids: list[int], chunk_size: int = 500
     ) -> dict[int, dict[str, str | None]]:
-        """Batch fetch partner/vendor information for given product IDs."""
+        """Batch fetch partner/vendor information for given product IDs using fetchmany."""
         if not product_ids:
             return {}
 
@@ -248,25 +273,28 @@ class MySQLCatalogReader:
                 pp.id DESC
         """
         await cur.execute(query, tuple(product_ids))
-        rows = await cur.fetchall()
 
         result: dict[int, dict[str, str | None]] = {}
-        for r in rows:
-            pid = r["product_id"]
-            if pid not in result:
-                v_name = (r["vendor_name"] or "").strip() or None
-                v_sku = (r["vendor_sku"] or "").strip() or None
-                result[pid] = {
-                    "vendor_name": v_name,
-                    "vendor_sku": v_sku,
-                }
+        while True:
+            rows = await cur.fetchmany(chunk_size)
+            if not rows:
+                break
+            for r in rows:
+                pid = int(r["product_id"])
+                if pid not in result:
+                    v_name = (r["vendor_name"] or "").strip() or None
+                    v_sku = (r["vendor_sku"] or "").strip() or None
+                    result[pid] = {
+                        "vendor_name": v_name,
+                        "vendor_sku": v_sku,
+                    }
 
         return result
 
     async def _fetch_images_for_ids(
-        self, cur: aiomysql.Cursor, product_ids: list[int]
+        self, cur: aiomysql.Cursor, product_ids: list[int], chunk_size: int = 500
     ) -> dict[int, int]:
-        """Batch fetch images count from images table for given product IDs."""
+        """Batch fetch images count from images table for given product IDs using fetchmany."""
         if not product_ids:
             return {}
 
@@ -278,11 +306,14 @@ class MySQLCatalogReader:
             GROUP BY product_id;
         """
         await cur.execute(query, tuple(product_ids))
-        rows = await cur.fetchall()
 
         result: dict[int, int] = {}
-        for r in rows:
-            result[int(r["product_id"])] = int(r["img_cnt"])
+        while True:
+            rows = await cur.fetchmany(chunk_size)
+            if not rows:
+                break
+            for r in rows:
+                result[int(r["product_id"])] = int(r["img_cnt"])
         return result
 
     async def count_products(
@@ -319,7 +350,7 @@ class MySQLCatalogReader:
                 row = await cur.fetchone()
                 return int(row["cnt"]) if row else 0
 
-    async def get_categories(self, only_active: bool = True) -> list[dict[str, Any]]:
+    async def get_categories(self, only_active: bool = True) -> list[CategorySummaryDict]:
         """List main categories with active/total product counts."""
         pool = self._ensure_connected()
         async with pool.acquire() as conn:
@@ -341,14 +372,29 @@ class MySQLCatalogReader:
                     ORDER BY active_count DESC;
                 """
                 await cur.execute(query)
-                return cast(list[dict[str, Any]], await cur.fetchall())
+                items: list[CategorySummaryDict] = []
+                while True:
+                    chunk = await cur.fetchmany(100)
+                    if not chunk:
+                        break
+                    for r in chunk:
+                        items.append(
+                            {
+                                "id": int(r["id"]),
+                                "name": str(r["name"] or ""),
+                                "urlkey": str(r["urlkey"] or ""),
+                                "active_count": int(r["active_count"] or 0),
+                                "total_count": int(r["total_count"] or 0),
+                            }
+                        )
+                return items
 
     async def get_groups(
         self,
         main_category_id: int | None = None,
         search: str | None = None,
         only_active: bool = True,
-    ) -> list[dict[str, Any]]:
+    ) -> list[GroupSummaryDict]:
         """List product groups with active/total product counts."""
         pool = self._ensure_connected()
         async with pool.acquire() as conn:
@@ -356,7 +402,7 @@ class MySQLCatalogReader:
                 await self._init_session(cur)
                 g = chr(96) + "groups" + chr(96)
                 conditions = []
-                params: list[Any] = []
+                params: list[str | int] = []
                 if main_category_id is not None:
                     conditions.append("c.id = %s")
                     params.append(main_category_id)
@@ -383,114 +429,146 @@ class MySQLCatalogReader:
                     ORDER BY active_count DESC;
                 """
                 await cur.execute(query, tuple(params))
-                return cast(list[dict[str, Any]], await cur.fetchall())
+                items: list[GroupSummaryDict] = []
+                while True:
+                    chunk = await cur.fetchmany(200)
+                    if not chunk:
+                        break
+                    for r in chunk:
+                        items.append(
+                            {
+                                "group_id": int(r["group_id"]),
+                                "group_name": str(r["group_name"] or ""),
+                                "group_urlkey": str(r["group_urlkey"] or ""),
+                                "cat_id": int(r["cat_id"]),
+                                "cat_name": str(r["cat_name"] or ""),
+                                "sub_id": int(r["sub_id"]),
+                                "sub_name": str(r["sub_name"] or ""),
+                                "active_count": int(r["active_count"] or 0),
+                                "total_count": int(r["total_count"] or 0),
+                            }
+                        )
+                return items
 
     async def stream_products(
         self,
         batch_size: int = 500,
         limit: int | None = None,
         offset: int = 0,
+        last_seen_id: int = 0,
         category_id: int | None = None,
         main_category_id: int | None = None,
         only_active: bool = True,
     ) -> AsyncIterator[list[Product]]:
         """
-        Stream products in batches using limit/offset with batch attribute fetching.
-        Yields list[Product] per batch.
+        Stream products in batches using O(N) Keyset Pagination (p.id > last_seen_id)
+        with batch attribute fetching. Yields list[Product] per batch.
         """
         pool = self._ensure_connected()
-        cur_offset = offset
+        cursor_id = max(0, last_seen_id)
+        initial_offset = max(0, offset) if cursor_id == 0 else 0
         total_yielded = 0
 
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await self._init_session(cur)
+        while True:
+            cur_batch_size = batch_size
+            if limit is not None:
+                remaining = limit - total_yielded
+                if remaining <= 0:
+                    break
+                cur_batch_size = min(batch_size, remaining)
 
-                while True:
-                    cur_batch_size = batch_size
-                    if limit is not None:
-                        remaining = limit - total_yielded
-                        if remaining <= 0:
-                            break
-                        cur_batch_size = min(batch_size, remaining)
+            where_conditions: list[str] = []
+            params: list[str | int] = []
 
-                    where_conditions: list[str] = []
-                    params: list[Any] = []
+            if cursor_id > 0:
+                where_conditions.append("p.id > %s")
+                params.append(cursor_id)
 
-                    if only_active:
-                        where_conditions.append(
-                            "EXISTS (SELECT 1 FROM partner_products pp WHERE pp.product_id = p.id AND pp.enabled = 1)"
-                        )
+            if only_active:
+                where_conditions.append(
+                    "EXISTS (SELECT 1 FROM partner_products pp WHERE pp.product_id = p.id AND pp.enabled = 1)"
+                )
 
-                    if category_id is not None:
-                        where_conditions.append("p.category_id = %s")
-                        params.append(category_id)
+            if category_id is not None:
+                where_conditions.append("p.category_id = %s")
+                params.append(category_id)
 
-                    if main_category_id is not None:
-                        g = chr(96) + "groups" + chr(96)
-                        where_conditions.append(
-                            f"p.category_id IN (SELECT g.id FROM {g} g JOIN sub_categories sc ON g.sub_categories_id = sc.id WHERE sc.categories_id = %s)"
-                        )
-                        params.append(main_category_id)
+            if main_category_id is not None:
+                g = chr(96) + "groups" + chr(96)
+                where_conditions.append(
+                    f"p.category_id IN (SELECT g.id FROM {g} g JOIN sub_categories sc ON g.sub_categories_id = sc.id WHERE sc.categories_id = %s)"
+                )
+                params.append(main_category_id)
 
-                    where_clause = ""
-                    if where_conditions:
-                        where_clause = "WHERE " + " AND ".join(where_conditions)
+            where_clause = ""
+            if where_conditions:
+                where_clause = "WHERE " + " AND ".join(where_conditions)
 
-                    query = f"""
-                        SELECT 
-                            p.id as product_id,
-                            p.base_id as shop_sku,
-                            p.barcode,
-                            p.name as title,
-                            p.description as description,
-                            b.name as brand_name
-                        FROM products p
-                        LEFT JOIN brand b ON p.brand_id = b.id
-                        {where_clause}
-                        ORDER BY p.id ASC
-                        LIMIT %s OFFSET %s;
-                    """
-                    params.extend([cur_batch_size, cur_offset])
+            if initial_offset > 0:
+                pagination_clause = "LIMIT %s OFFSET %s"
+                params.extend([cur_batch_size, initial_offset])
+                initial_offset = 0
+            else:
+                pagination_clause = "LIMIT %s"
+                params.append(cur_batch_size)
+
+            query = f"""
+                SELECT 
+                    p.id as product_id,
+                    p.base_id as shop_sku,
+                    p.barcode,
+                    p.name as title,
+                    p.description as description,
+                    b.name as brand_name
+                FROM products p
+                LEFT JOIN brand b ON p.brand_id = b.id
+                {where_clause}
+                ORDER BY p.id ASC
+                {pagination_clause};
+            """
+
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await self._init_session(cur)
                     await cur.execute(query, tuple(params))
-                    rows = await cur.fetchall()
+                    rows = await cur.fetchmany(cur_batch_size)
 
                     if not rows:
                         break
 
-                    pids = [r["product_id"] for r in rows]
-                    specs = await self._fetch_specs_for_ids(cur, pids)
-                    partners = await self._fetch_partners_for_ids(cur, pids)
-                    img_counts = await self._fetch_images_for_ids(cur, pids)
+                    pids = [int(r["product_id"]) for r in rows]
+                    specs = await self._fetch_specs_for_ids(cur, pids, chunk_size=max(500, cur_batch_size * 10))
+                    partners = await self._fetch_partners_for_ids(cur, pids, chunk_size=max(500, cur_batch_size * 4))
+                    img_counts = await self._fetch_images_for_ids(cur, pids, chunk_size=max(500, cur_batch_size))
 
-                    batch_products: list[Product] = []
-                    for r in rows:
-                        pid = r["product_id"]
-                        title = (r["title"] or "").strip() or f"Product #{pid}"
-                        partner_info = partners.get(pid, {})
-                        vendor_name = partner_info.get("vendor_name")
-                        brand_name = (r.get("brand_name") or "").strip() or None
-                        if (not vendor_name or "склад" in vendor_name.lower()) and brand_name:
-                            vendor_name = brand_name
+            cursor_id = int(rows[-1]["product_id"])
+            batch_products: list[Product] = []
+            for r in rows:
+                pid = int(r["product_id"])
+                title = (r["title"] or "").strip() or f"Product #{pid}"
+                partner_info = partners.get(pid, {})
+                vendor_name = partner_info.get("vendor_name")
+                brand_name = (r.get("brand_name") or "").strip() or None
+                if (not vendor_name or "склад" in vendor_name.lower()) and brand_name:
+                    vendor_name = brand_name
 
-                        prod = Product(
-                            product_id=pid,
-                            shop_sku=str(r["shop_sku"]).strip() if r["shop_sku"] else str(pid),
-                            title=title,
-                            barcode=str(r["barcode"]).strip() if r["barcode"] else None,
-                            vendor_name=vendor_name,
-                            vendor_sku=partner_info.get("vendor_sku"),
-                            manufacturer_sku=None,
-                            description=r.get("description"),
-                            images_count=img_counts.get(pid, 0),
-                            current_specs=specs.get(pid, {}),
-                            status=AuditStatus.PENDING,
-                        )
-                        batch_products.append(prod)
+                prod = Product(
+                    product_id=pid,
+                    shop_sku=str(r["shop_sku"]).strip() if r["shop_sku"] else str(pid),
+                    title=title,
+                    barcode=str(r["barcode"]).strip() if r["barcode"] else None,
+                    vendor_name=vendor_name,
+                    vendor_sku=partner_info.get("vendor_sku"),
+                    manufacturer_sku=None,
+                    description=r.get("description"),
+                    images_count=img_counts.get(pid, 0),
+                    current_specs=specs.get(pid, {}),
+                    status=AuditStatus.PENDING,
+                )
+                batch_products.append(prod)
 
-                    yield batch_products
-                    total_yielded += len(batch_products)
-                    cur_offset += len(rows)
+            yield batch_products
+            total_yielded += len(batch_products)
 
-                    if len(rows) < cur_batch_size:
-                        break
+            if len(rows) < cur_batch_size:
+                break

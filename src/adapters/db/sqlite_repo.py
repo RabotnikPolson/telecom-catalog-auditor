@@ -3,7 +3,7 @@ import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 from src.domain.entities import (
     AuditResult,
@@ -20,17 +20,19 @@ DEFAULT_CACHE_TTL_DAYS: int = 14
 DEFAULT_CACHE_MAX_RECORDS: int = 30000
 
 
+class CrawlerStateDict(TypedDict):
+    category_key: str
+    last_page: int
+    total_pages: int
+    is_completed: bool
+    updated_at: str
+
+
 class SQLiteProductRepository:
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         init_db(self.db_path)
-        with get_sqlite_connection(self.db_path) as conn:
-            try:
-                conn.execute("ALTER TABLE audit_results ADD COLUMN missing_specs_json TEXT;")
-                conn.commit()
-            except Exception:
-                pass
         self.prune_expired_cache()
 
     def _row_to_product(self, row: sqlite3.Row) -> Product:
@@ -71,62 +73,9 @@ class SQLiteProductRepository:
         )
 
     def save_product(self, product: Product) -> Product:
-        sql = """
-        INSERT INTO products (
-            product_id, shop_sku, title, barcode, vendor_name, vendor_sku, manufacturer_sku,
-            description, images_count,
-            current_specs, content_hash, parent_sku, master_key, is_master,
-            status, created_at, updated_at
-        ) VALUES (
-            :product_id, :shop_sku, :title, :barcode, :vendor_name, :vendor_sku, :manufacturer_sku,
-            :description, :images_count,
-            :current_specs, :content_hash, :parent_sku, :master_key, :is_master,
-            :status, :created_at, :updated_at
-        )
-        ON CONFLICT(product_id) DO UPDATE SET
-            shop_sku = excluded.shop_sku,
-            title = excluded.title,
-            barcode = excluded.barcode,
-            vendor_name = excluded.vendor_name,
-            vendor_sku = excluded.vendor_sku,
-            manufacturer_sku = excluded.manufacturer_sku,
-            description = excluded.description,
-            images_count = excluded.images_count,
-            current_specs = excluded.current_specs,
-            content_hash = excluded.content_hash,
-            parent_sku = excluded.parent_sku,
-            master_key = excluded.master_key,
-            is_master = excluded.is_master,
-            status = CASE 
-                WHEN products.content_hash = excluded.content_hash THEN products.status 
-                ELSE excluded.status 
-            END,
-            updated_at = excluded.updated_at;
-        """
-        payload = {
-            "product_id": product.product_id,
-            "shop_sku": product.shop_sku,
-            "title": product.title,
-            "barcode": product.barcode,
-            "vendor_name": product.vendor_name,
-            "vendor_sku": product.vendor_sku,
-            "manufacturer_sku": product.manufacturer_sku,
-            "description": product.description,
-            "images_count": product.images_count,
-            "current_specs": json.dumps(product.current_specs, ensure_ascii=False),
-            "content_hash": product.content_hash or product.recalculate_content_hash(),
-            "parent_sku": product.parent_sku,
-            "master_key": product.master_key,
-            "is_master": 1 if product.is_master else 0,
-            "status": product.status.value,
-            "created_at": product.created_at.isoformat(),
-            "updated_at": product.updated_at.isoformat(),
-        }
-
         with get_sqlite_connection(self.db_path) as conn:
-            conn.execute(sql, payload)
+            self._execute_upsert_product(conn, product)
             conn.commit()
-
         return product
 
     def batch_upsert(self, products: Sequence[Product]) -> int:
@@ -300,9 +249,9 @@ class SQLiteProductRepository:
                     specs = {}
                 try:
                     m_key = grouper.extract_master_key(title, specs)
-                    updates.append((m_key, p_id))
                 except Exception:
-                    pass
+                    m_key = f"pid_{p_id}"
+                updates.append((m_key or f"pid_{p_id}", p_id))
             if updates:
                 conn.executemany("UPDATE products SET master_key = ? WHERE product_id = ?;", updates)
                 conn.commit()
@@ -472,7 +421,7 @@ class SQLiteProductRepository:
             )
             conn.commit()
 
-    def get_crawler_state(self, category_key: str) -> dict[str, Any] | None:
+    def get_crawler_state(self, category_key: str) -> CrawlerStateDict | None:
         sql = "SELECT * FROM crawler_state WHERE category_key = ?;"
         with get_sqlite_connection(self.db_path) as conn:
             cursor = conn.execute(sql, (category_key,))
@@ -480,11 +429,11 @@ class SQLiteProductRepository:
             if not row:
                 return None
             return {
-                "category_key": row["category_key"],
-                "last_page": row["last_page"],
-                "total_pages": row["total_pages"],
+                "category_key": str(row["category_key"]),
+                "last_page": int(row["last_page"]),
+                "total_pages": int(row["total_pages"]),
                 "is_completed": bool(row["is_completed"]),
-                "updated_at": row["updated_at"],
+                "updated_at": str(row["updated_at"]),
             }
 
     def reset_crawler_state(self, category_key: str | None = None) -> None:
@@ -495,17 +444,17 @@ class SQLiteProductRepository:
                 conn.execute("DELETE FROM crawler_state;")
             conn.commit()
 
-    def get_all_crawler_states(self) -> list[dict[str, Any]]:
+    def get_all_crawler_states(self) -> list[CrawlerStateDict]:
         sql = "SELECT * FROM crawler_state ORDER BY updated_at DESC;"
         with get_sqlite_connection(self.db_path) as conn:
             cursor = conn.execute(sql)
             return [
                 {
-                    "category_key": row["category_key"],
-                    "last_page": row["last_page"],
-                    "total_pages": row["total_pages"],
+                    "category_key": str(row["category_key"]),
+                    "last_page": int(row["last_page"]),
+                    "total_pages": int(row["total_pages"]),
                     "is_completed": bool(row["is_completed"]),
-                    "updated_at": row["updated_at"],
+                    "updated_at": str(row["updated_at"]),
                 }
                 for row in cursor.fetchall()
             ]
@@ -561,7 +510,61 @@ class SQLiteProductRepository:
             description_quality=description_quality,
         )
 
-    def save_audit_result(self, result: AuditResult) -> int:
+    def _execute_upsert_product(self, conn: sqlite3.Connection, product: Product) -> None:
+        sql = """
+        INSERT INTO products (
+            product_id, shop_sku, title, barcode, vendor_name, vendor_sku, manufacturer_sku,
+            description, images_count,
+            current_specs, content_hash, parent_sku, master_key, is_master,
+            status, created_at, updated_at
+        ) VALUES (
+            :product_id, :shop_sku, :title, :barcode, :vendor_name, :vendor_sku, :manufacturer_sku,
+            :description, :images_count,
+            :current_specs, :content_hash, :parent_sku, :master_key, :is_master,
+            :status, :created_at, :updated_at
+        )
+        ON CONFLICT(product_id) DO UPDATE SET
+            shop_sku = excluded.shop_sku,
+            title = excluded.title,
+            barcode = excluded.barcode,
+            vendor_name = excluded.vendor_name,
+            vendor_sku = excluded.vendor_sku,
+            manufacturer_sku = excluded.manufacturer_sku,
+            description = excluded.description,
+            images_count = excluded.images_count,
+            current_specs = excluded.current_specs,
+            content_hash = excluded.content_hash,
+            parent_sku = excluded.parent_sku,
+            master_key = excluded.master_key,
+            is_master = excluded.is_master,
+            status = CASE 
+                WHEN products.content_hash = excluded.content_hash THEN products.status 
+                ELSE excluded.status 
+            END,
+            updated_at = excluded.updated_at;
+        """
+        payload = {
+            "product_id": product.product_id,
+            "shop_sku": product.shop_sku,
+            "title": product.title,
+            "barcode": product.barcode,
+            "vendor_name": product.vendor_name,
+            "vendor_sku": product.vendor_sku,
+            "manufacturer_sku": product.manufacturer_sku,
+            "description": product.description,
+            "images_count": product.images_count,
+            "current_specs": json.dumps(product.current_specs, ensure_ascii=False),
+            "content_hash": product.content_hash or product.recalculate_content_hash(),
+            "parent_sku": product.parent_sku,
+            "master_key": product.master_key,
+            "is_master": 1 if product.is_master else 0,
+            "status": product.status.value,
+            "created_at": product.created_at.isoformat(),
+            "updated_at": product.updated_at.isoformat(),
+        }
+        conn.execute(sql, payload)
+
+    def _execute_upsert_audit_result(self, conn: sqlite3.Connection, result: AuditResult) -> int:
         sql = """
         INSERT INTO audit_results (
             product_id, status, confidence_score, reference_url,
@@ -592,7 +595,8 @@ class SQLiteProductRepository:
             input_tokens = excluded.input_tokens,
             output_tokens = excluded.output_tokens,
             estimated_cost_usd = excluded.estimated_cost_usd,
-            search_trace_json = excluded.search_trace_json;
+            search_trace_json = excluded.search_trace_json
+        RETURNING audit_id;
         """
         disc_json = json.dumps(
             [d.model_dump() for d in result.discrepancies],
@@ -608,48 +612,53 @@ class SQLiteProductRepository:
         ) if result.description_discrepancies else None
         trace_json = json.dumps(result.search_trace, ensure_ascii=False) if result.search_trace else None
         now_iso = result.audited_at.isoformat()
-        with get_sqlite_connection(self.db_path) as conn:
-            cursor = conn.execute(
-                sql,
-                (
-                    result.product_id,
-                    result.status.value,
-                    result.confidence_score,
-                    result.reference_url,
-                    disc_json,
-                    missing_json,
-                    result.matched_specs_count,
-                    result.total_specs_count,
-                    result.images_count,
-                    result.reference_images_count,
-                    result.images_status,
-                    desc_disc_json,
-                    result.description_quality,
-                    now_iso,
-                    result.details,
-                    result.execution_time_sec,
-                    result.crawler_time_sec,
-                    result.llm_time_sec,
-                    result.input_tokens,
-                    result.output_tokens,
-                    result.estimated_cost_usd,
-                    trace_json,
-                ),
-            )
-            audit_id = cursor.lastrowid
-            if not audit_id:
-                row = conn.execute(
-                    "SELECT audit_id FROM audit_results WHERE product_id = ?;",
-                    (result.product_id,),
-                ).fetchone()
-                audit_id = row[0] if row else 0
+        cursor = conn.execute(
+            sql,
+            (
+                result.product_id,
+                result.status.value,
+                result.confidence_score,
+                result.reference_url,
+                disc_json,
+                missing_json,
+                result.matched_specs_count,
+                result.total_specs_count,
+                result.images_count,
+                result.reference_images_count,
+                result.images_status,
+                desc_disc_json,
+                result.description_quality,
+                now_iso,
+                result.details,
+                result.execution_time_sec,
+                result.crawler_time_sec,
+                result.llm_time_sec,
+                result.input_tokens,
+                result.output_tokens,
+                result.estimated_cost_usd,
+                trace_json,
+            ),
+        )
+        row = cursor.fetchone()
+        audit_id = int(row[0]) if row else 0
+        conn.execute(
+            "UPDATE products SET status = ?, updated_at = ? WHERE product_id = ?;",
+            (result.status.value, now_iso, result.product_id),
+        )
+        return audit_id
 
-            conn.execute(
-                "UPDATE products SET status = ?, updated_at = ? WHERE product_id = ?;",
-                (result.status.value, now_iso, result.product_id),
-            )
+    def save_audit_result(self, result: AuditResult) -> int:
+        with get_sqlite_connection(self.db_path) as conn:
+            audit_id = self._execute_upsert_audit_result(conn, result)
             conn.commit()
-            return int(audit_id)
+            return audit_id
+
+    def save_product_and_audit_result(self, product: Product, result: AuditResult) -> int:
+        with get_sqlite_connection(self.db_path) as conn:
+            self._execute_upsert_product(conn, product)
+            audit_id = self._execute_upsert_audit_result(conn, result)
+            conn.commit()
+            return audit_id
 
     def get_audit_results_by_product_id(self, product_id: int) -> list[AuditResult]:
         sql = "SELECT * FROM audit_results WHERE product_id = ? ORDER BY audit_id DESC;"

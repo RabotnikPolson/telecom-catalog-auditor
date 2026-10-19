@@ -1,5 +1,12 @@
+import logging
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+LATEST_SCHEMA_VERSION: int = 2
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS products (
@@ -38,6 +45,8 @@ CREATE TABLE IF NOT EXISTS url_cache (
 );
 
 CREATE INDEX IF NOT EXISTS idx_url_cache_source ON url_cache(source_type);
+CREATE INDEX IF NOT EXISTS idx_url_cache_resolved_url ON url_cache(resolved_url);
+CREATE INDEX IF NOT EXISTS idx_url_cache_created_at ON url_cache(created_at);
 
 CREATE TABLE IF NOT EXISTS specs_cache (
     resolved_url TEXT PRIMARY KEY,
@@ -49,6 +58,7 @@ CREATE TABLE IF NOT EXISTS specs_cache (
 );
 
 CREATE INDEX IF NOT EXISTS idx_url_cache_expires ON url_cache(expires_at);
+CREATE INDEX IF NOT EXISTS idx_specs_cache_fetched_at ON specs_cache(fetched_at);
 CREATE INDEX IF NOT EXISTS idx_specs_cache_expires ON specs_cache(expires_at);
 
 CREATE TABLE IF NOT EXISTS audit_results (
@@ -78,7 +88,6 @@ CREATE TABLE IF NOT EXISTS audit_results (
     FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE CASCADE
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_results_product_unique ON audit_results(product_id);
 CREATE INDEX IF NOT EXISTS idx_audit_results_status ON audit_results(status);
 
 CREATE TABLE IF NOT EXISTS crawler_state (
@@ -93,139 +102,108 @@ CREATE INDEX IF NOT EXISTS idx_crawler_state_completed ON crawler_state(is_compl
 """
 
 
-def get_sqlite_connection(db_path: str | Path) -> sqlite3.Connection:
+@contextmanager
+def get_sqlite_connection(db_path: str | Path) -> Iterator[sqlite3.Connection]:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(str(path), timeout=10.0)
+    conn = sqlite3.connect(str(path), timeout=15.0)
     conn.row_factory = sqlite3.Row
 
-    conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA busy_timeout = 15000;")
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.execute("PRAGMA synchronous = NORMAL;")
-    conn.execute("PRAGMA busy_timeout = 5000;")
+    conn.execute("PRAGMA temp_store = MEMORY;")
+    conn.execute("PRAGMA cache_size = -64000;")
+    conn.execute("PRAGMA mmap_size = 268435456;")
 
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _try_add_column(conn: sqlite3.Connection, table: str, column_def: str) -> None:
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_def};")
+    except sqlite3.OperationalError as exc:
+        logger.debug("Column migration skipped on %s (%s): %s", table, column_def, exc)
 
 
 def init_db(db_path: str | Path) -> None:
-    with get_sqlite_connection(db_path) as conn:
-        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='products';")
-        if cursor.fetchone():
-            col_cursor = conn.execute("PRAGMA table_info(products);")
-            columns = [row["name"] for row in col_cursor.fetchall()]
-            if "barcode" not in columns:
-                try:
-                    conn.execute("ALTER TABLE products ADD COLUMN barcode TEXT;")
-                except Exception:
-                    pass
-            if "shop_sku" not in columns:
-                try:
-                    conn.execute("ALTER TABLE products ADD COLUMN shop_sku TEXT;")
-                except Exception:
-                    pass
-            if "description" not in columns:
-                try:
-                    conn.execute("ALTER TABLE products ADD COLUMN description TEXT;")
-                except Exception:
-                    pass
-            if "images_count" not in columns:
-                try:
-                    conn.execute("ALTER TABLE products ADD COLUMN images_count INTEGER NOT NULL DEFAULT 0;")
-                except Exception:
-                    pass
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with get_sqlite_connection(path) as conn:
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA wal_autocheckpoint = 1000;")
 
-        # Migrate specs_cache table if missing expires_at and backfill
-        specs_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='specs_cache';")
-        if specs_cursor.fetchone():
-            s_cols = [row["name"] for row in conn.execute("PRAGMA table_info(specs_cache);").fetchall()]
-            if "expires_at" not in s_cols:
-                try:
-                    conn.execute("ALTER TABLE specs_cache ADD COLUMN expires_at TEXT;")
-                except Exception:
-                    pass
-            conn.execute("UPDATE specs_cache SET expires_at = datetime(fetched_at, '+30 days') WHERE expires_at IS NULL;")
+        ver_row = conn.execute("PRAGMA user_version;").fetchone()
+        current_version = int(ver_row[0]) if ver_row else 0
 
-        # Backfill url_cache if expires_at is NULL
-        url_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='url_cache';")
-        if url_cursor.fetchone():
-            conn.execute("UPDATE url_cache SET expires_at = datetime(created_at, '+30 days') WHERE expires_at IS NULL;")
+        if current_version < LATEST_SCHEMA_VERSION:
+            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='products';")
+            if cursor.fetchone():
+                col_cursor = conn.execute("PRAGMA table_info(products);")
+                columns = [row["name"] for row in col_cursor.fetchall()]
+                if "barcode" not in columns:
+                    _try_add_column(conn, "products", "barcode TEXT")
+                if "shop_sku" not in columns:
+                    _try_add_column(conn, "products", "shop_sku TEXT")
+                if "description" not in columns:
+                    _try_add_column(conn, "products", "description TEXT")
+                if "images_count" not in columns:
+                    _try_add_column(conn, "products", "images_count INTEGER NOT NULL DEFAULT 0")
 
-        # Migrate audit_results table if missing metrics/photos/description columns and deduplicate
-        audit_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit_results';")
-        if audit_cursor.fetchone():
-            a_cols = [row["name"] for row in conn.execute("PRAGMA table_info(audit_results);").fetchall()]
-            if "execution_time_sec" not in a_cols:
-                try:
-                    conn.execute("ALTER TABLE audit_results ADD COLUMN execution_time_sec REAL DEFAULT 0.0;")
-                except Exception:
-                    pass
-            if "crawler_time_sec" not in a_cols:
-                try:
-                    conn.execute("ALTER TABLE audit_results ADD COLUMN crawler_time_sec REAL DEFAULT 0.0;")
-                except Exception:
-                    pass
-            if "llm_time_sec" not in a_cols:
-                try:
-                    conn.execute("ALTER TABLE audit_results ADD COLUMN llm_time_sec REAL DEFAULT 0.0;")
-                except Exception:
-                    pass
-            if "input_tokens" not in a_cols:
-                try:
-                    conn.execute("ALTER TABLE audit_results ADD COLUMN input_tokens INTEGER DEFAULT 0;")
-                except Exception:
-                    pass
-            if "output_tokens" not in a_cols:
-                try:
-                    conn.execute("ALTER TABLE audit_results ADD COLUMN output_tokens INTEGER DEFAULT 0;")
-                except Exception:
-                    pass
-            if "estimated_cost_usd" not in a_cols:
-                try:
-                    conn.execute("ALTER TABLE audit_results ADD COLUMN estimated_cost_usd REAL DEFAULT 0.0;")
-                except Exception:
-                    pass
-            if "search_trace_json" not in a_cols:
-                try:
-                    conn.execute("ALTER TABLE audit_results ADD COLUMN search_trace_json TEXT;")
-                except Exception:
-                    pass
-            if "images_count" not in a_cols:
-                try:
-                    conn.execute("ALTER TABLE audit_results ADD COLUMN images_count INTEGER NOT NULL DEFAULT 0;")
-                except Exception:
-                    pass
-            if "reference_images_count" not in a_cols:
-                try:
-                    conn.execute("ALTER TABLE audit_results ADD COLUMN reference_images_count INTEGER NOT NULL DEFAULT 0;")
-                except Exception:
-                    pass
-            if "images_status" not in a_cols:
-                try:
-                    conn.execute("ALTER TABLE audit_results ADD COLUMN images_status TEXT NOT NULL DEFAULT 'OK';")
-                except Exception:
-                    pass
-            if "description_discrepancies_json" not in a_cols:
-                try:
-                    conn.execute("ALTER TABLE audit_results ADD COLUMN description_discrepancies_json TEXT;")
-                except Exception:
-                    pass
-            if "description_quality" not in a_cols:
-                try:
-                    conn.execute("ALTER TABLE audit_results ADD COLUMN description_quality TEXT NOT NULL DEFAULT 'GOOD';")
-                except Exception:
-                    pass
+            specs_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='specs_cache';")
+            if specs_cursor.fetchone():
+                s_cols = [row["name"] for row in conn.execute("PRAGMA table_info(specs_cache);").fetchall()]
+                if "expires_at" not in s_cols:
+                    _try_add_column(conn, "specs_cache", "expires_at TEXT")
+                conn.execute("UPDATE specs_cache SET expires_at = datetime(fetched_at, '+30 days') WHERE expires_at IS NULL;")
 
-            # Deduplicate existing records: keep latest MAX(audit_id) per product_id
-            conn.execute("""
-                DELETE FROM audit_results 
-                WHERE audit_id NOT IN (
-                    SELECT MAX(audit_id) FROM audit_results GROUP BY product_id
-                );
-            """)
-            conn.execute("DROP INDEX IF EXISTS idx_audit_results_product;")
+            url_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='url_cache';")
+            if url_cursor.fetchone():
+                conn.execute("UPDATE url_cache SET expires_at = datetime(created_at, '+30 days') WHERE expires_at IS NULL;")
+
+            audit_cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit_results';")
+            if audit_cursor.fetchone():
+                a_cols = [row["name"] for row in conn.execute("PRAGMA table_info(audit_results);").fetchall()]
+                migrations = [
+                    ("missing_specs_json", "missing_specs_json TEXT"),
+                    ("execution_time_sec", "execution_time_sec REAL DEFAULT 0.0"),
+                    ("crawler_time_sec", "crawler_time_sec REAL DEFAULT 0.0"),
+                    ("llm_time_sec", "llm_time_sec REAL DEFAULT 0.0"),
+                    ("input_tokens", "input_tokens INTEGER DEFAULT 0"),
+                    ("output_tokens", "output_tokens INTEGER DEFAULT 0"),
+                    ("estimated_cost_usd", "estimated_cost_usd REAL DEFAULT 0.0"),
+                    ("search_trace_json", "search_trace_json TEXT"),
+                    ("images_count", "images_count INTEGER NOT NULL DEFAULT 0"),
+                    ("reference_images_count", "reference_images_count INTEGER NOT NULL DEFAULT 0"),
+                    ("images_status", "images_status TEXT NOT NULL DEFAULT 'OK'"),
+                    ("description_discrepancies_json", "description_discrepancies_json TEXT"),
+                    ("description_quality", "description_quality TEXT NOT NULL DEFAULT 'GOOD'"),
+                ]
+                for col_name, col_def in migrations:
+                    if col_name not in a_cols:
+                        _try_add_column(conn, "audit_results", col_def)
+
+                conn.execute("""
+                    DELETE FROM audit_results 
+                    WHERE audit_id NOT IN (
+                        SELECT MAX(audit_id) FROM audit_results GROUP BY product_id
+                    );
+                """)
+                conn.execute("DROP INDEX IF EXISTS idx_audit_results_product;")
+                conn.execute("DROP INDEX IF EXISTS idx_audit_results_product_unique;")
 
         conn.executescript(SCHEMA_SQL)
+        if current_version < LATEST_SCHEMA_VERSION:
+            conn.execute(f"PRAGMA user_version = {LATEST_SCHEMA_VERSION};")
         conn.commit()
+
 
 

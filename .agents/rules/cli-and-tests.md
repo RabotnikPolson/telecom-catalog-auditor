@@ -24,5 +24,6 @@ description: "CLI architecture conventions, terminal output formatting, and pyte
   - `test_stage2_photos_and_desc.py` — Photos count evaluation and description factual audit.
   - `test_stage3_search.py` — Reference resolver (5 scenarios + cascade).
   - `test_stage4_crawler_and_judge.py` — Full audit pipeline with LLM judge.
+- **Configuration Source of Truth**: All tool configurations (`mypy`, `ruff`, `pytest`) are declared centrally in `pyproject.toml`. Run checks directly (`python -m ruff check src/`, `python -m mypy`, `python -m pytest`) without ad-hoc CLI flags.
 - **Combat Testing**: Unit tests must validate real behavior and edge cases. Never create fake mock-only scripts that bypass real validation logic.
 - **Resource Cleanup in Tests**: Always close temporary SQLite databases, mock servers, and Playwright browsers.

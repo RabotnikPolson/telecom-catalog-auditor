@@ -8,11 +8,6 @@ import warnings
 from pathlib import Path
 
 warnings.filterwarnings("ignore", message=".*urllib3.*or chardet.*doesn't match a supported version.*")
-try:
-    from requests.exceptions import RequestsDependencyWarning  # type: ignore[import-untyped]
-    warnings.filterwarnings("ignore", category=RequestsDependencyWarning)
-except ImportError:
-    pass
 
 from rich.console import Console
 from rich.live import Live
@@ -35,12 +30,9 @@ from src.use_cases.resolve_reference import ResolveReferenceUseCase
 
 
 def setup_utf8_terminal() -> None:
-    if sys.platform == "win32":
-        try:
-            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-        except Exception:
-            pass
+    if sys.platform == "win32" and hasattr(sys.stdout, "buffer") and hasattr(sys.stderr, "buffer"):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 
 async def run_crawl_command(args: argparse.Namespace) -> int:
@@ -209,7 +201,6 @@ async def _live_sync_products(
                     try:
                         p = await mysql_reader.fetch_product(key)
                         if p:
-                            repo.save_product(p)
                             print(f"  [+] MySQL sync OK: Key '{key}' -> ID #{p.product_id} | Shop SKU: {p.shop_sku or 'N/A'} | {p.title[:150]}")
                             print(f"      Current specs: {len(p.current_specs)} items | Barcode: {p.barcode or 'N/A'}")
                             products.append(p)
@@ -241,11 +232,11 @@ async def _live_sync_products(
                             barcode=details.barcode,
                             current_specs=details.current_specs,
                         )
-                        repo.save_product(p)
                         print(f"  [+] Web crawl OK: SKU/ID '{key}' -> ID #{p.product_id} | Shop SKU: {p.shop_sku or 'N/A'} | {p.title[:50]}")
                         print(f"      Current specs on store: {len(p.current_specs)} items.")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    p = None
+                    _ = exc
 
                 if not p:
                     p = repo.find_product(key)
@@ -422,7 +413,6 @@ async def run_live_test_command(args: argparse.Namespace) -> int:
                     barcode=details.barcode,
                     current_specs=details.current_specs,
                 )
-                repo.save_product(product)
                 saved_products.append(product)
 
                 print(f"[{idx:02d}/{len(product_ids)}] ID #{pid} | Shop SKU: {product.shop_sku or 'N/A'} | {product.title[:45]}")
@@ -610,7 +600,7 @@ async def run_audit_command(args: argparse.Namespace) -> int:
                 try:
                     p.master_key = grouper.extract_master_key(p.title, p.current_specs)
                 except Exception:
-                    pass
+                    p.master_key = f"pid_{p.product_id}"
     else:
         source_mode = getattr(args, "source", "mysql")
         products = []
@@ -678,8 +668,13 @@ async def run_audit_command(args: argparse.Namespace) -> int:
                 print(f"[!] MySQL streaming error: {e}. Falling back to local DB.")
 
         if not products:
-            db_candidates = repo.get_auditable_products(limit=target_limit * 4, offset=getattr(args, "offset", 0) or 0)
-            if db_candidates:
+            cur_db_offset = getattr(args, "offset", 0) or 0
+            chunk_size = max(100, target_limit * 4)
+            while len(products) < target_limit:
+                db_candidates = repo.get_auditable_products(limit=chunk_size, offset=cur_db_offset)
+                if not db_candidates:
+                    break
+                cur_db_offset += len(db_candidates)
                 grouper.group_products(db_candidates)
                 for prod in db_candidates:
                     if not prod.is_master:
@@ -696,6 +691,8 @@ async def run_audit_command(args: argparse.Namespace) -> int:
                     products.append(prod)
                     if len(products) >= target_limit:
                         break
+                if len(db_candidates) < chunk_size:
+                    break
 
         if not products:
             print("[*] No un-audited master products found (all audited or none match filter).")
