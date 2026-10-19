@@ -17,7 +17,11 @@ ENV/
 .DS_Store
 Thumbs.db
 scratch/
+plans/
 
 *.md
+!AGENTS.md
+!.agents/**/*.md
 *.csv
 *.xlsx
+*.db-journal
