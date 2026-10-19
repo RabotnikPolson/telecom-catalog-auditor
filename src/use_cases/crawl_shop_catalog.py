@@ -4,7 +4,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from src.adapters.catalog.mysql_reader import MySQLCatalogReader
-from src.adapters.catalog.telecom_crawler import LeafCategory, TelecomShopCrawler
+from src.adapters.catalog.telecom_crawler import (
+    CatalogItemPreview,
+    LeafCategory,
+    TelecomShopCrawler,
+)
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
 from src.domain.entities import AuditStatus, Product
 
@@ -124,6 +128,8 @@ class CrawlShopCatalogUseCase:
         limit: int | None = None,
         force_rescan: bool = False,
     ) -> None:
+        assert self.repo is not None
+        assert self.crawler is not None
         cat_key = category.category_key
         state = self.repo.get_crawler_state(cat_key)
 
@@ -177,10 +183,12 @@ class CrawlShopCatalogUseCase:
                         stats.products_skipped += 1
                     elif is_updated:
                         stats.products_updated += 1
-                        products_to_upsert.append(product_obj)
+                        if product_obj is not None:
+                            products_to_upsert.append(product_obj)
                     else:
                         stats.products_added += 1
-                        products_to_upsert.append(product_obj)
+                        if product_obj is not None:
+                            products_to_upsert.append(product_obj)
                 except Exception as exc:
                     err_msg = f"Error processing product #{preview.product_id}: {exc}"
                     stats.errors.append(err_msg)
@@ -208,8 +216,10 @@ class CrawlShopCatalogUseCase:
             current_page += 1
 
     async def _process_product(
-        self, preview
+        self, preview: CatalogItemPreview
     ) -> tuple[Product | None, bool, bool]:
+        assert self.repo is not None
+        assert self.crawler is not None
         existing = self.repo.get_product_by_id(preview.product_id)
 
         try:

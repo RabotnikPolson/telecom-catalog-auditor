@@ -108,7 +108,11 @@ class SerperClient:
                     response = await client.post(self.BASE_URL, json=payload, headers=headers)
                     if response.status_code == 200:
                         data = response.json()
-                        return data.get("organic", [])
+                        if isinstance(data, dict):
+                            organic = data.get("organic")
+                            if isinstance(organic, list):
+                                return [item for item in organic if isinstance(item, dict)]
+                        return []
                     elif response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
                         await asyncio.sleep(0.5 * (attempt + 1))
                         continue

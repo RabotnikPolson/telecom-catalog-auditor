@@ -34,7 +34,7 @@ class VendorDirectResolver:
             return None
 
         template = profile.get("search_url_template")
-        if not template:
+        if not isinstance(template, str):
             return None
 
         return template.format(vendor_sku=clean_sku)
@@ -66,7 +66,7 @@ class VendorDirectResolver:
             if self._last_checked_response and self._last_checked_response[0] == search_url:
                 response = self._last_checked_response[1]
             else:
-                response = await client.get(search_url) if client else None
+                response = await client.get(search_url)
 
             if not response or response.status_code >= 400:
                 return VendorResolutionResult(is_available=False, reference_url=None)

@@ -26,6 +26,9 @@ class CatalogItemPreview:
     vendor_sku: str | None = None
 
 
+ProductPreview = CatalogItemPreview
+
+
 @dataclass
 class CategoryPageResult:
     category_path: str
@@ -260,7 +263,7 @@ class TelecomShopCrawler:
 
     async def fetch_product_details(
         self, product_url_or_id: str | int
-    ) -> ProductDetailResult:
+    ) -> ProductDetailResult | None:
         if isinstance(product_url_or_id, int) or (
             isinstance(product_url_or_id, str) and product_url_or_id.isdigit()
         ):
@@ -286,7 +289,7 @@ class TelecomShopCrawler:
 
     def _parse_product_details_html(
         self, page_html: str, url: str, pid_hint: int = 0
-    ) -> ProductDetailResult:
+    ) -> ProductDetailResult | None:
         pid = pid_hint
         if pid <= 0:
             m = re.search(r"/product/(\d+)", url)

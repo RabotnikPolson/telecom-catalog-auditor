@@ -3,6 +3,7 @@ import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from src.domain.entities import (
     AuditResult,
@@ -259,7 +260,8 @@ class SQLiteProductRepository:
         sql = "SELECT COUNT(*) FROM products;"
         with get_sqlite_connection(self.db_path) as conn:
             cursor = conn.execute(sql)
-            return cursor.fetchone()[0]
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
 
     def get_audited_product_ids(self) -> set[int]:
         sql = "SELECT DISTINCT product_id FROM audit_results;"
@@ -470,7 +472,7 @@ class SQLiteProductRepository:
             )
             conn.commit()
 
-    def get_crawler_state(self, category_key: str) -> dict | None:
+    def get_crawler_state(self, category_key: str) -> dict[str, Any] | None:
         sql = "SELECT * FROM crawler_state WHERE category_key = ?;"
         with get_sqlite_connection(self.db_path) as conn:
             cursor = conn.execute(sql, (category_key,))
@@ -493,7 +495,7 @@ class SQLiteProductRepository:
                 conn.execute("DELETE FROM crawler_state;")
             conn.commit()
 
-    def get_all_crawler_states(self) -> list[dict]:
+    def get_all_crawler_states(self) -> list[dict[str, Any]]:
         sql = "SELECT * FROM crawler_state ORDER BY updated_at DESC;"
         with get_sqlite_connection(self.db_path) as conn:
             cursor = conn.execute(sql)

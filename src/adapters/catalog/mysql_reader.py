@@ -1,9 +1,9 @@
 import logging
 from collections import defaultdict
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
-import aiomysql
+import aiomysql  # type: ignore[import-untyped]
 
 from config.settings import Settings, get_settings
 from src.domain.entities import AuditStatus, Product
@@ -341,7 +341,7 @@ class MySQLCatalogReader:
                     ORDER BY active_count DESC;
                 """
                 await cur.execute(query)
-                return await cur.fetchall()
+                return cast(list[dict[str, Any]], await cur.fetchall())
 
     async def get_groups(
         self,
@@ -383,7 +383,7 @@ class MySQLCatalogReader:
                     ORDER BY active_count DESC;
                 """
                 await cur.execute(query, tuple(params))
-                return await cur.fetchall()
+                return cast(list[dict[str, Any]], await cur.fetchall())
 
     async def stream_products(
         self,

@@ -9,7 +9,7 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore", message=".*urllib3.*or chardet.*doesn't match a supported version.*")
 try:
-    from requests.exceptions import RequestsDependencyWarning
+    from requests.exceptions import RequestsDependencyWarning  # type: ignore[import-untyped]
     warnings.filterwarnings("ignore", category=RequestsDependencyWarning)
 except ImportError:
     pass
@@ -50,11 +50,11 @@ async def run_crawl_command(args: argparse.Namespace) -> int:
     repo = SQLiteProductRepository(db_path)
     settings = get_settings()
 
+    def on_progress(msg: str) -> None:
+        print(f"  [+] {msg}")
+
     source = getattr(args, "source", "mysql")
     if source == "mysql" and settings.MYSQL_HOST:
-        def on_progress(msg: str) -> None:
-            print(f"  [+] {msg}")
-
         print("=" * 70)
         print("TELECOM CATALOG AUDITOR :: HIGH-SPEED MYSQL INGESTION")
         print("=" * 70)
@@ -92,9 +92,6 @@ async def run_crawl_command(args: argparse.Namespace) -> int:
         delay_max=args.delay_max,
         max_concurrency=args.concurrency,
     )
-
-    def on_progress(msg: str) -> None:
-        print(f"  [+] {msg}")
 
     print("=" * 70)
     print("TELECOM CATALOG AUDITOR :: STAGE 2 NIGHT CRAWLER")
@@ -413,6 +410,8 @@ async def run_live_test_command(args: argparse.Namespace) -> int:
             url = f"https://shop.telecom.kz/product/{pid}"
             try:
                 details = await crawler.fetch_product_details(url)
+                if not details:
+                    continue
                 product = Product(
                     product_id=details.product_id,
                     shop_sku=details.shop_sku,
@@ -617,7 +616,7 @@ async def run_audit_command(args: argparse.Namespace) -> int:
         products = []
         skip_audited = getattr(args, "skip_audited", True) and not getattr(args, "force_refresh", False)
         audited_ids: set[int] = set()
-        audited_master_keys: set[str] = set()
+        audited_master_keys = set()
         if skip_audited:
             audited_ids = repo.get_audited_product_ids()
             audited_master_keys = repo.get_audited_master_keys()
