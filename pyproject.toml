@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telecom-catalog-auditor"
+version = "1.0.0"
+description = "Autonomous Python 3.13 microservice for factual catalog auditing using Clean Architecture"
+readme = "TECHNICAL_SPECIFICATION.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.5.0",
+    "anyio>=4.0.0",
+    "python-dotenv>=1.0.1",
+    "httpx>=0.27.0",
+    "playwright>=1.49.0",
+    "crawl4ai>=0.9.0",
+    "pymysql>=1.1.0",
+    "aiomysql>=0.2.0",
+    "rich>=13.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "mypy>=1.13.0",
+    "ruff>=0.8.0",
+]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+files = ["src"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E9",   # Syntax & runtime errors
+    "F",    # Pyflakes fatal errors
+    "UP",   # Pyupgrade modern Python 3.13 typing & idioms
+    "I",    # isort import ordering
+]
+ignore = [
+    "UP042", # Preserve Enum, str inheritance for Pydantic v2 JSON serialization compatibility
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src", "config"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::ResourceWarning",
+]

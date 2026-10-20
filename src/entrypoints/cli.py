@@ -623,6 +623,8 @@ async def run_audit_command(args: argparse.Namespace) -> int:
         grouper = ParentChildGrouper()
         seen_batch_master_keys: set[str] = set()
         skipped_count = 0
+        mysql_stream_succeeded = False
+        has_category_filter = bool(group_id or main_cat_id)
 
         if source_mode == "mysql" and settings.MYSQL_HOST:
             filter_desc = []
@@ -664,10 +666,19 @@ async def run_audit_command(args: argparse.Namespace) -> int:
                                 break
                         if len(products) >= target_limit:
                             break
+                mysql_stream_succeeded = True
             except Exception as e:
                 print(f"[!] MySQL streaming error: {e}. Falling back to local DB.")
 
-        if not products:
+        if has_category_filter and not products:
+            category_label = desc_str.strip(" ()") if desc_str else "specified category"
+            if mysql_stream_succeeded:
+                print(f"[*] No un-audited master products found for {category_label} (all audited or none match filter).")
+                return 0
+            print(f"[!] Cannot fallback to local DB for {category_label}: local SQLite does not store category mappings.")
+            return 1
+
+        if not products and not mysql_stream_succeeded:
             cur_db_offset = getattr(args, "offset", 0) or 0
             chunk_size = max(100, target_limit * 4)
             while len(products) < target_limit:
