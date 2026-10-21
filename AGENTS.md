@@ -13,6 +13,8 @@ Autonomous Python 3.13+ microservice for factual auditing of `shop.telecom.kz` (
 ## 1. CORE ARCHITECTURAL INVARIANTS (NON-NEGOTIABLE)
 - **Stack & Types**: Python 3.13+, Pydantic v2 (`ConfigDict(frozen=True, extra="ignore")`), explicit `str | None` (no `Optional`/`Any`). Pass all dependencies via `__init__` (zero global state).
 - **SQLite JIT Persistence ONLY**: Remote MySQL (`READ ONLY`, `READ UNCOMMITTED`) is the source of truth. Bulk-inserting catalog items (`repo.batch_upsert` during streaming) is **STRICTLY FORBIDDEN**. Save to SQLite `products` ONLY inside `AuditProductUseCase.audit_product(prod)` right before writing `audit_results`.
+- **Schema Safety**: Migrations must work on existing `catalog_audit.db`. Never drop unique indexes backing `ON CONFLICT`. Bump `PRAGMA user_version` on schema change.
+- **Category Fallback Ban**: Local SQLite has no category data — with `--group`/`--main-cat` never fall back to it; if MySQL finds nothing, exit 0.
 - **In-Memory & O(1) Hygiene**: Master/child grouping (`ParentChildGrouper`) and `--skip-audited` SHA-256 hash checks run 100% in RAM. **Zero N+1 queries** inside loops.
 - **Resource Lifecycle**:
   - `httpx.AsyncClient`: Always close in `try...finally: if should_close: await client.aclose()`. No early `return` before `try...finally`.

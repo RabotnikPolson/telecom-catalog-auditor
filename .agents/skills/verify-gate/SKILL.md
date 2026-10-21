@@ -1,6 +1,6 @@
 ---
 name: verify-gate
-description: Runs the mandatory Windows PowerShell verification gate (ruff and pytest live combat tests). Use this before finishing any code modification or when the user asks to test/validate the project.
+description: Runs the mandatory Windows PowerShell verification gate (ruff, pytest, mypy, and a CLI smoke test on a copy of catalog_audit.db). Use this before finishing any code modification or when the user asks to test/validate the project.
 ---
 
 # Mandatory Verification Gate

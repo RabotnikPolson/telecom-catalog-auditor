@@ -27,6 +27,7 @@ Inspect the modified files and fail the audit if ANY of the following is violate
 - [ ] Explicit Python 3.13 type hints (`str | None`), returns domain entities (not raw dicts).
 - [ ] Constructor Dependency Injection only (zero global state).
 - [ ] **NO `repo.batch_upsert`** during catalog streaming (SQLite JIT write only).
+- [ ] Schema migrations keep unique indexes backing `ON CONFLICT`; no local SQLite fallback with `--group`/`--main-cat`.
 - [ ] All `httpx.AsyncClient`, Playwright pages, and MySQL cursors are closed inside `try...finally` without early returns leaking resources.
 - [ ] Vendor HTTP checks use `timeout <= 2.0s` and reuse `_last_checked_response`.
 - [ ] Playwright `WebCrawler` aborts media/fonts and NEVER uses `networkidle`.

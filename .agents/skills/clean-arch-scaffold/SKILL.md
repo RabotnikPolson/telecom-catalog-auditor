@@ -14,11 +14,19 @@ description: Domain contracts for Reference Resolution (5 scenarios), OpenAI NLI
 - **Model**: OpenAI `gpt-6-luna` (configured via `config/settings.py`) via `httpx`, `reasoning_effort="low"`, `response_format={"type": "json_object"}` (NO custom `temperature`). Rates: $0.10/1M in ($0.05 cached), $0.50/1M out.
 - **No Regex Heuristics**: Never filter sub-modifications via regex; require exact `proof_quote` from LLM NLI prompt. Print CLI output sequentially.
 
-## 3. Two-Level SQLite Caching
+## 3. SQLite Persistence & Two-Level Caching
+- **Connections**: Always `with get_sqlite_connection(db_path) as conn:` (auto commit/rollback/close). Per-connection PRAGMAs: `busy_timeout = 15000` first, then `foreign_keys`, `synchronous = NORMAL`, `temp_store`, `cache_size`, `mmap_size`.
+- **WAL**: `journal_mode = WAL` and `wal_autocheckpoint` are set once in `init_db`, NOT per connection.
+- **Schema Versioning**: `PRAGMA user_version` (`LATEST_SCHEMA_VERSION` in `schema.py`); migrations run conditionally in `init_db`.
+- **Atomic JIT Write**: `repo.save_product_and_audit_result(product, result)` — one transaction, `RETURNING audit_id`.
 - `url_cache`: Key = `SHA256("ref:{product_id}:{normalized_query}")` → `resolved_url`.
 - `specs_cache`: Key = `resolved_url` → extracted specs JSON.
 
-## 4. Scaffolding New Components
+## 4. MySQL Streaming (`mysql_reader.py`)
+- **Keyset Pagination**: `p.id > %s ORDER BY p.id ASC LIMIT %s` (no deep OFFSET).
+- **Per-Batch Connection**: acquire from pool per batch and release BEFORE `yield`.
+
+## 5. Scaffolding New Components
 - **New UseCase (`src/use_cases/<name>.py`)**: Inject repos/gateways via `__init__`, implement `async def`, return Domain Entities, add test in `tests/test_stage_N.py`.
 - **New Adapter (`src/adapters/<name>/`)**: Use `asyncio.Semaphore` for rate limits, close clients in `try...finally`, raise `DomainException`.
 - **New Vendor Profile**: Add entry with `search_url_template` to `config/vendor_profiles.py` and verify via `python main.py resolve --product-id <ID>`.
