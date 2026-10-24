@@ -106,6 +106,45 @@ def _make_openai_resp(
 class TestOpenAIJudge:
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("cached_tokens", "expected_cost"),
+        [(400_000, 0.164), (0, 0.20), (1_000_000, 0.11)],
+    )
+    async def test_judge_estimated_cost_uses_cached_input_rate(
+        self, sample_product: Product, cached_tokens: int, expected_cost: float
+    ) -> None:
+        judge = OpenAIJudge(api_key="test-key")
+        mock_output = LLMJudgeOutput(
+            status="VERIFIED",
+            confidence_score=0.98,
+            matched_specs_count=3,
+            total_specs_count=3,
+            discrepancies=[],
+            details="All specs match reference",
+        )
+        mock_resp = _make_openai_resp(
+            mock_output.model_dump_json(),
+            prompt_tokens=1_000_000,
+            completion_tokens=200_000,
+            cached_tokens=cached_tokens,
+        )
+
+        try:
+            with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp):
+                result = await judge.judge(
+                    product=sample_product,
+                    reference_url="https://example.com/item",
+                    external_markdown="* Емкость: 2200 мАч",
+                )
+
+            assert result.status == AuditStatus.VERIFIED
+            assert result.input_tokens == 1_000_000
+            assert result.output_tokens == 200_000
+            assert result.estimated_cost_usd == pytest.approx(expected_cost)
+        finally:
+            await judge.aclose()
+
+    @pytest.mark.anyio
     async def test_judge_returns_error_when_no_api_key(
         self, sample_product: Product
     ) -> None:

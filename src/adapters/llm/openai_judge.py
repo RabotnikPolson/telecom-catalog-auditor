@@ -445,12 +445,12 @@ class OpenAIJudge:
 
             # gpt-6-luna pricing:
             # uncached input: $0.10 / 1M ($0.00000010)
-            # cached input:   $0.05 / 1M ($0.00000005)
+            # cached input:   $0.01 / 1M ($0.00000001)
             # completion:     $0.50 / 1M ($0.00000050)
             uncached_tokens = max(0, input_tokens - cached_tokens)
             cost_usd = (
                 (uncached_tokens * 0.00000010)
-                + (cached_tokens * 0.00000005)
+                + (cached_tokens * 0.00000001)
                 + (output_tokens * 0.00000050)
             )
 

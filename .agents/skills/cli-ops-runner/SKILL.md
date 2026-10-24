@@ -5,6 +5,8 @@ description: Reference for running main.py CLI commands (categories, crawl, reso
 
 # CLI Operations & Debugging Guide
 
+Select automatically for CLI operations and product debugging. Commands below are reference examples, not authorization for bulk runs. For debugging use `--limit 1` and an explicit verification SQLite copy via `--db`; never mutate the original DB merely to inspect it. MySQL remains READ ONLY. Category filters never fall back to local SQLite. Do not run commands in `core` or touch shop/production data.
+
 ## 1. Catalog & Categories Navigation
 ```powershell
 # Show active main categories
@@ -22,7 +24,7 @@ python main.py categories --search "роутер"
 # Night crawler: fetch from web display
 python main.py crawl --source crawler --category smartfony-i-aksessuary/telefony --limit 50
 
-# Fast MySQL sync: stream directly from shop database (recommended for bulk)
+# Stream from MySQL (no bulk SQLite product upsert; JIT persistence rule still applies)
 python main.py crawl --source mysql --limit 5000
 ```
 
@@ -43,7 +45,7 @@ python main.py audit --sku 417095
 # Batch audit by group ID with incremental skip
 python main.py audit --group 78 --limit 10 --skip-audited
 
-# Fast photos-only compliance audit (offline, zero LLM calls)
+# Photos-only compliance audit (zero LLM calls; catalog lookup may use MySQL)
 python main.py audit --group 78 --limit 50 --photos-only
 
 # Audit specs & photos only (skip description evaluation)
@@ -67,12 +69,5 @@ python main.py live-test --db catalog_audit.db --limit 10
 
 ## 6. Single Product Debugging
 - Add `--limit 1` to process only one item.
-- Add `--no-headless` to visually observe Playwright navigation.
-- Check SQLite database state:
-```python
-from src.adapters.db.sqlite_repo import SQLiteProductRepository
-repo = SQLiteProductRepository("catalog_audit.db")
-products = repo.get_auditable_products(limit=5)
-for p in products:
-    print(f"ID: {p.product_id} | Hash: {p.content_hash[:16]}... | Status: {p.status}")
-```
+- `audit --no-headless` can show Playwright navigation; this flag is not exposed by every subcommand. Check `<subcommand> --help` first.
+- Inspect SQLite through read-only queries (`sqlite3.connect('file:catalog_audit.db?mode=ro', uri=True)`) with explicit connection cleanup. Avoid repository initialization for read-only inspection because it may migrate/write the database. Do not add root debug scripts or non-CLI `print()` calls.

@@ -1,10 +1,6 @@
----
-trigger: glob
-globs: "main.py, src/entrypoints/**/*.py, tests/**/*.py"
-description: "CLI architecture conventions, terminal output formatting, and pytest test suite rules"
----
-
 # CLI & Testing Guidelines
+
+Read automatically via `AGENTS.md` for `main.py`, `src/entrypoints/**/*.py`, or `tests/**/*.py`. This is a development reference, not a Codex command-permission rule.
 
 ## 1. CLI Conventions (`src/entrypoints/cli.py`, `main.py`)
 - **UTF-8 Output**: Always call `setup_utf8_terminal()` at CLI entry before any terminal output.
@@ -12,6 +8,7 @@ description: "CLI architecture conventions, terminal output formatting, and pyte
 - **On-the-Fly Live Sync Priority**:
   When `--sku`, `--product-id`, or `--url` is passed, refresh products in this strict order:
   `MySQL (if configured) -> web crawler fetch -> local SQLite fallback`.
+  Category exception from `AGENTS.md`: with `--group` or `--main-cat`, never fall back to SQLite; when MySQL finds nothing, exit 0.
 - **Error Handling**: Catch operational exceptions gracefully and display structured status without crashing the process or swallowing traceback logs in debug mode.
 
 ## 2. Testing Framework & Invariants (`tests/`)
@@ -24,6 +21,7 @@ description: "CLI architecture conventions, terminal output formatting, and pyte
   - `test_stage2_photos_and_desc.py` — Photos count evaluation and description factual audit.
   - `test_stage3_search.py` — Reference resolver (5 scenarios + cascade).
   - `test_stage4_crawler_and_judge.py` — Full audit pipeline with LLM judge.
-- **Configuration Source of Truth**: All tool configurations (`mypy`, `ruff`, `pytest`) are declared centrally in `pyproject.toml`. Run checks directly (`python -m ruff check src/`, `python -m mypy`, `python -m pytest`) without ad-hoc CLI flags.
+- **Configuration Source of Truth**: All tool configurations (`mypy`, `ruff`, `pytest`) are declared centrally in `pyproject.toml`. Run checks directly (`python -m ruff check src/`, `python -m mypy`, `python -m pytest`) without ad-hoc configuration overrides. Report-output flags such as `--junitxml=<run-owned-path>` are allowed without changing full-gate collection/selection. Approved focused behavior checks may select the agreed test cases separately.
 - **Combat Testing**: Unit tests must validate real behavior and edge cases. Never create fake mock-only scripts that bypass real validation logic.
 - **Resource Cleanup in Tests**: Always close temporary SQLite databases, mock servers, and Playwright browsers.
+- **Full Gate**: Implementer and independent auditor each run `verify-gate` including configured live tests. Focused mocked responses test real behavior but never replace live coverage. Report skips/unavailability and limit automatic repairs to the approved scope.

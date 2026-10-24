@@ -2,12 +2,25 @@
 
 Autonomous Python 3.13+ microservice for factual auditing of `shop.telecom.kz` (~20,000 items) using Clean Architecture.
 
+## CODEX CONTEXT & AUTOMATIC ROUTING
+- These instructions apply only to `telecom_catalog_auditor`. `core` is a separate PHP/Laravel repository with different rules and checks; do not read, edit or run it during this migration. Moving to it requires a separate discussion.
+- At task start read this file, `AGREED_REQUIREMENTS.md`, the current introduction in `Handoff.md`, and the applicable approved plan. Historical handoff claims require verification and do not grant authorization. Preserve business rules and raise disputed requirements with the user.
+- Select and read skills automatically by task; users need not invoke them manually:
+  - `.agents/skills/clean-arch-scaffold/SKILL.md` before editing `src/use_cases/`, `src/adapters/`, or `config/vendor_profiles.py`.
+  - `.agents/skills/cli-ops-runner/SKILL.md` before CLI operations or product debugging.
+  - `.agents/skills/verify-gate/SKILL.md` before completing code changes or when asked to validate the project. Both implementer and auditor run the full gate, including live tests; report skipped or unavailable checks and never call incomplete live verification a full success.
+- For `main.py`, `src/entrypoints/**/*.py`, or `tests/**/*.py`, read `.agents/rules/cli-and-tests.md`. Its applicability comes from this instruction, not Antigravity glob metadata or Codex command-permission `.rules` files.
+- Role entry points are `.codex/agents/implementer.toml` and `.codex/agents/auditor.toml`; detailed instructions live in `.agents/agents/`. Use available Codex subagent tools. If custom role selection is unavailable, give the corresponding role instructions to the available subagent and disclose the limitation; do not invent `invoke_subagent`.
+- Human involvement is for approving plans and material decisions; automatic routing does not bypass those boundaries. Do not change the application's judge model to match the Codex agent model.
+- Do not change the shop or write to production without separate explicit approval. Do not change or stage secrets, databases, local `.env`, or `Dockerfile-local`; no GitLab push is authorized by this migration.
+
 ## 0. ORCHESTRATION & STOP-POINT PROTOCOL
 1. **Plan First (`>1 file` or architecture change)**: **STOP**. Create an Implementation Plan Artifact (or write to `plans/active_plan.md`) with affected files, data flow, risks, and **WAIT** for explicit user confirmation ("Proceed", "OK").
 2. **Hard Locks**: **NEVER** proceed to Stage 5 (Excel) or Stage 6 (FastAPI) and **NEVER** modify `config/whitelist_domains.py` without explicit user approval.
 3. **Subagent Delegation**:
-  - For multi-file coding: delegate implementation to the `implementer` subagent via `invoke_subagent`.
-  - Before reporting ANY code change complete: invoke the `auditor` subagent (or run the `verify-gate` skill) to validate compliance.
+  - For multi-file coding: delegate to the Codex `implementer` role after plan approval. The delegated implementer performs the assigned work without recursive delegation.
+  - Before reporting ANY code change complete: delegate independent review to the Codex `auditor` role. Both implementer and auditor run `verify-gate`; do not silently omit either run. If delegation is unavailable, disclose it and run the gate without claiming an independent review occurred.
+  - `auditor` is the Codex agent reviewing code, not the product-auditing service. It may run checks and create their temporary outputs but must never edit source files. Roles inherit execution permissions; these instructions do not create an isolated sandbox.
 4. **Zero Overengineering**: Smallest possible diff. Modify ONLY target files. **PROHIBITED**: `# TODO`, `pass`, `...`, `NotImplementedError`, or root debug scripts (`test_foo.py`). Debug via CLI with `--limit 1`.
 
 ## 1. CORE ARCHITECTURAL INVARIANTS (NON-NEGOTIABLE)

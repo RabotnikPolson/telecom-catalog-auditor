@@ -11,7 +11,7 @@ description: Domain contracts for Reference Resolution (5 scenarios), OpenAI NLI
 - **Concurrency & Timeouts**: Run vendor check (`timeout=2.0s`, cache in `_last_checked_response`) and Serper cascade in parallel via `asyncio.gather`. Return full sorted `candidate_urls` pool (`Kaspi -> DNS -> Official -> Whitelisted`).
 
 ## 2. Semantic NLI Arbitrage (`openai_judge.py`)
-- **Model**: OpenAI `gpt-6-luna` (configured via `config/settings.py`) via `httpx`, `reasoning_effort="low"`, `response_format={"type": "json_object"}` (NO custom `temperature`). Rates: $0.10/1M in ($0.05 cached), $0.50/1M out.
+- **Model**: OpenAI `gpt-6-luna` (configured via `config/settings.py`) via `httpx`, `reasoning_effort="low"`, `response_format={"type": "json_object"}` (NO custom `temperature`). Rates: $0.10/1M input, $0.01/1M cached input, $0.50/1M output ([official model documentation](https://developers.openai.com/api/docs/models/gpt-6-luna), checked 24.10.2026). Price updates do not authorize model changes.
 - **No Regex Heuristics**: Never filter sub-modifications via regex; require exact `proof_quote` from LLM NLI prompt. Print CLI output sequentially.
 
 ## 3. SQLite Persistence & Two-Level Caching
@@ -28,8 +28,8 @@ description: Domain contracts for Reference Resolution (5 scenarios), OpenAI NLI
 
 ## 5. Scaffolding New Components
 - **New UseCase (`src/use_cases/<name>.py`)**: Inject repos/gateways via `__init__`, implement `async def`, return Domain Entities, add test in `tests/test_stage_N.py`.
-- **New Adapter (`src/adapters/<name>/`)**: Use `asyncio.Semaphore` for rate limits, close clients in `try...finally`, raise `DomainException`.
-- **New Vendor Profile**: Add entry with `search_url_template` to `config/vendor_profiles.py` and verify via `python main.py resolve --product-id <ID>`.
+- **New Adapter (`src/adapters/<name>/`)**: Use `asyncio.Semaphore` for rate limits, close clients in `try...finally`, raise the existing `DomainError` or a relevant subtype from `src/domain/exceptions.py`.
+- **New Vendor Profile**: Add entry with `search_url_template` to `config/vendor_profiles.py` and verify via `python main.py resolve --product-id <ID> --limit 1 --db <verification-copy.db>` after reading `cli-ops-runner`; this does not authorize whitelist changes.
 
 ### Starter UseCase Template:
 ```python
@@ -52,7 +52,8 @@ class SampleUseCase:
 ```python
 import asyncio
 import httpx
-from src.domain.exceptions import DomainException
+from src.domain.entities import Product
+from src.domain.exceptions import DomainError
 
 
 class SampleApiAdapter:
@@ -60,7 +61,7 @@ class SampleApiAdapter:
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._client: httpx.AsyncClient | None = None
 
-    async def fetch_data(self, url: str) -> dict[str, str]:
+    async def fetch_product(self, url: str) -> Product:
         should_close = False
         client = self._client
         if client is None:
@@ -70,9 +71,9 @@ class SampleApiAdapter:
             async with self._semaphore:
                 response = await client.get(url)
                 response.raise_for_status()
-                return response.json()
+                return Product.model_validate(response.json())
         except Exception as e:
-            raise DomainException(f"Adapter fetch failed: {e}") from e
+            raise DomainError(f"Adapter fetch failed: {e}") from e
         finally:
             if should_close:
                 await client.aclose()

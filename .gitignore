@@ -21,7 +21,10 @@ plans/
 
 *.md
 !AGENTS.md
+!Handoff.md
+!AGREED_REQUIREMENTS.md
 !.agents/**/*.md
 *.csv
 *.xlsx
 *.db-journal
+.codex/
