@@ -6,7 +6,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-LATEST_SCHEMA_VERSION: int = 3
+LATEST_SCHEMA_VERSION: int = 4
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS products (
@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS audit_results (
     output_tokens INTEGER DEFAULT 0,
     estimated_cost_usd REAL DEFAULT 0.0,
     search_trace_json TEXT,
+    audit_parts_json TEXT,
     FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE CASCADE
 );
 
@@ -187,18 +188,20 @@ def init_db(db_path: str | Path) -> None:
                     ("images_status", "images_status TEXT NOT NULL DEFAULT 'OK'"),
                     ("description_discrepancies_json", "description_discrepancies_json TEXT"),
                     ("description_quality", "description_quality TEXT NOT NULL DEFAULT 'GOOD'"),
+                    ("audit_parts_json", "audit_parts_json TEXT"),
                 ]
                 for col_name, col_def in migrations:
                     if col_name not in a_cols:
                         _try_add_column(conn, "audit_results", col_def)
 
-                conn.execute("""
-                    DELETE FROM audit_results 
-                    WHERE audit_id NOT IN (
-                        SELECT MAX(audit_id) FROM audit_results GROUP BY product_id
-                    );
-                """)
-                conn.execute("DROP INDEX IF EXISTS idx_audit_results_product;")
+                if current_version < 3:
+                    conn.execute("""
+                        DELETE FROM audit_results
+                        WHERE audit_id NOT IN (
+                            SELECT MAX(audit_id) FROM audit_results GROUP BY product_id
+                        );
+                    """)
+                    conn.execute("DROP INDEX IF EXISTS idx_audit_results_product;")
 
         conn.executescript(SCHEMA_SQL)
         if current_version < LATEST_SCHEMA_VERSION:

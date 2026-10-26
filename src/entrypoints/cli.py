@@ -201,6 +201,7 @@ async def _live_sync_products(
                     try:
                         p = await mysql_reader.fetch_product(key)
                         if p:
+                            p.images_count_known = True
                             print(f"  [+] MySQL sync OK: Key '{key}' -> ID #{p.product_id} | Shop SKU: {p.shop_sku or 'N/A'} | {p.title[:150]}")
                             print(f"      Current specs: {len(p.current_specs)} items | Barcode: {p.barcode or 'N/A'}")
                             products.append(p)
@@ -458,23 +459,34 @@ async def run_live_test_command(args: argparse.Namespace) -> int:
 
 
 class AuditTUI:
-    def __init__(self, console: Console, total_products: int, concurrency: int) -> None:
+    def __init__(self, console: Console, total_products: int, concurrency: int, photos_only: bool = False) -> None:
         self.console = console
         self.total = total_products
         self.concurrency = concurrency
+        self.photos_only = photos_only
         self.completed = 0
         self.verified_count = 0
         self.mismatch_count = 0
         self.missing_specs_count = 0
         self.not_found_count = 0
         self.error_count = 0
+        self.photo_checked_count = 0
+        self.photo_issue_count = 0
         self.worker_status: dict[int, str] = {w: "Waiting..." for w in range(1, concurrency + 1)}
 
     def set_worker_status(self, worker_id: int, status_text: str) -> None:
         self.worker_status[worker_id] = status_text
 
-    def record_completed(self, status: AuditStatus) -> None:
+    def record_completed(self, status: AuditStatus, photos_only: bool = False, photos_error: bool = False, images_status: str = "OK") -> None:
         self.completed += 1
+        if photos_only:
+            if photos_error:
+                self.error_count += 1
+            else:
+                self.photo_checked_count += 1
+                if images_status != "OK":
+                    self.photo_issue_count += 1
+            return
         if status == AuditStatus.VERIFIED:
             self.verified_count += 1
         elif status == AuditStatus.MISMATCH:
@@ -500,6 +512,13 @@ class AuditTUI:
             f"[bold magenta]Not Found: {self.not_found_count}[/bold magenta] | "
             f"[bold red]Errors: {self.error_count}[/bold red]"
         ]
+        if self.photos_only:
+            lines = [
+                f"[bold cyan]Progress:[/bold cyan] \\[{self.completed:02d}/{self.total:02d}] \\[{bar}] {pct}% | "
+                f"[bold green]Photos checked: {self.photo_checked_count}[/bold green] | "
+                f"[bold yellow]Photo issues: {self.photo_issue_count}[/bold yellow] | "
+                f"[bold red]Errors: {self.error_count}[/bold red]"
+            ]
         if self.concurrency > 1:
             lines.append("")
             for w in range(1, self.concurrency + 1):
@@ -521,6 +540,19 @@ def format_audit_card(idx: int, total_count: int, prod: Product, result: AuditRe
     lines.append(f"\\[{idx:02d}/{total_count}] Product ID #{prod.product_id} | {escape(prod.title[:150])}")
     lines.append(f"      Shop SKU: {escape(prod.shop_sku or 'N/A')} | Vendor SKU: {escape(prod.vendor_sku or 'N/A')} | Barcode: {escape(prod.barcode or 'N/A')}")
     lines.append(f"      Shop URL: https://shop.telecom.kz/product/{prod.product_id}")
+    if result.photos_only_run:
+        lines.append("      Проверка только фото")
+        if result.photos_error:
+            lines.append(f"      Фото: сравнить не удалось — {escape(result.photos_error)}")
+        else:
+            assessment = "без замечаний" if result.images_status == "OK" else "есть замечание"
+            lines.append(f"      Фото: магазин {result.images_count}, эталон {result.reference_images_count} — {assessment}")
+            photo_url = result.audit_parts.get("photos_url")
+            if photo_url:
+                lines.append(f"      Ref URL: {escape(photo_url)}")
+        lines.append("      Характеристики и описание в этом запуске не проверялись.")
+        lines.append("")
+        return "\n".join(lines)
     photo_badge = f"[bold green]\\[{result.images_status}][/bold green]" if result.images_status == "OK" else (
         f"[bold red]\\[{result.images_status}][/bold red]" if result.images_status == "NO_IMAGES" else f"[bold yellow]\\[{result.images_status}][/bold yellow]"
     )
@@ -578,6 +610,22 @@ def format_audit_card(idx: int, total_count: int, prod: Product, result: AuditRe
     return "\n".join(lines)
 
 
+def _audit_is_current(product: Product, result: AuditResult | None, photos_only: bool, skip_desc: bool) -> bool:
+    if result is None or not result.audit_parts:
+        return False
+    required = ["photos"] if photos_only else ["specs", "photos"]
+    if not photos_only and not skip_desc and product.description is not None:
+        required.append("description")
+    for part in required:
+        if part == "photos" and not product.images_count_known:
+            return False
+        photo_url = result.audit_parts.get("photos_url") or result.reference_url
+        expected = product.audit_input_hash(part, photo_url if part == "photos" else None)
+        if result.audit_parts.get(part) != expected:
+            return False
+    return True
+
+
 async def run_audit_command(args: argparse.Namespace) -> int:
     setup_utf8_terminal()
 
@@ -586,7 +634,7 @@ async def run_audit_command(args: argparse.Namespace) -> int:
     settings = get_settings()
 
     target_keys = _extract_target_keys(args)
-    audited_master_keys: set[str] = set()
+    previous_results: dict[int, AuditResult] = {}
 
     if target_keys:
         source_mode = getattr(args, "source", "mysql")
@@ -605,13 +653,6 @@ async def run_audit_command(args: argparse.Namespace) -> int:
         source_mode = getattr(args, "source", "mysql")
         products = []
         skip_audited = getattr(args, "skip_audited", True) and not getattr(args, "force_refresh", False)
-        audited_ids: set[int] = set()
-        audited_master_keys = set()
-        if skip_audited:
-            audited_ids = repo.get_audited_product_ids()
-            audited_master_keys = repo.get_audited_master_keys()
-            if audited_ids or audited_master_keys:
-                print(f"[*] Incremental Mode: Loaded {len(audited_ids)} audited products ({len(audited_master_keys)} master models) from DB (skipping).")
 
         main_cat_id = getattr(args, "main_cat", None)
         group_id = getattr(args, "group", None)
@@ -644,15 +685,16 @@ async def run_audit_command(args: argparse.Namespace) -> int:
                         only_active=True,
                     ):
                         grouper.group_products(batch)
+                        batch_results = repo.get_latest_audit_results_for_ids([p.product_id for p in batch])
+                        previous_results.update(batch_results)
                         for prod in batch:
+                            prod.images_count_known = True
                             if not prod.is_master:
                                 skipped_count += 1
                                 continue
                             if skip_audited:
-                                if prod.product_id in audited_ids:
-                                    skipped_count += 1
-                                    continue
-                                if prod.master_key and prod.master_key in audited_master_keys:
+                                if _audit_is_current(prod, batch_results.get(prod.product_id), getattr(args, "photos_only", False), getattr(args, "skip_desc", False)):
+                                    print(f"[*] Пропущен товар #{prod.product_id}: нужные проверки уже выполнены, данные магазина не изменились.")
                                     skipped_count += 1
                                     continue
                             if prod.master_key:
@@ -687,13 +729,14 @@ async def run_audit_command(args: argparse.Namespace) -> int:
                     break
                 cur_db_offset += len(db_candidates)
                 grouper.group_products(db_candidates)
+                batch_results = repo.get_latest_audit_results_for_ids([p.product_id for p in db_candidates])
+                previous_results.update(batch_results)
                 for prod in db_candidates:
                     if not prod.is_master:
                         continue
                     if skip_audited:
-                        if prod.product_id in audited_ids:
-                            continue
-                        if prod.master_key and prod.master_key in audited_master_keys:
+                        if _audit_is_current(prod, batch_results.get(prod.product_id), getattr(args, "photos_only", False), getattr(args, "skip_desc", False)):
+                            print(f"[*] Пропущен товар #{prod.product_id}: нужные проверки уже выполнены, данные магазина не изменились.")
                             continue
                     if prod.master_key:
                         if prod.master_key in seen_batch_master_keys:
@@ -708,6 +751,9 @@ async def run_audit_command(args: argparse.Namespace) -> int:
         if not products:
             print("[*] No un-audited master products found (all audited or none match filter).")
             return 0
+
+    if products and not previous_results:
+        previous_results = repo.get_latest_audit_results_for_ids([p.product_id for p in products])
 
     settings = get_settings()
     openai_key = (
@@ -747,7 +793,7 @@ async def run_audit_command(args: argparse.Namespace) -> int:
     )
 
     console = Console()
-    tui = AuditTUI(console=console, total_products=len(products), concurrency=effective_concurrency)
+    tui = AuditTUI(console=console, total_products=len(products), concurrency=effective_concurrency, photos_only=getattr(args, "photos_only", False))
 
     print("=" * 80)
     print("TELECOM CATALOG AUDITOR :: STAGE 4 FACTUAL ARBITER")
@@ -796,6 +842,8 @@ async def run_audit_command(args: argparse.Namespace) -> int:
                         skip_desc=getattr(args, "skip_desc", False),
                         skip_tech=getattr(args, "skip_tech", False),
                         photos_only=getattr(args, "photos_only", False),
+                        prior_result=previous_results.get(prod.product_id),
+                        prior_loaded=True,
                     )
                 except Exception as exc:
                     result = AuditResult(
@@ -810,10 +858,12 @@ async def run_audit_command(args: argparse.Namespace) -> int:
                         execution_time_sec=0.0,
                     )
 
-                if prod.master_key:
-                    audited_master_keys.add(prod.master_key)
-
-                tui.record_completed(result.status)
+                tui.record_completed(
+                    result.status,
+                    photos_only=getattr(args, "photos_only", False),
+                    photos_error=bool(result.photos_error),
+                    images_status=result.images_status,
+                )
                 if result.execution_time_sec:
                     total_time_all += result.execution_time_sec
                 if result.input_tokens:
@@ -860,7 +910,10 @@ async def run_audit_command(args: argparse.Namespace) -> int:
         wall_time = time.perf_counter() - start_time_all
         speedup = (total_time_all / wall_time) if wall_time > 0 else 1.0
         print("-" * 80)
-        print(f"AUDIT SUMMARY: Total: {len(products)} | Verified: {tui.verified_count} | Mismatches: {tui.mismatch_count} | Missing Specs: {tui.missing_specs_count} | Not Found: {tui.not_found_count} | Errors: {tui.error_count}")
+        if getattr(args, "photos_only", False):
+            print(f"PHOTO SUMMARY: Total: {len(products)} | Checked: {tui.photo_checked_count} | Photo issues: {tui.photo_issue_count} | Errors: {tui.error_count}")
+        else:
+            print(f"AUDIT SUMMARY: Total: {len(products)} | Verified: {tui.verified_count} | Mismatches: {tui.mismatch_count} | Missing Specs: {tui.missing_specs_count} | Not Found: {tui.not_found_count} | Errors: {tui.error_count}")
         if len(products) > 1 and total_tokens_all > 0:
             print(f"BATCH METRICS: Wall Time: {wall_time:.2f}s | Total Time: {total_time_all:.2f}s | Speedup: {speedup:.1f}x | Total Tokens: {total_tokens_all:,} | Total Est. Cost: ~${total_cost_all:.5f}")
         print("=" * 80)
@@ -1131,7 +1184,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit_parser.add_argument(
         "--photos-only",
         action="store_true",
-        help="Fast offline check of product photos without web search or LLM",
+        help="Check shop photo count against a confirmed matching reference; uses search, crawl and model verification",
     )
     audit_parser.add_argument(
         "--source",

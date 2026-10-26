@@ -485,6 +485,8 @@ class SQLiteProductRepository:
 
         trace_raw = row["search_trace_json"] if "search_trace_json" in keys else None
         search_trace = [str(x) for x in json.loads(trace_raw)] if trace_raw else []
+        parts_raw = row["audit_parts_json"] if "audit_parts_json" in keys else None
+        audit_parts = json.loads(parts_raw) if parts_raw else {}
         return AuditResult(
             product_id=row["product_id"],
             status=AuditStatus(row["status"]),
@@ -508,6 +510,7 @@ class SQLiteProductRepository:
             images_status=images_status,
             description_discrepancies=description_discrepancies,
             description_quality=description_quality,
+            audit_parts=audit_parts,
         )
 
     def _execute_upsert_product(self, conn: sqlite3.Connection, product: Product) -> None:
@@ -572,8 +575,8 @@ class SQLiteProductRepository:
             images_count, reference_images_count, images_status,
             description_discrepancies_json, description_quality,
             audited_at, details, execution_time_sec, crawler_time_sec, llm_time_sec,
-            input_tokens, output_tokens, estimated_cost_usd, search_trace_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            input_tokens, output_tokens, estimated_cost_usd, search_trace_json, audit_parts_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(product_id) DO UPDATE SET
             status = excluded.status,
             confidence_score = excluded.confidence_score,
@@ -595,7 +598,8 @@ class SQLiteProductRepository:
             input_tokens = excluded.input_tokens,
             output_tokens = excluded.output_tokens,
             estimated_cost_usd = excluded.estimated_cost_usd,
-            search_trace_json = excluded.search_trace_json
+            search_trace_json = excluded.search_trace_json,
+            audit_parts_json = excluded.audit_parts_json
         RETURNING audit_id;
         """
         disc_json = json.dumps(
@@ -637,6 +641,7 @@ class SQLiteProductRepository:
                 result.output_tokens,
                 result.estimated_cost_usd,
                 trace_json,
+                json.dumps(result.audit_parts, ensure_ascii=False) if result.audit_parts else None,
             ),
         )
         row = cursor.fetchone()
@@ -672,5 +677,18 @@ class SQLiteProductRepository:
             cursor = conn.execute(sql, (product_id,))
             row = cursor.fetchone()
             return self._row_to_audit_result(row) if row else None
+
+    def get_latest_audit_results_for_ids(self, product_ids: Sequence[int]) -> dict[int, AuditResult]:
+        results: dict[int, AuditResult] = {}
+        with get_sqlite_connection(self.db_path) as conn:
+            for start in range(0, len(product_ids), 900):
+                chunk = product_ids[start:start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT * FROM audit_results WHERE product_id IN ({placeholders})",
+                    tuple(chunk),
+                ).fetchall()
+                results.update({int(row["product_id"]): self._row_to_audit_result(row) for row in rows})
+        return results
 
 

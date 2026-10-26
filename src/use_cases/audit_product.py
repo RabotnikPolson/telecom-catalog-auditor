@@ -65,32 +65,15 @@ class AuditProductUseCase:
         skip_desc: bool = False,
         skip_tech: bool = False,
         photos_only: bool = False,
+        prior_result: AuditResult | None = None,
+        prior_loaded: bool = False,
     ) -> AuditResult:
         t_audit_start = time.perf_counter()
         crawler_time_sec = 0.0
+        previous = prior_result if prior_loaded else self.product_repo.get_latest_audit_result(product.product_id)
 
-        # Fast path: photos-only audit (zero network or LLM calls)
         if photos_only:
-            img_status = evaluate_photos_status(product.images_count, 0)
-            status = AuditStatus.VERIFIED if product.images_count >= 1 else AuditStatus.MISMATCH
-            res = AuditResult(
-                product_id=product.product_id,
-                status=status,
-                confidence_score=1.0,
-                reference_url=None,
-                discrepancies=[],
-                missing_specs=[],
-                matched_specs_count=len(product.current_specs),
-                total_specs_count=len(product.current_specs),
-                audited_at=datetime.now(UTC),
-                details=f"Photos-only audit: {product.images_count} photos on store ({img_status})",
-                images_count=product.images_count,
-                reference_images_count=0,
-                images_status=img_status,
-                description_quality="GOOD",
-            )
-            self._persist_audit(product, res)
-            return res
+            return await self._audit_photos(product, reference_url, force_refresh, previous)
 
         urls_to_try: list[str] = []
         if reference_url:
@@ -130,6 +113,8 @@ class AuditProductUseCase:
                     images_count=product.images_count,
                     images_status=evaluate_photos_status(product.images_count, 0),
                 )
+                if previous:
+                    return result
                 self._persist_audit(product, result)
                 return result
             urls_to_try = candidates
@@ -207,7 +192,12 @@ class AuditProductUseCase:
                 result.execution_time_sec = round(time.perf_counter() - t_audit_start, 2)
                 result.images_count = product.images_count
                 result.reference_images_count = ref_images_cnt
-                result.images_status = evaluate_photos_status(product.images_count, ref_images_cnt)
+                # A crawler's zero can mean no images or no extracted count; it is not
+                # evidence that the reference really has zero photos.
+                result.images_status = (
+                    evaluate_photos_status(product.images_count, ref_images_cnt)
+                    if product.images_count_known and ref_images_cnt > 0 else "UNKNOWN"
+                )
 
                 search_trace.append(f"[{label_prefix} {cand_idx}] LLM Judge verdict: {result.status.value} (Confidence: {result.confidence_score:.2f})")
                 last_result = result
@@ -225,7 +215,7 @@ class AuditProductUseCase:
             return None
 
         winning_result: AuditResult | None = None
-        is_step1_code = (resolved.source_type == "CODE_PINPOINT")
+        is_step1_code = bool(not reference_url and resolved and resolved.source_type == "CODE_PINPOINT")
         step1_max = 2 if is_step1_code else None
 
         if urls_to_try:
@@ -255,6 +245,23 @@ class AuditProductUseCase:
         if winning_result:
             winning_result.product_id = product.product_id
             winning_result.search_trace = search_trace
+            parts = dict(previous.audit_parts) if previous else {}
+            if not skip_tech:
+                parts["specs"] = product.audit_input_hash("specs")
+            if not skip_desc and product.description is not None:
+                parts["description"] = product.audit_input_hash("description")
+            if product.images_count_known and winning_result.reference_images_count > 0:
+                parts["photos"] = product.audit_input_hash("photos", winning_result.reference_url)
+                if winning_result.reference_url:
+                    parts["photos_url"] = winning_result.reference_url
+            elif previous and "photos" in previous.audit_parts:
+                winning_result.images_count = previous.images_count
+                winning_result.reference_images_count = previous.reference_images_count
+                winning_result.images_status = previous.images_status
+            winning_result.audit_parts = parts
+            if previous and skip_desc:
+                winning_result.description_discrepancies = previous.description_discrepancies
+                winning_result.description_quality = previous.description_quality
             self._persist_audit(product, winning_result)
             return winning_result
 
@@ -262,6 +269,8 @@ class AuditProductUseCase:
             search_trace.append("[Evaluation] All candidate URLs exhausted without a verified match.")
             last_result.product_id = product.product_id
             last_result.search_trace = search_trace
+            if previous:
+                return last_result
             self._persist_audit(product, last_result)
             return last_result
 
@@ -282,6 +291,105 @@ class AuditProductUseCase:
             images_count=product.images_count,
             images_status=evaluate_photos_status(product.images_count, 0),
         )
+        if previous:
+            return result
+        self._persist_audit(product, result)
+        return result
+
+    async def _audit_photos(
+        self,
+        product: Product,
+        reference_url: str | None,
+        force_refresh: bool,
+        previous: AuditResult | None,
+    ) -> AuditResult:
+        error = "Нет достоверного количества фото магазина."
+        accepted_url: str | None = None
+        reference_count: int | None = None
+        if product.images_count_known:
+            error = "Подходящий эталон не найден."
+            if reference_url:
+                candidates = [reference_url]
+            else:
+                resolver_fn = getattr(self.reference_resolver, "execute", None) or getattr(self.reference_resolver, "resolve", None)
+                try:
+                    resolved = await resolver_fn(product, force_refresh=force_refresh) if resolver_fn else None
+                except Exception as exc:
+                    resolved = None
+                    error = f"Поиск эталона завершился ошибкой: {exc}"
+                candidates = list(getattr(resolved, "candidate_urls", []) or [])
+                first = getattr(resolved, "reference_url", None)
+                if first and first not in candidates:
+                    candidates.insert(0, first)
+            if candidates:
+                error = "Подходящий эталон не найден."
+            for url in candidates:
+                raw = None if force_refresh else self.product_repo.get_specs_cache(url)
+                try:
+                    cached = json.loads(raw) if raw else None
+                except json.JSONDecodeError:
+                    cached = None
+                if isinstance(cached, dict) and cached.get("markdown") and isinstance(cached.get("images_count"), int) and cached["images_count"] > 0:
+                    markdown = str(cached["markdown"])
+                    count = cached.get("images_count")
+                else:
+                    try:
+                        crawled = await self.crawler.crawl(url)
+                    except Exception as exc:
+                        error = f"Эталон не удалось открыть: {exc}"
+                        continue
+                    if not crawled.success or not crawled.markdown:
+                        continue
+                    markdown = crawled.markdown
+                    count = getattr(crawled, "images_count", None)
+                    self.product_repo.save_specs_cache(
+                        resolved_url=url,
+                        specs_json=json.dumps({"title": crawled.title, "markdown": markdown, "images_count": count}, ensure_ascii=False),
+                        status_code=crawled.status_code,
+                    )
+                try:
+                    matches = await self.judge.matches_model(product, url, markdown)
+                except Exception as exc:
+                    error = f"Проверка модели эталона завершилась ошибкой: {exc}"
+                    continue
+                if not matches:
+                    continue
+                if not isinstance(count, int) or count < 1:
+                    error = "У подходящего эталона нет количества фото."
+                    continue
+                accepted_url = url
+                reference_count = count
+                break
+
+        if accepted_url is None or reference_count is None:
+            result = previous.model_copy(deep=True) if previous else AuditResult(
+                product_id=product.product_id,
+                status=AuditStatus.ERROR,
+                details=error,
+            )
+            result.photos_only_run = True
+            result.photos_error = error
+            result.audit_parts.pop("photos", None)
+            self._persist_audit(product, result)
+            return result
+
+        result = previous.model_copy(deep=True) if previous else AuditResult(
+            product_id=product.product_id,
+            status=AuditStatus.PENDING,
+        )
+        result.images_count = product.images_count
+        result.reference_images_count = reference_count
+        result.images_status = evaluate_photos_status(product.images_count, reference_count)
+        if not previous or not previous.reference_url or previous.status not in (
+            AuditStatus.VERIFIED, AuditStatus.MISMATCH, AuditStatus.MISSING_SPECS,
+        ):
+            result.reference_url = accepted_url
+        result.audit_parts["photos"] = product.audit_input_hash("photos", accepted_url)
+        result.audit_parts["photos_url"] = accepted_url
+        result.photos_only_run = True
+        result.audited_at = datetime.now(UTC)
+        if not previous:
+            result.details = "Проверены только фото."
         self._persist_audit(product, result)
         return result
 

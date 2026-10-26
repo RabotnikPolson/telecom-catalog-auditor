@@ -18,6 +18,7 @@ from src.domain.entities import (
     MissingSpecItem,
     Product,
 )
+from src.domain.exceptions import DomainError
 
 from .prompts import AUDIT_SYSTEM_PROMPT, build_audit_user_prompt
 
@@ -356,6 +357,45 @@ class OpenAIJudge:
         """
         bundle = await self.decompose_search_query(title=title, vendor_name=vendor_name)
         return bundle.marketing_model
+
+    async def matches_model(self, product: Product, reference_url: str, external_markdown: str) -> bool:
+        """Confirm the candidate's exact product model without evaluating catalog content."""
+        if not self.api_key:
+            raise DomainError("OPENAI_API_KEY is not configured")
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": (
+                    "Determine whether the external page is for the same exact product model as the shop item. "
+                    "Reject different models, variants, capacities, or uncertain pages. "
+                    "Do not compare specifications, description, or photos. "
+                    'Return JSON only: {"same_model": true or false}.'
+                )},
+                {"role": "user", "content": (
+                    f"Shop title: {product.title}\nBrand: {product.vendor_name or ''}\n"
+                    f"Manufacturer SKU: {product.manufacturer_sku or ''}\n"
+                    f"Vendor SKU: {product.vendor_sku or ''}\nBarcode: {product.barcode or ''}\n"
+                    f"Reference URL: {reference_url}\nReference page:\n{external_markdown[:50000]}"
+                )},
+            ],
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": self.reasoning_effort,
+            "max_completion_tokens": 120,
+        }
+        try:
+            response = await self._get_client().post(
+                self.API_URL,
+                json=payload,
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            )
+            response.raise_for_status()
+            answer = json.loads(response.json()["choices"][0]["message"]["content"])
+            if not isinstance(answer, dict) or not isinstance(answer.get("same_model"), bool):
+                raise ValueError("Model verification response lacks same_model")
+            return answer["same_model"] is True
+        except Exception as exc:
+            logger.warning("Model match check failed: %s", exc)
+            raise DomainError(f"Model verification failed: {exc}") from exc
 
     async def judge(
         self,

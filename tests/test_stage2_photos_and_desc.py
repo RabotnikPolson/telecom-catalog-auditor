@@ -164,12 +164,17 @@ async def test_photos_only_mode_in_use_case(tmp_path: Path) -> None:
     repo = SQLiteProductRepository(db_file)
 
     # Note: Products are NOT pre-saved into repo — tests JIT persistence contract
-    p1 = Product(product_id=6001, title="Camera with 0 photos", images_count=0)
-    p2 = Product(product_id=6002, title="Camera with 3 photos", images_count=3)
+    p1 = Product(product_id=6001, title="Camera Model A", images_count=0, images_count_known=True)
+    p2 = Product(product_id=6002, title="Camera Model B", images_count=3, images_count_known=True)
 
     mock_resolver = MagicMock()
     mock_crawler = MagicMock()
     mock_judge = MagicMock()
+    mock_judge.matches_model = AsyncMock(return_value=True)
+    mock_crawler.crawl = AsyncMock(return_value=MagicMock(
+        success=True, markdown="Camera model reference", images_count=4,
+        title="Camera", status_code=200,
+    ))
 
     use_case = AuditProductUseCase(
         product_repo=repo,
@@ -178,19 +183,188 @@ async def test_photos_only_mode_in_use_case(tmp_path: Path) -> None:
         judge=mock_judge,
     )
 
-    res1 = await use_case.audit_product(p1, photos_only=True)
+    res1 = await use_case.audit_product(p1, photos_only=True, reference_url="https://example.com/a")
     assert res1.images_status == "NO_IMAGES"
-    assert res1.status == AuditStatus.MISMATCH
+    assert res1.status == AuditStatus.PENDING
+    assert "photos" in res1.audit_parts
 
-    res2 = await use_case.audit_product(p2, photos_only=True)
-    assert res2.images_status == "OK"
-    assert res2.status == AuditStatus.VERIFIED
+    res2 = await use_case.audit_product(p2, photos_only=True, reference_url="https://example.com/b")
+    assert res2.images_status == "LESS_THAN_REFERENCE"
+    assert res2.status == AuditStatus.PENDING
+    assert "specs" not in res2.audit_parts
 
     # Verify both products were saved JIT into products table to satisfy FK
     assert repo.get_product_by_id(6001) is not None
     assert repo.get_product_by_id(6002) is not None
 
-    # Zero calls to external resolver/crawler/judge were made!
+    # Manual URLs bypass search but still require a crawl and model match.
     assert not mock_resolver.execute.called
-    assert not mock_crawler.crawl.called
+    assert mock_crawler.crawl.await_count == 2
+    assert mock_judge.matches_model.await_count == 2
     assert not mock_judge.judge.called
+
+
+@pytest.mark.anyio
+async def test_photos_only_preserves_previous_findings_and_retries_missing_reference_count(tmp_path: Path) -> None:
+    repo = SQLiteProductRepository(tmp_path / "partial.db")
+    product = Product(product_id=6110, title="Router RX10", images_count=3, images_count_known=True)
+    old = AuditResult(
+        product_id=6110,
+        status=AuditStatus.MISMATCH,
+        details="Specification mismatch",
+        reference_url="https://example.com/rx10",
+        audit_parts={"specs": product.audit_input_hash("specs")},
+    )
+    repo.save_product_and_audit_result(product, old)
+    crawler = MagicMock()
+    crawler.crawl = AsyncMock(return_value=MagicMock(
+        success=True, markdown="Router RX10", images_count=5,
+        title="RX10", status_code=200,
+    ))
+    judge = MagicMock()
+    judge.matches_model = AsyncMock(return_value=True)
+    use_case = AuditProductUseCase(repo, MagicMock(), crawler, judge)
+
+    updated = await use_case.audit_product(product, photos_only=True, reference_url="https://example.com/rx10")
+    assert updated.status == AuditStatus.MISMATCH
+    assert updated.details == "Specification mismatch"
+    assert updated.audit_parts["specs"] == old.audit_parts["specs"]
+    assert updated.audit_parts["photos"] == product.audit_input_hash("photos", old.reference_url)
+    assert repo.get_latest_audit_result(6110).images_status == "LESS_THAN_REFERENCE"
+
+    crawler.crawl = AsyncMock(return_value=MagicMock(
+        success=True, markdown="Router RX10", images_count=0,
+        title="RX10", status_code=200,
+    ))
+    failed = await use_case.audit_product(product, photos_only=True, reference_url="https://example.com/rx10", force_refresh=True)
+    assert failed.photos_error == "У подходящего эталона нет количества фото."
+    after_failure = repo.get_latest_audit_result(6110)
+    assert after_failure.images_status == updated.images_status
+    assert after_failure.details == old.details
+    assert "photos" not in after_failure.audit_parts
+    assert after_failure.audit_parts["specs"] == old.audit_parts["specs"]
+
+
+def test_audit_part_hashes_change_only_with_relevant_inputs() -> None:
+    original = Product(product_id=7001, title="Router RX10", description="Old", images_count=3)
+    changed = original.model_copy(update={"description": "New", "images_count": 4})
+    assert original.audit_input_hash("specs") == changed.audit_input_hash("specs")
+    assert original.audit_input_hash("description") != changed.audit_input_hash("description")
+    assert original.audit_input_hash("photos", "https://example.com/rx10") != changed.audit_input_hash("photos", "https://example.com/rx10")
+    assert original.audit_input_hash("photos", "https://example.com/a") != original.audit_input_hash("photos", "https://example.com/b")
+
+
+@pytest.mark.anyio
+async def test_photo_source_does_not_relabel_existing_spec_evidence(tmp_path: Path) -> None:
+    from src.entrypoints.cli import _audit_is_current
+
+    repo = SQLiteProductRepository(tmp_path / "photo_source.db")
+    product = Product(product_id=7100, title="Router RX10", images_count=1, images_count_known=True)
+    old = AuditResult(
+        product_id=7100,
+        status=AuditStatus.MISMATCH,
+        reference_url="https://example.com/spec-source",
+        details="Spec evidence from first source",
+        audit_parts={"specs": product.audit_input_hash("specs")},
+    )
+    repo.save_product_and_audit_result(product, old)
+    crawler = MagicMock()
+    crawler.crawl = AsyncMock(return_value=MagicMock(
+        success=True, markdown="Router RX10", images_count=2,
+        title="RX10", status_code=200,
+    ))
+    judge = MagicMock()
+    judge.matches_model = AsyncMock(return_value=True)
+    use_case = AuditProductUseCase(repo, MagicMock(), crawler, judge)
+    result = await use_case.audit_product(product, photos_only=True, reference_url="https://example.com/photo-source")
+    assert result.reference_url == old.reference_url
+    assert result.audit_parts["photos_url"] == "https://example.com/photo-source"
+    assert _audit_is_current(product, result, photos_only=True, skip_desc=False)
+
+
+@pytest.mark.anyio
+async def test_legacy_full_report_keeps_its_reference_after_photo_run(tmp_path: Path) -> None:
+    repo = SQLiteProductRepository(tmp_path / "legacy_full_photo.db")
+    product = Product(product_id=7150, title="Router RX10", images_count=0, images_count_known=True)
+    previous = AuditResult(
+        product_id=7150,
+        status=AuditStatus.MISMATCH,
+        reference_url="https://example.com/old-spec-evidence",
+        details="Old specification discrepancy",
+        audit_parts={},
+    )
+    repo.save_product_and_audit_result(product, previous)
+    crawler = MagicMock()
+    crawler.crawl = AsyncMock(return_value=MagicMock(
+        success=True, markdown="Router RX10", images_count=1,
+        title="RX10", status_code=200,
+    ))
+    judge = MagicMock()
+    judge.matches_model = AsyncMock(return_value=True)
+    result = await AuditProductUseCase(repo, MagicMock(), crawler, judge).audit_product(
+        product, photos_only=True, reference_url="https://example.com/photo-evidence",
+    )
+    assert result.reference_url == previous.reference_url
+    assert result.details == previous.details
+    assert result.images_status == "NO_IMAGES"
+    assert result.reference_images_count == 1
+    assert result.audit_parts["photos_url"] == "https://example.com/photo-evidence"
+    persisted = repo.get_latest_audit_result(7150)
+    assert persisted.reference_url == previous.reference_url
+    assert persisted.audit_parts["photos"] == product.audit_input_hash("photos", "https://example.com/photo-evidence")
+
+
+@pytest.mark.anyio
+async def test_model_check_failure_is_reported_without_replacing_findings(tmp_path: Path) -> None:
+    repo = SQLiteProductRepository(tmp_path / "model_error.db")
+    product = Product(product_id=7200, title="Router RX10", images_count=1, images_count_known=True)
+    old = AuditResult(product_id=7200, status=AuditStatus.MISMATCH, details="Existing finding")
+    repo.save_product_and_audit_result(product, old)
+    crawler = MagicMock()
+    crawler.crawl = AsyncMock(return_value=MagicMock(
+        success=True, markdown="Router RX10", images_count=2,
+        title="RX10", status_code=200,
+    ))
+    judge = MagicMock()
+    judge.matches_model = AsyncMock(side_effect=RuntimeError("API unavailable"))
+    result = await AuditProductUseCase(repo, MagicMock(), crawler, judge).audit_product(
+        product, photos_only=True, reference_url="https://example.com/photo-source",
+    )
+    assert "API unavailable" in (result.photos_error or "")
+    assert repo.get_latest_audit_result(7200).details == "Existing finding"
+
+
+@pytest.mark.anyio
+async def test_full_run_with_unknown_reference_count_preserves_previous_photo_result(tmp_path: Path) -> None:
+    repo = SQLiteProductRepository(tmp_path / "photo_then_full.db")
+    product = Product(product_id=7300, title="Router RX10", images_count=1, images_count_known=True)
+    photo_source = "https://example.com/photos"
+    old = AuditResult(
+        product_id=7300, status=AuditStatus.PENDING,
+        reference_url=photo_source, images_count=1, reference_images_count=3,
+        images_status="LESS_THAN_REFERENCE",
+        audit_parts={
+            "photos": product.audit_input_hash("photos", photo_source),
+            "photos_url": photo_source,
+        },
+    )
+    repo.save_product_and_audit_result(product, old)
+    crawler = MagicMock()
+    crawler.crawl = AsyncMock(return_value=MagicMock(
+        success=True, markdown="Router RX10 specs", images_count=0,
+        title="RX10", status_code=200,
+    ))
+    judge = MagicMock()
+    judge.judge = AsyncMock(return_value=AuditResult(
+        product_id=7300, status=AuditStatus.VERIFIED,
+        reference_url="https://example.com/specs", details="Specs confirmed",
+    ))
+    result = await AuditProductUseCase(repo, MagicMock(), crawler, judge).audit_product(
+        product, reference_url="https://example.com/specs",
+    )
+    assert result.reference_url == "https://example.com/specs"
+    assert result.images_status == "LESS_THAN_REFERENCE"
+    assert result.reference_images_count == 3
+    assert result.audit_parts["photos_url"] == photo_source
+    assert result.audit_parts["photos"] == old.audit_parts["photos"]
+    assert result.audit_parts["specs"] == product.audit_input_hash("specs")

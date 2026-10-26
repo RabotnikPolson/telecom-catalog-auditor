@@ -10,7 +10,9 @@ from src.adapters.crawler.web_crawler import CrawlResult, WebCrawler
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
 from src.adapters.llm.openai_judge import OpenAIJudge, GeminiJudge, LLMDiscrepancy, LLMJudgeOutput, LLMMissingSpec
 from src.domain.entities import AuditResult, AuditStatus, DiscrepancyItem, Product
+from src.domain.exceptions import DomainError
 from src.use_cases.audit_product import AuditProductUseCase
+from src.entrypoints.cli import _audit_is_current
 from src.use_cases.resolve_reference import ResolvedReference, ResolveReferenceUseCase
 
 
@@ -40,6 +42,30 @@ def sample_product() -> Product:
             "Напряжение": "1.2 В",
         },
     )
+
+
+def test_incremental_skip_requires_all_parts_for_same_product() -> None:
+    first = Product(
+        product_id=1001, title="Router RX10", description="Description",
+        images_count=3, images_count_known=True,
+    )
+    second = first.model_copy(update={"product_id": 1002})
+    report = AuditResult(
+        product_id=1001,
+        status=AuditStatus.VERIFIED,
+        reference_url="https://example.com/rx10",
+        audit_parts={
+            "specs": first.audit_input_hash("specs"),
+            "description": first.audit_input_hash("description"),
+            "photos": first.audit_input_hash("photos", "https://example.com/rx10"),
+        },
+    )
+    assert _audit_is_current(first, report, photos_only=False, skip_desc=False)
+    assert not _audit_is_current(second, report, photos_only=False, skip_desc=False)
+    assert not _audit_is_current(first.model_copy(update={"images_count_known": False}), report, True, False)
+    assert not _audit_is_current(first, report.model_copy(update={"audit_parts": {}}), False, False)
+    assert not _audit_is_current(first.model_copy(update={"description": "Changed"}), report, False, False)
+    assert _audit_is_current(first.model_copy(update={"description": "Changed"}), report, True, False)
 
 
 class TestWebCrawler:
@@ -104,6 +130,23 @@ def _make_openai_resp(
 
 
 class TestOpenAIJudge:
+
+    @pytest.mark.anyio
+    async def test_model_verification_distinguishes_rejection_from_failure(self, sample_product: Product) -> None:
+        judge = OpenAIJudge(api_key="test-key")
+        try:
+            response = _make_openai_resp('{"same_model": false}')
+            with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=response):
+                assert not await judge.matches_model(sample_product, "https://example.com/item", "Another model")
+            malformed = _make_openai_resp('{"other": true}')
+            with patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=malformed):
+                with pytest.raises(DomainError, match="same_model"):
+                    await judge.matches_model(sample_product, "https://example.com/item", "Unknown")
+            judge.api_key = None
+            with pytest.raises(DomainError, match="OPENAI_API_KEY"):
+                await judge.matches_model(sample_product, "https://example.com/item", "Unknown")
+        finally:
+            await judge.aclose()
 
     @pytest.mark.anyio
     @pytest.mark.parametrize(

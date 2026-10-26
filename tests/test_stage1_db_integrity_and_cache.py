@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from src.adapters.db.schema import get_sqlite_connection
+from src.adapters.db.schema import get_sqlite_connection, init_db
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
 from src.domain.entities import AuditResult, AuditStatus, DiscrepancyItem, Product
 
@@ -199,7 +199,7 @@ def test_atomic_jit_save_product_and_audit_result(temp_repo: SQLiteProductReposi
 def test_cache_indexes_and_user_version_exist(temp_repo: SQLiteProductRepository) -> None:
     with get_sqlite_connection(temp_repo.db_path) as conn:
         ver = conn.execute("PRAGMA user_version;").fetchone()[0]
-        assert ver >= 3
+        assert ver == 4
 
         idx_rows = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index';"
@@ -209,6 +209,26 @@ def test_cache_indexes_and_user_version_exist(temp_repo: SQLiteProductRepository
         assert "idx_url_cache_created_at" in idx_names
         assert "idx_specs_cache_fetched_at" in idx_names
         assert "idx_audit_results_product_unique" in idx_names
+
+
+def test_v3_audit_migration_keeps_report_and_unique_index(tmp_path: Path) -> None:
+    db_file = tmp_path / "version_three.db"
+    init_db(db_file)
+    repo = SQLiteProductRepository(db_file)
+    product = Product(product_id=9201, title="Legacy router")
+    original = AuditResult(product_id=9201, status=AuditStatus.MISMATCH, details="Keep this finding")
+    repo.save_product_and_audit_result(product, original)
+    with get_sqlite_connection(db_file) as conn:
+        conn.execute("ALTER TABLE audit_results DROP COLUMN audit_parts_json")
+        conn.execute("PRAGMA user_version = 3")
+    init_db(db_file)
+    init_db(db_file)
+    with get_sqlite_connection(db_file) as conn:
+        row = conn.execute("SELECT details, audit_parts_json FROM audit_results WHERE product_id = 9201").fetchone()
+        index = conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_audit_results_product_unique'").fetchone()
+        assert row["details"] == "Keep this finding"
+        assert row["audit_parts_json"] is None
+        assert index is not None
 
 
 def test_legacy_schema_without_inline_unique_migrates_and_upserts(tmp_path: Path) -> None:

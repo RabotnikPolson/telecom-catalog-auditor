@@ -1,4 +1,5 @@
 import hashlib
+import json
 from datetime import UTC, datetime
 from enum import Enum
 
@@ -82,6 +83,9 @@ class AuditResult(BaseModel):
     images_status: str = Field(default="OK")
     description_discrepancies: list[DescriptionDiscrepancyItem] = Field(default_factory=list)
     description_quality: str = Field(default="GOOD")
+    audit_parts: dict[str, str] = Field(default_factory=dict)
+    photos_only_run: bool = Field(default=False, exclude=True)
+    photos_error: str | None = Field(default=None, exclude=True)
 
 
 class Product(BaseModel):
@@ -96,6 +100,7 @@ class Product(BaseModel):
     manufacturer_sku: str | None = Field(default=None)
     description: str | None = Field(default=None)
     images_count: int = Field(default=0, ge=0)
+    images_count_known: bool = Field(default=False, exclude=True)
     current_specs: dict[str, str] = Field(default_factory=dict)
     content_hash: str = Field(default="")
     parent_sku: str | None = Field(default=None)
@@ -126,6 +131,29 @@ class Product(BaseModel):
         ]
         payload = f"{clean_title}|" + "|".join(sorted_pairs)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def audit_input_hash(self, part: str, reference_url: str | None = None) -> str:
+        identity = {
+            "product_id": self.product_id,
+            "title": self.title,
+            "shop_sku": self.shop_sku,
+            "barcode": self.barcode,
+            "vendor_name": self.vendor_name,
+            "vendor_sku": self.vendor_sku,
+            "manufacturer_sku": self.manufacturer_sku,
+        }
+        if part == "specs":
+            identity["current_specs"] = self.current_specs
+        elif part == "description":
+            identity["current_specs"] = self.current_specs
+            identity["description"] = self.description
+        elif part == "photos":
+            identity["images_count"] = self.images_count
+            identity["reference_url"] = reference_url
+        else:
+            raise ValueError(f"Unknown audit part: {part}")
+        raw = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     @model_validator(mode="after")
     def populate_content_hash_if_empty(self) -> "Product":
