@@ -1,4 +1,6 @@
+import hashlib
 import re
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -36,15 +38,6 @@ class ParentChildGrouper:
         r"\bбез зарядного устройства\b",
         r"\bростест\b",
         r"\bросэп\b",
-        r"\bglobal\b",
-        r"\beu\b",
-        r"\bkz\b",
-        r"\bkaz\b",
-        r"\bказ\b",
-        r"\be-?sim\b",
-        r"\bdual\s*sim\b",
-        r"\b2sim\b",
-        r"\b1sim\b",
         r"\bnew\b",
         r"\bновинка\b",
     ]
@@ -152,13 +145,18 @@ class ParentChildGrouper:
             re.IGNORECASE | re.UNICODE
         )
 
+        self._decorative_value_regex = re.compile(
+            rf"(?:{'|'.join(self.PACKAGING_NOISE)})",
+            re.IGNORECASE | re.UNICODE,
+        )
+
         self._storage_regex = re.compile(
             r"(\b\d+)\s*(gb|гб|tb|тб|mb|мб)\b",
             re.IGNORECASE | re.UNICODE
         )
 
     def extract_master_key(self, title: str, specs: dict[str, str] | None = None) -> str:
-        text = title.strip().lower()
+        text = title.strip()
 
         def _normalize_storage(match: re.Match[str]) -> str:
             val = match.group(1)
@@ -174,6 +172,7 @@ class ParentChildGrouper:
         text = self._storage_regex.sub(_normalize_storage, text)
         text = self._noise_regex.sub(" ", text)
         text = self._color_regex.sub(" ", text)
+        text = self._strip_standalone_region_suffix(text).lower()
 
         has_memory = bool(re.search(r"\b\d+(?:gb|tb|mb)\b", text))
         if not has_memory and specs:
@@ -192,21 +191,58 @@ class ParentChildGrouper:
         if not tokens:
             raise GroupingError(f"Failed to generate master key for product title: '{title}'")
 
-        master_key = "_".join(tokens)
-        return master_key
+        return "_".join(tokens)
+
+    @staticmethod
+    def _normalize_signature_text(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", value).casefold()
+        return re.sub(r"[^\w]+", " ", normalized, flags=re.UNICODE).strip()
+
+    def _is_decorative_spec_value(self, value: str) -> bool:
+        remaining = self._color_regex.sub(" ", value)
+        remaining = self._decorative_value_regex.sub(" ", remaining)
+        remaining = self._strip_standalone_region_suffix(remaining)
+        return not self._normalize_signature_text(remaining)
+
+    @staticmethod
+    def _strip_standalone_region_suffix(value: str) -> str:
+        """Remove only a structurally explicit trailing market label."""
+        return re.sub(
+            r"(?:^|\s)(?:[A-Z]{2}|(?i:global))\s*$",
+            " ",
+            value,
+        ).strip()
+
+    def _spec_signature(self, specs: dict[str, str] | None) -> str | None:
+        if not specs:
+            return None
+
+        normalized_specs = sorted(
+            (
+                self._normalize_signature_text(name),
+                self._normalize_signature_text(value),
+            )
+            for name, value in specs.items()
+            if name.strip() and value.strip() and not self._is_decorative_spec_value(value)
+        )
+        normalized_specs = [(name, value) for name, value in normalized_specs if name and value]
+        if not normalized_specs:
+            return None
+
+        canonical = "\n".join(f"{name}={value}" for name, value in normalized_specs)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
     def group_products(self, products: Sequence[Product]) -> GroupingSummary:
         if not products:
             return GroupingSummary(total_products=0, master_count=0, child_count=0)
 
         groups: dict[str, list[Product]] = {}
-
         for prod in products:
-            key = self.extract_master_key(prod.title, prod.current_specs)
+            base_key = self.extract_master_key(prod.title, prod.current_specs)
+            signature = self._spec_signature(prod.current_specs)
+            key = f"{base_key}__specs_{signature or 'unknown'}"
             prod.master_key = key
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(prod)
+            groups.setdefault(key, []).append(prod)
 
         masters: list[Product] = []
         children: list[Product] = []

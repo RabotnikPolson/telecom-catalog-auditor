@@ -1,19 +1,17 @@
-import asyncio
-from datetime import datetime, timezone
-import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+
 import httpx
 import pytest
 
 from src.adapters.crawler.web_crawler import CrawlResult, WebCrawler
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
-from src.adapters.llm.openai_judge import OpenAIJudge, GeminiJudge, LLMDiscrepancy, LLMJudgeOutput, LLMMissingSpec
+from src.adapters.llm.openai_judge import LLMDiscrepancy, LLMJudgeOutput, LLMMissingSpec, OpenAIJudge
 from src.domain.entities import AuditResult, AuditStatus, DiscrepancyItem, Product
 from src.domain.exceptions import DomainError
-from src.use_cases.audit_product import AuditProductUseCase
 from src.entrypoints.cli import _audit_is_current
-from src.use_cases.resolve_reference import ResolvedReference, ResolveReferenceUseCase
+from src.use_cases.audit_product import AuditProductUseCase
+from src.use_cases.resolve_reference import ResolvedReference
 
 
 @pytest.fixture
@@ -145,6 +143,26 @@ class TestOpenAIJudge:
             judge.api_key = None
             with pytest.raises(DomainError, match="OPENAI_API_KEY"):
                 await judge.matches_model(sample_product, "https://example.com/item", "Unknown")
+        finally:
+            await judge.aclose()
+
+    @pytest.mark.anyio
+    async def test_model_verification_receives_specs_and_shared_variant_rules(
+        self, sample_product: Product
+    ) -> None:
+        judge = OpenAIJudge(api_key="test-key")
+        response = _make_openai_resp('{"same_model": true}')
+        try:
+            with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)) as post:
+                assert await judge.matches_model(
+                    sample_product,
+                    "https://example.com/item",
+                    "Camelion UB-AA2200 exact reference",
+                )
+            messages = post.call_args.kwargs["json"]["messages"]
+            assert "SIM/eSIM" in messages[0]["content"]
+            assert "4G versus 5G" in messages[0]["content"]
+            assert '"Емкость": "2200 мАч"' in messages[1]["content"]
         finally:
             await judge.aclose()
 
@@ -354,7 +372,10 @@ class TestOpenAIJudge:
             res = await judge.judge(
                 product=sample_product,
                 reference_url="https://example.com/item",
-                external_markdown="* Ports: 4 Ethernet",
+                external_markdown=(
+                    "Более широкое покрытие всего дома\nЧасы есть\n"
+                    "Очень высокая производительность\nПоддержка Wi-Fi 7"
+                ),
             )
 
         # Both false discrepancies must be discarded, so status flips to VERIFIED
@@ -365,6 +386,238 @@ class TestOpenAIJudge:
         assert len(res.missing_specs) == 1
         assert res.missing_specs[0].spec_name == "Стандарт Wi-Fi"
         assert res.missing_specs[0].reference_value == "Wi-Fi 7"
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("title", "spec_name", "reference_value", "quote"),
+        [
+            ("Смартфон Model X", "NFC", "нет", "NFC не поддерживается"),
+            ("Роутер Model R", "Поддержка PoE", "отсутствует", "PoE отсутствует"),
+            ("Стиральная машина Model W", "Сушка", "нет", "Функция сушки недоступна"),
+        ],
+    )
+    async def test_directly_proven_negative_missing_spec_is_kept_for_different_categories(
+        self, title: str, spec_name: str, reference_value: str, quote: str
+    ) -> None:
+        product = Product(product_id=2001, title=title, current_specs={})
+        judge = OpenAIJudge(api_key="test-key")
+        output = LLMJudgeOutput(
+            status="MISSING_SPECS",
+            confidence_score=0.9,
+            missing_specs=[
+                LLMMissingSpec(
+                    spec_name=spec_name,
+                    reference_value=reference_value,
+                    proof_quote=quote,
+                )
+            ],
+            details="Подтверждена важная отсутствующая характеристика.",
+        )
+        response = _make_openai_resp(output.model_dump_json())
+        try:
+            with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)):
+                result = await judge.judge(product, "https://example.com/item", quote)
+            assert result.status == AuditStatus.MISSING_SPECS
+            assert len(result.missing_specs) == 1
+            assert result.missing_specs[0].reference_value == reference_value
+            assert result.missing_specs[0].proof_quote == quote
+            assert result.missing_specs[0].source_url == "https://example.com/item"
+        finally:
+            await judge.aclose()
+
+    @pytest.mark.anyio
+    async def test_missing_spec_requires_quote_from_transmitted_reference(self) -> None:
+        product = Product(product_id=2002, title="Model X", current_specs={})
+        judge = OpenAIJudge(api_key="test-key")
+        output = LLMJudgeOutput(
+            status="MISSING_SPECS",
+            missing_specs=[
+                LLMMissingSpec(
+                    spec_name="NFC",
+                    reference_value="нет",
+                    proof_quote="NFC не поддерживается",
+                )
+            ],
+            details="Missing NFC",
+        )
+        response = _make_openai_resp(output.model_dump_json())
+        try:
+            with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)):
+                result = await judge.judge(product, "https://example.com/item", "NFC поддерживается")
+            assert result.status == AuditStatus.ERROR
+            assert result.missing_specs == []
+            assert "проверяемых цитат" in (result.details or "")
+        finally:
+            await judge.aclose()
+
+    @pytest.mark.anyio
+    async def test_verified_with_only_invented_missing_spec_becomes_error(self) -> None:
+        product = Product(product_id=2006, title="Model X", current_specs={"Память": "128 ГБ"})
+        judge = OpenAIJudge(api_key="test-key")
+        output = LLMJudgeOutput(
+            status="VERIFIED",
+            matched_specs_count=1,
+            missing_specs=[
+                LLMMissingSpec(
+                    spec_name="NFC",
+                    reference_value="нет",
+                    proof_quote="NFC не поддерживается",
+                )
+            ],
+            details="Verified",
+        )
+        response = _make_openai_resp(output.model_dump_json())
+        try:
+            with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)):
+                result = await judge.judge(product, "https://example.com/item", "Память: 128 ГБ")
+            assert result.status == AuditStatus.ERROR
+            assert result.missing_specs == []
+        finally:
+            await judge.aclose()
+
+    @pytest.mark.anyio
+    async def test_valid_evidence_survives_alongside_invented_missing_spec(self) -> None:
+        product = Product(product_id=2007, title="Model X", current_specs={})
+        judge = OpenAIJudge(api_key="test-key")
+        output = LLMJudgeOutput(
+            status="MISSING_SPECS",
+            missing_specs=[
+                LLMMissingSpec(
+                    spec_name="Wi-Fi",
+                    reference_value="Wi-Fi 6",
+                    proof_quote="Поддерживается Wi-Fi 6",
+                ),
+                LLMMissingSpec(
+                    spec_name="NFC",
+                    reference_value="нет",
+                    proof_quote="NFC не поддерживается",
+                ),
+            ],
+        )
+        response = _make_openai_resp(output.model_dump_json())
+        try:
+            with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)):
+                result = await judge.judge(
+                    product,
+                    "https://example.com/item",
+                    "Поддерживается Wi-Fi 6",
+                )
+            assert result.status == AuditStatus.MISSING_SPECS
+            assert [item.spec_name for item in result.missing_specs] == ["Wi-Fi"]
+        finally:
+            await judge.aclose()
+
+    @pytest.mark.anyio
+    async def test_quote_normalization_and_exact_existing_spec_name_filter(self) -> None:
+        product = Product(
+            product_id=2003,
+            title="Model X",
+            current_specs={"  NFC  ": "нет"},
+        )
+        judge = OpenAIJudge(api_key="test-key")
+        output = LLMJudgeOutput(
+            status="VERIFIED",
+            matched_specs_count=1,
+            missing_specs=[
+                LLMMissingSpec(
+                    spec_name="nfc",
+                    reference_value="нет",
+                    proof_quote="NFC не поддерживается",
+                )
+            ],
+            details="Verified",
+        )
+        response = _make_openai_resp(output.model_dump_json())
+        try:
+            with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)):
+                result = await judge.judge(
+                    product,
+                    "https://example.com/item",
+                    "NFC\u00a0  не поддерживается",
+                )
+            assert result.status == AuditStatus.VERIFIED
+            assert result.missing_specs == []
+        finally:
+            await judge.aclose()
+
+    @pytest.mark.anyio
+    async def test_negative_shop_value_is_a_real_value_not_a_missing_spec(self) -> None:
+        product = Product(product_id=2004, title="Model X", current_specs={"NFC": "нет"})
+        judge = OpenAIJudge(api_key="test-key")
+        output = LLMJudgeOutput(
+            status="MISMATCH",
+            discrepancies=[
+                LLMDiscrepancy(
+                    spec_name="NFC",
+                    shop_value="нет",
+                    reference_value="есть",
+                    proof_quote="NFC поддерживается",
+                    contradiction_reason="Функция не может одновременно отсутствовать и поддерживаться.",
+                )
+            ],
+            details="Mismatch",
+        )
+        response = _make_openai_resp(output.model_dump_json())
+        try:
+            with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)):
+                result = await judge.judge(product, "https://example.com/item", "NFC поддерживается")
+            assert result.status == AuditStatus.MISMATCH
+            assert len(result.discrepancies) == 1
+            assert result.missing_specs == []
+        finally:
+            await judge.aclose()
+
+    @pytest.mark.anyio
+    async def test_quote_after_transmitted_25k_boundary_is_rejected(self) -> None:
+        product = Product(product_id=2005, title="Model X", current_specs={})
+        judge = OpenAIJudge(api_key="test-key")
+        quote = "NFC не поддерживается"
+        output = LLMJudgeOutput(
+            status="MISSING_SPECS",
+            missing_specs=[LLMMissingSpec(spec_name="NFC", reference_value="нет", proof_quote=quote)],
+        )
+        response = _make_openai_resp(output.model_dump_json())
+        try:
+            with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)):
+                result = await judge.judge(
+                    product,
+                    "https://example.com/item",
+                    ("x" * 25_000) + quote,
+                )
+            assert result.status == AuditStatus.ERROR
+            assert result.missing_specs == []
+        finally:
+            await judge.aclose()
+
+    @pytest.mark.anyio
+    async def test_unverifiable_discrepancy_does_not_become_verified(
+        self, sample_product: Product
+    ) -> None:
+        judge = OpenAIJudge(api_key="test-key")
+        output = LLMJudgeOutput(
+            status="MISMATCH",
+            discrepancies=[
+                LLMDiscrepancy(
+                    spec_name="Емкость",
+                    shop_value="2200 мАч",
+                    reference_value="2000 мАч",
+                    proof_quote="Емкость: 2000 мАч",
+                    contradiction_reason="Значения взаимоисключающие.",
+                )
+            ],
+        )
+        response = _make_openai_resp(output.model_dump_json())
+        try:
+            with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)):
+                result = await judge.judge(
+                    sample_product,
+                    "https://example.com/item",
+                    "Емкость: 2200 мАч",
+                )
+            assert result.status == AuditStatus.ERROR
+            assert result.discrepancies == []
+        finally:
+            await judge.aclose()
 
     @pytest.mark.anyio
     async def test_judge_openai_retry_on_transient_error(self, sample_product: Product) -> None:

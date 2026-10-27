@@ -1,8 +1,9 @@
-import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+
 import httpx
 import pytest
+
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
 from src.adapters.search.kaspi_client import KaspiSearchClient, is_kaspi_card_relevant
 from src.adapters.search.serper_client import SerperClient
@@ -264,6 +265,38 @@ class TestResolveReferenceUseCase:
         assert bundle.marketing_model == "Yeelight Arwen 550S"
         assert bundle.model_code == "YLXD013-A"
         assert bundle.brand_aliases == []
+
+    @pytest.mark.anyio
+    async def test_decompose_instruction_keeps_factory_code_and_excludes_standalone_region(self):
+        from src.adapters.llm.openai_judge import OpenAIJudge
+
+        judge = OpenAIJudge(api_key="test-key")
+        response = httpx.Response(
+            status_code=200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"brand":"Acme","marketing_model":"Acme Model X",'
+                                '"model_code":"ABC-123","brand_aliases":[]}'
+                            )
+                        }
+                    }
+                ]
+            },
+            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        )
+        try:
+            with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)) as post:
+                bundle = await judge.decompose_search_query("Acme Model X KZ ABC-123")
+            system_prompt = post.call_args.kwargs["json"]["messages"][0]["content"]
+            assert "standalone regional distribution marker" in system_prompt
+            assert "Never discard an authentic factory code" in system_prompt
+            assert bundle.marketing_model == "Acme Model X"
+            assert bundle.model_code == "ABC-123"
+        finally:
+            await judge.aclose()
 
     def test_is_valid_model_code(self):
         from src.use_cases.resolve_reference import is_valid_model_code

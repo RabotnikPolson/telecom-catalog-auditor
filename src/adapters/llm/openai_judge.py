@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from datetime import UTC, datetime
 from typing import Any
 
@@ -145,6 +146,11 @@ def _is_equivalent_value(val1: str, val2: str) -> bool:
     if norm1 == norm2:
         return True
     return _check_metric_unit_equivalence(val1, val2)
+
+
+def _normalize_evidence_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return " ".join(normalized.split())
 
 
 class OpenAIJudge:
@@ -292,8 +298,9 @@ class OpenAIJudge:
             "colors, promotional words, or parenthesized factory codes. Example: 'Yeelight Arwen Ceiling Light 550S', 'ASUS Vivobook 15'.\n"
             "3. 'model_code': Explicit alphanumeric factory part number / execution code / revision code if present in title "
             "(e.g. 'YLXD013-A', 'YLXDD-0270', 'X1504VA-BQ005', '6100-02 0001'). If absent or only harmless spec (e.g. '12V', 'белый'), return null.\n"
-            "4. 'brand_aliases': Array of parent/ecosystem brand combinations if applicable (e.g. ['Xiaomi Yeelight', 'Xiaomi'] for Yeelight; ['Xiaomi Poco'] for Poco). Otherwise empty list [].\n"
-            "5. Respond STRICTLY in JSON format:\n"
+            "4. A standalone regional distribution marker is not part of marketing_model. Never discard an authentic factory code or revision merely because it is a suffix; keep uncertain suffixes rather than guessing that they are regional.\n"
+            "5. 'brand_aliases': Array of parent/ecosystem brand combinations if applicable (e.g. ['Xiaomi Yeelight', 'Xiaomi'] for Yeelight; ['Xiaomi Poco'] for Poco). Otherwise empty list [].\n"
+            "6. Respond STRICTLY in JSON format:\n"
             '{"brand": "...", "marketing_model": "...", "model_code": "..." or null, "brand_aliases": [...]}\n'
         )
         user_msg = f"Product title: {clean_title}"
@@ -367,7 +374,11 @@ class OpenAIJudge:
             "messages": [
                 {"role": "system", "content": (
                     "Determine whether the external page is for the same exact product model as the shop item. "
-                    "Reject different models, variants, capacities, or uncertain pages. "
+                    "Decide from the actual model, factory execution code, hardware revision and confirmed functional configuration. "
+                    "A standalone regional marker is neutral by itself, but confirmed differences in SIM/eSIM configuration, "
+                    "communication generation such as 4G versus 5G, hardware revision, factory execution, capacity, or functional sub-model mean a different product. "
+                    "Never ignore an authentic model code or revision merely because it is a suffix. "
+                    "If the shop specifies an exact configuration and the page does not establish it, reject the uncertain page. "
                     "Do not compare specifications, description, or photos. "
                     'Return JSON only: {"same_model": true or false}.'
                 )},
@@ -375,6 +386,7 @@ class OpenAIJudge:
                     f"Shop title: {product.title}\nBrand: {product.vendor_name or ''}\n"
                     f"Manufacturer SKU: {product.manufacturer_sku or ''}\n"
                     f"Vendor SKU: {product.vendor_sku or ''}\nBarcode: {product.barcode or ''}\n"
+                    f"Shop specifications: {json.dumps(product.current_specs, ensure_ascii=False, sort_keys=True)}\n"
                     f"Reference URL: {reference_url}\nReference page:\n{external_markdown[:50000]}"
                 )},
             ],
@@ -512,7 +524,9 @@ class OpenAIJudge:
                 )
 
             # Filter out false-positive discrepancies where reference has placeholder/no data
-            placeholder_markers = ("нет данных", "не указано", "отсутствует", "-", "n/a", "none", "null")
+            placeholder_markers = ("нет данных", "не указано", "-", "n/a", "none", "null")
+            evidence_text = _normalize_evidence_text(external_markdown[:25000])
+            invalid_evidence_count = 0
             valid_discrepancies: list[LLMDiscrepancy] = []
             for d in output.discrepancies:
                 ref_val = (d.reference_value or "").strip().lower()
@@ -520,8 +534,11 @@ class OpenAIJudge:
                 quote_val = (d.proof_quote or "").strip().lower()
                 if ref_val in placeholder_markers or quote_val in placeholder_markers:
                     continue
+                if not quote_val or _normalize_evidence_text(d.proof_quote) not in evidence_text:
+                    invalid_evidence_count += 1
+                    continue
                 # If shop_value is missing or placeholder, this is actually a missing spec, not a discrepancy!
-                if not shop_val or shop_val in ("нет", "отсутствует", "не указано", "n/a", "none"):
+                if not shop_val or shop_val in placeholder_markers:
                     output.missing_specs.append(
                         LLMMissingSpec(
                             spec_name=d.spec_name,
@@ -571,10 +588,19 @@ class OpenAIJudge:
                 "надежн", "high", "low", "medium", "basic", "premium", "good",
             )
             filtered_missing: list[LLMMissingSpec] = []
+            current_spec_names = {
+                _normalize_evidence_text(name) for name in product.current_specs if name.strip()
+            }
             for m in output.missing_specs:
                 m_name = (m.spec_name or "").strip().lower()
                 m_val = (m.reference_value or "").strip().lower()
                 if not m_name or not m_val:
+                    continue
+                if _normalize_evidence_text(m.spec_name) in current_spec_names:
+                    continue
+                normalized_quote = _normalize_evidence_text(m.proof_quote)
+                if not normalized_quote or normalized_quote not in evidence_text:
+                    invalid_evidence_count += 1
                     continue
                 if any(kw in m_name for kw in excluded_missing_keywords):
                     continue
@@ -589,7 +615,14 @@ class OpenAIJudge:
                 filtered_missing.append(m)
             output.missing_specs = filtered_missing
 
-            if not valid_discrepancies and audit_status == AuditStatus.MISMATCH:
+            if (
+                invalid_evidence_count
+                and not valid_discrepancies
+                and not output.missing_specs
+            ):
+                audit_status = AuditStatus.ERROR
+                output.details = "Ответ модели не содержит проверяемых цитат из эталона."
+            elif not valid_discrepancies and audit_status == AuditStatus.MISMATCH:
                 audit_status = AuditStatus.VERIFIED
                 output.details = f"Все заявленные характеристики витрины подтверждены эталоном; выявлено {len(output.missing_specs)} характеристик для обогащения."
             elif valid_discrepancies and len(valid_discrepancies) < len(output.discrepancies):

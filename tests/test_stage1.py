@@ -1,6 +1,8 @@
 import hashlib
 from pathlib import Path
+
 import pytest
+
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
 from src.domain.entities import AuditStatus, Product
 from src.domain.services import ParentChildGrouper
@@ -115,19 +117,99 @@ class TestParentChildGrouper:
 
         assert p1.is_master is True
         assert p1.parent_sku is None
-        assert p1.master_key == "apple_iphone_13_128gb"
+        assert p1.master_key is not None
+        assert p1.master_key.startswith("apple_iphone_13_128gb__specs_")
 
         assert p2.is_master is False
         assert p2.parent_sku == "MLPF3RM/A"
-        assert p2.master_key == "apple_iphone_13_128gb"
+        assert p2.master_key == p1.master_key
 
         assert p3.is_master is False
         assert p3.parent_sku == "MLPF3RM/A"
-        assert p3.master_key == "apple_iphone_13_128gb"
+        assert p3.master_key == p1.master_key
 
         assert p4.is_master is True
         assert p4.parent_sku is None
-        assert p4.master_key == "apple_iphone_13_256gb"
+        assert p4.master_key is not None
+        assert p4.master_key.startswith("apple_iphone_13_256gb__specs_")
+
+    def test_standalone_region_is_neutral_but_factory_suffix_is_preserved(
+        self, grouper: ParentChildGrouper
+    ) -> None:
+        specs = {"Память": "128 ГБ", "Связь": "5G"}
+        regional_keys = {
+            grouper.extract_master_key(title, specs)
+            for title in ("Model X KZ", "Model X EU", "Model X DE", "Model X Global")
+        }
+        assert regional_keys == {"model_x_128gb"}
+        assert grouper.extract_master_key("Model X", specs) == "model_x_128gb"
+        assert grouper.extract_master_key("Model X ABC-123", specs) == "model_x_abc-123_128gb"
+        assert grouper.extract_master_key("Model X HX9", specs) == "model_x_hx9_128gb"
+        assert grouper.extract_master_key("Model X abc", specs) == "model_x_abc_128gb"
+
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            ("Model X 1 SIM", "Model X Dual SIM"),
+            ("Model X eSIM", "Model X Dual SIM"),
+            ("Router X 4G", "Router X 5G"),
+            ("Router X V1", "Router X V2"),
+        ],
+    )
+    def test_technical_variant_markers_remain_distinct(
+        self, grouper: ParentChildGrouper, first: str, second: str
+    ) -> None:
+        assert grouper.extract_master_key(first) != grouper.extract_master_key(second)
+
+    def test_spec_signature_is_stable_and_conservative(
+        self, grouper: ParentChildGrouper
+    ) -> None:
+        first = {"Стандарт связи": "5G", "Память": "128 ГБ", "Цвет": "Black"}
+        reordered = {"Цвет": "White", "Память": "128 ГБ", "Стандарт связи": "5G"}
+        different = {"Память": "128 ГБ", "Стандарт связи": "4G", "Цвет": "Black"}
+
+        products = [
+            Product(product_id=201, title="Model X KZ", current_specs=first),
+            Product(product_id=202, title="Model X EU", current_specs=reordered),
+            Product(product_id=203, title="Model X Global", current_specs=different),
+            Product(product_id=204, title="Model X", current_specs={}),
+        ]
+
+        summary = grouper.group_products(products)
+
+        assert products[0].master_key == products[1].master_key
+        assert products[0].master_key != products[2].master_key
+        assert products[0].master_key != products[3].master_key
+        assert summary.master_count == 3
+        assert summary.child_count == 1
+        assert all(
+            product.master_key.startswith("model_x_128gb__specs_")
+            for product in products[:3]
+        )
+        assert products[3].master_key == "model_x__specs_unknown"
+
+    def test_master_key_is_stable_across_separate_batches(
+        self, grouper: ParentChildGrouper
+    ) -> None:
+        first = Product(
+            product_id=301,
+            title="Model X KZ",
+            current_specs={"Стандарт связи": "4G"},
+        )
+        second = Product(
+            product_id=302,
+            title="Model X EU",
+            current_specs={"Стандарт связи": "5G"},
+        )
+
+        first_summary = grouper.group_products([first])
+        seen_keys = set(first_summary.groups)
+        second_summary = grouper.group_products([second])
+
+        assert first.master_key == next(iter(first_summary.groups))
+        assert second.master_key == next(iter(second_summary.groups))
+        assert first.master_key != second.master_key
+        assert second.master_key not in seen_keys
 
 
 class TestSQLiteRepository:
