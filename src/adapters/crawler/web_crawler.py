@@ -138,10 +138,10 @@ class WebCrawler:
                 except Exception:
                     pass
 
-            await context.route("**/*", _route_filter)
-
-            page = await context.new_page()
+            page: Any = None
             try:
+                await context.route("**/*", _route_filter)
+                page = await context.new_page()
                 response = await page.goto(
                     url,
                     wait_until="domcontentloaded",
@@ -305,14 +305,14 @@ class WebCrawler:
 
                         return {
                             title: title,
-                            markdown: lines.join('\\n').trim(),
+                            markdown: lines.join('\\n').trim().substring(0, 50000),
                             imagesCount: imagesCount
                         };
                     }"""
                 )
 
                 title = extracted.get("title", "")
-                markdown = extracted.get("markdown", "")
+                markdown = str(extracted.get("markdown", ""))[:50000]
                 ref_images_cnt = int(extracted.get("imagesCount", 0))
 
                 md_lower = markdown.lower()
@@ -371,5 +371,12 @@ class WebCrawler:
                     error=str(e),
                 )
             finally:
-                await page.close()
-                await context.close()
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                try:
+                    await context.close()
+                except Exception:
+                    pass

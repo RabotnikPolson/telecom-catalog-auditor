@@ -61,6 +61,7 @@ class KaspiSearchClient:
         self.timeout = timeout
         self.city_code = city_code
         self.base_url = "https://kaspi.kz/yml/product-view/pl/results"
+        self.last_error: str | None = None
 
     async def search(
         self,
@@ -71,8 +72,9 @@ class KaspiSearchClient:
     ) -> list[str]:
         """
         Queries Kaspi internal search API and returns up to `limit` relevant product card URLs.
-        Guaranteed to never raise exceptions, returning [] on timeout or network error.
+        Records errors in self.last_error instead of raising exceptions, returning [] on error.
         """
+        self.last_error = None
         clean_query = query.strip()
         if not clean_query:
             return []
@@ -130,7 +132,9 @@ class KaspiSearchClient:
             return candidates
 
         except Exception as e:
-            logger.warning(f"Kaspi search fallback encountered non-fatal error for '{clean_query}': {e}")
+            err_msg = f"Kaspi search error for '{clean_query}': {e}"
+            logger.warning(err_msg)
+            self.last_error = err_msg
             return []
         finally:
             if should_close:

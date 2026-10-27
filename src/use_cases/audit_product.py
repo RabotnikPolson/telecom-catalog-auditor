@@ -12,7 +12,7 @@ from src.adapters.db.sqlite_repo import SQLiteProductRepository
 from src.adapters.llm.gemini_judge import GeminiJudge
 from src.domain.entities import AuditResult, AuditStatus, Product
 from src.domain.exceptions import DomainError
-from src.use_cases.resolve_reference import ResolveReferenceUseCase
+from src.use_cases.resolve_reference import ResolvedReference, ResolveReferenceUseCase
 
 
 def evaluate_photos_status(shop_count: int, reference_count: int) -> str:
@@ -121,10 +121,22 @@ class AuditProductUseCase:
         if photos_only:
             return await self._audit_photos(product, reference_url, force_refresh, previous)
 
+        resolved: ResolvedReference | None = None
         urls_to_try: list[str] = []
         if reference_url:
             urls_to_try = [reference_url]
             search_trace = [f"[Manual Reference] Using direct reference URL override: {reference_url}"]
+            resolved = ResolvedReference(
+                product_id=product.product_id,
+                reference_url=reference_url,
+                source_type="MANUAL_OVERRIDE",
+                query_used=None,
+                scenario_applied="MANUAL",
+                status="FOUND",
+                candidate_urls=[reference_url],
+                is_cached=False,
+                search_trace=search_trace,
+            )
         else:
             resolver_fn = getattr(self.reference_resolver, "execute", None) or getattr(self.reference_resolver, "resolve", None)
             if resolver_fn:
@@ -143,22 +155,42 @@ class AuditProductUseCase:
             search_trace = list(getattr(resolved, "search_trace", [])) if resolved else []
 
             if not candidates:
-                search_trace.append("[Audit] No reference candidate URLs available to evaluate -> Status: NOT_FOUND")
-                result = AuditResult(
-                    product_id=product.product_id,
-                    status=AuditStatus.NOT_FOUND,
-                    confidence_score=0.0,
-                    reference_url=None,
-                    discrepancies=[],
-                    matched_specs_count=0,
-                    total_specs_count=len(product.current_specs),
-                    audited_at=datetime.now(UTC),
-                    details="Reference URL could not be resolved from suppliers or search",
-                    search_trace=search_trace,
-                    execution_time_sec=round(time.perf_counter() - t_audit_start, 2),
-                    images_count=product.images_count,
-                    images_status=evaluate_photos_status(product.images_count, 0),
-                )
+                search_err = getattr(resolved, "search_error", None)
+                if search_err:
+                    search_trace.append(f"[Audit] Search cascade failed due to technical error: {search_err} -> Status: ERROR")
+                    result = AuditResult(
+                        product_id=product.product_id,
+                        status=AuditStatus.ERROR,
+                        confidence_score=0.0,
+                        reference_url=None,
+                        discrepancies=[],
+                        matched_specs_count=0,
+                        total_specs_count=len(product.current_specs),
+                        audited_at=datetime.now(UTC),
+                        details=f"Search failed due to external API or network error: {search_err}",
+                        search_trace=search_trace,
+                        execution_time_sec=round(time.perf_counter() - t_audit_start, 2),
+                        images_count=product.images_count,
+                        images_status=evaluate_photos_status(product.images_count, 0),
+                    )
+                else:
+                    search_trace.append("[Audit] No reference candidate URLs available to evaluate -> Status: NOT_FOUND")
+                    result = AuditResult(
+                        product_id=product.product_id,
+                        status=AuditStatus.NOT_FOUND,
+                        confidence_score=0.0,
+                        reference_url=None,
+                        discrepancies=[],
+                        matched_specs_count=0,
+                        total_specs_count=len(product.current_specs),
+                        audited_at=datetime.now(UTC),
+                        details="Reference URL could not be resolved from suppliers or search",
+                        search_trace=search_trace,
+                        execution_time_sec=round(time.perf_counter() - t_audit_start, 2),
+                        images_count=product.images_count,
+                        images_status=evaluate_photos_status(product.images_count, 0),
+                    )
+                self._persist_audit(product, result)
                 return result
             urls_to_try = candidates
 
@@ -259,14 +291,46 @@ class AuditProductUseCase:
 
         winning_result: AuditResult | None = None
         is_step1_code = bool(not reference_url and resolved and resolved.source_type == "CODE_PINPOINT")
+        is_from_cache = bool(not reference_url and resolved and resolved.source_type == "CACHE")
         step1_max = 2 if is_step1_code else None
 
         if urls_to_try:
             winning_result = await _evaluate_candidates(
                 urls_to_try,
-                label_prefix="Step 1 Candidate" if is_step1_code else "Candidate",
+                label_prefix="Step 1 Candidate" if is_step1_code else ("Cached Candidate" if is_from_cache else "Candidate"),
                 max_to_test=step1_max,
             )
+
+        # Escalate to fresh live search if cached candidate was rejected
+        if winning_result is None and is_from_cache:
+            search_trace.append(
+                "[Cache Rejected] Cached reference candidate rejected by judge. "
+                "Escalating to live external search cascade..."
+            )
+            resolver_fn = getattr(self.reference_resolver, "execute", None) or getattr(self.reference_resolver, "resolve", None)
+            if resolver_fn:
+                try:
+                    resolved_live = await resolver_fn(product, force_refresh=True)
+                except Exception as exc:
+                    resolved_live = None
+                    search_trace.append(f"[Search Error] Live search after cache rejection failed: {exc}")
+
+                live_candidates = getattr(resolved_live, "candidate_urls", []) if resolved_live else []
+                first_live = getattr(resolved_live, "reference_url", None)
+                if first_live and first_live not in live_candidates:
+                    live_candidates.insert(0, first_live)
+
+                if resolved_live:
+                    for t in getattr(resolved_live, "search_trace", []):
+                        if t not in search_trace:
+                            search_trace.append(t)
+
+                if live_candidates:
+                    winning_result = await _evaluate_candidates(
+                        live_candidates,
+                        label_prefix="Live Candidate",
+                        max_to_test=None,
+                    )
 
         # Escalate to Step 2 (Marketing Model Search) if Step 1 pinpoint candidates were rejected or exhausted
         if winning_result is None and is_step1_code:
@@ -312,6 +376,7 @@ class AuditProductUseCase:
             search_trace.append("[Evaluation] All candidate URLs exhausted without a verified match.")
             last_result.product_id = product.product_id
             last_result.search_trace = search_trace
+            self._persist_audit(product, last_result)
             return last_result
 
         search_trace.append(f"[Evaluation] All candidates failed. Crawler error: {crawl_error or 'No candidates accessible'}")
@@ -331,6 +396,7 @@ class AuditProductUseCase:
             images_count=product.images_count,
             images_status=evaluate_photos_status(product.images_count, 0),
         )
+        self._persist_audit(product, result)
         return result
 
     async def _audit_photos(
@@ -345,6 +411,7 @@ class AuditProductUseCase:
         reference_count: int | None = None
         if product.images_count_known:
             error = "Подходящий эталон не найден."
+            resolved: ResolvedReference | None = None
             if reference_url:
                 candidates = [reference_url]
             else:

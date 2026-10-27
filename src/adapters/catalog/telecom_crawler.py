@@ -49,6 +49,8 @@ class ProductDetailResult:
     detail_url: str
     shop_sku: str | None = None
     barcode: str | None = None
+    description: str | None = None
+    photos_count: int | None = None
 
 
 
@@ -306,6 +308,8 @@ class TelecomShopCrawler:
         vendor_sku = None
         vendor_name = None
         title = ""
+        description: str | None = None
+        photos_count: int | None = None
 
         m_data = re.search(r'<input[^>]*id=["\']productData["\'][^>]*value=["\'](.*?)["\']', page_html, re.DOTALL)
         if m_data:
@@ -328,6 +332,16 @@ class TelecomShopCrawler:
                     name_from_json = data.get("name")
                     if name_from_json and str(name_from_json).strip():
                         title = self._clean_html_text(str(name_from_json))
+
+                    desc_raw = data.get("description") or data.get("full_description") or data.get("product_description")
+                    if desc_raw and str(desc_raw).strip():
+                        description = self._clean_html_text(str(desc_raw))
+
+                    imgs_raw = data.get("images") or data.get("photos") or data.get("gallery") or data.get("media")
+                    if isinstance(imgs_raw, list) and imgs_raw:
+                        photos_count = len(imgs_raw)
+                    elif isinstance(data.get("images_count"), int):
+                        photos_count = data["images_count"]
 
                     all_p = data.get("all_partners") or []
                     if all_p and isinstance(all_p, list) and isinstance(all_p[0], dict):
@@ -421,6 +435,34 @@ class TelecomShopCrawler:
         if not title or title.strip().lower() in ("страница не найдена!", "страница не найдена", "404 not found", "404"):
             return None
 
+        if not description:
+            desc_m = re.search(
+                r'<(?:div|section|article)[^>]*class=["\'][^"\']*(?:product-description|description-block|tab-description|product-info__description|detail-text)[^"\']*["\'][^>]*>(.*?)</(?:div|section|article)>',
+                page_html,
+                re.DOTALL | re.I,
+            )
+            if desc_m:
+                cleaned_desc = self._clean_html_text(desc_m.group(1))
+                if len(cleaned_desc) > 10:
+                    description = cleaned_desc
+
+        if photos_count is None:
+            gallery_items = re.findall(
+                r'<div[^>]*class=["\'][^"\']*(?:slider__item|gallery__item|swiper-slide|product-gallery__item)[^"\']*["\'][^>]*>',
+                page_html,
+                re.I,
+            )
+            if gallery_items:
+                photos_count = len(gallery_items)
+            else:
+                prod_imgs = re.findall(
+                    r'<img[^>]*class=["\'][^"\']*(?:product-image|gallery|slider|item__slider)[^"\']*["\'][^>]*>',
+                    page_html,
+                    re.I,
+                )
+                if prod_imgs:
+                    photos_count = len(prod_imgs)
+
         return ProductDetailResult(
             product_id=pid,
             shop_sku=shop_sku,
@@ -431,6 +473,8 @@ class TelecomShopCrawler:
             current_specs=specs,
             detail_url=url,
             barcode=barcode,
+            description=description,
+            photos_count=photos_count,
         )
 
     async def search_product_ids(self, query: str) -> list[int]:

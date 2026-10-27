@@ -236,6 +236,9 @@ async def _live_sync_products(
                             manufacturer_sku=details.manufacturer_sku,
                             barcode=details.barcode,
                             current_specs=details.current_specs,
+                            description=details.description,
+                            images_count=details.photos_count or 0,
+                            images_count_known=details.photos_count is not None,
                         )
                         print(f"  [+] Web crawl OK: SKU/ID '{key}' -> ID #{p.product_id} | Shop SKU: {p.shop_sku or 'N/A'} | {p.title[:50]}")
                         print(f"      Current specs on store: {len(p.current_specs)} items.")

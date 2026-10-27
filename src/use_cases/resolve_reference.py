@@ -26,6 +26,7 @@ class ResolvedReference:
     candidate_urls: list[str] = field(default_factory=list)
     is_cached: bool = False
     search_trace: list[str] = field(default_factory=list)
+    search_error: str | None = None
 
 def is_valid_model_code(code: str | None) -> bool:
     """
@@ -565,6 +566,30 @@ class ResolveReferenceUseCase:
                 candidate_urls=candidate_pool,
                 is_cached=False,
                 search_trace=trace,
+                search_error=None,
+            )
+
+        # Distinguish technical / quota error from legitimate absence of reference
+        search_err: str | None = None
+        err_items = [
+            getattr(self.serper_client, "last_error", None),
+            getattr(self.kaspi_client, "last_error", None),
+        ]
+        active_errs = [e for e in err_items if e]
+        if active_errs:
+            search_err = "; ".join(active_errs)
+            trace.append(f"[Resolved] Search failed due to technical error(s): {search_err} -> Status: ERROR")
+            return ResolvedReference(
+                product_id=product.product_id,
+                reference_url=None,
+                source_type=source_type,
+                query_used=clean_model_query,
+                scenario_applied=scenario_override,
+                status="ERROR",
+                candidate_urls=[],
+                is_cached=False,
+                search_trace=trace,
+                search_error=search_err,
             )
 
         trace.append(f"[Resolved] All search attempts exhausted for model '{clean_model_query}'. No whitelisted candidate pages found -> Status: NOT_FOUND")
@@ -578,5 +603,6 @@ class ResolveReferenceUseCase:
             candidate_urls=[],
             is_cached=False,
             search_trace=trace,
+            search_error=None,
         )
 

@@ -69,13 +69,11 @@ class CrawlShopCatalogUseCase:
                 batch_size=batch_size, limit=limit, category_id=category_id
             ):
                 stats.products_seen += len(batch)
-                inserted = self.repo.batch_upsert(batch)
-                stats.products_added += inserted
                 self._notify(
-                    f"Sync progress: {stats.products_seen}/{target_limit} products processed ({inserted} upserted into local DB)..."
+                    f"Sync progress: {stats.products_seen}/{target_limit} products scanned from MySQL..."
                 )
 
-        self._notify(f"MySQL catalog sync finished: {stats.products_seen} products saved.")
+        self._notify(f"MySQL catalog sync finished: {stats.products_seen} products streamed (JIT persistence active).")
         return stats
 
     async def execute(
@@ -162,14 +160,18 @@ class CrawlShopCatalogUseCase:
             total_pages = page_result.total_pages
 
             if not page_result.items:
+                is_natural_end = current_page >= total_pages
                 self.repo.update_crawler_state(
                     cat_key,
                     last_page=current_page,
                     total_pages=total_pages,
-                    is_completed=True,
+                    is_completed=is_natural_end,
                 )
                 break
 
+            # Batch fetch existing products to eliminate N+1 queries
+            pids = [p.product_id for p in page_result.items]
+            existing_map = self.repo.get_products_by_ids(pids) if hasattr(self.repo, "get_products_by_ids") else {}
             products_to_upsert: list[Product] = []
 
             for preview in page_result.items:
@@ -178,7 +180,8 @@ class CrawlShopCatalogUseCase:
 
                 stats.products_seen += 1
                 try:
-                    product_obj, is_updated, is_skipped = await self._process_product(preview)
+                    existing_p = existing_map.get(preview.product_id)
+                    product_obj, is_updated, is_skipped = await self._process_product(preview, existing=existing_p)
                     if is_skipped:
                         stats.products_skipped += 1
                     elif is_updated:
@@ -197,7 +200,8 @@ class CrawlShopCatalogUseCase:
             if products_to_upsert:
                 self.repo.batch_upsert(products_to_upsert)
 
-            is_completed = current_page >= total_pages or not page_result.has_next
+            hit_limit = limit is not None and stats.products_seen >= limit
+            is_completed = (not hit_limit) and (current_page >= total_pages or not page_result.has_next)
             self.repo.update_crawler_state(
                 cat_key,
                 last_page=current_page,
@@ -210,33 +214,49 @@ class CrawlShopCatalogUseCase:
                 f"Batch: {len(products_to_upsert)} saved. Total seen: {stats.products_seen}"
             )
 
-            if is_completed or not page_result.has_next:
+            if is_completed or not page_result.has_next or hit_limit:
                 break
 
             current_page += 1
 
     async def _process_product(
-        self, preview: CatalogItemPreview
+        self, preview: CatalogItemPreview, existing: Product | None = None
     ) -> tuple[Product | None, bool, bool]:
         assert self.repo is not None
         assert self.crawler is not None
-        existing = self.repo.get_product_by_id(preview.product_id)
+        if existing is None:
+            existing = self.repo.get_product_by_id(preview.product_id)
 
         try:
             details = await self.crawler.fetch_product_details(preview.detail_url)
         except Exception:
             details = None
 
-        title = (details.title if details and details.title else preview.title).strip()
-        if not title:
-            title = f"Product #{preview.product_id}"
-
-        specs = details.current_specs if details else {}
-        shop_sku = details.shop_sku if details else None
-        vendor_sku = details.vendor_sku if details and details.vendor_sku else preview.vendor_sku
-        manufacturer_sku = details.manufacturer_sku if details else None
-        vendor_name = details.vendor_name if details else None
-        barcode = details.barcode if details else None
+        if details is not None:
+            title = (details.title if details.title else preview.title).strip()
+            specs = details.current_specs
+            shop_sku = details.shop_sku
+            vendor_sku = details.vendor_sku if details.vendor_sku else preview.vendor_sku
+            manufacturer_sku = details.manufacturer_sku
+            vendor_name = details.vendor_name
+            barcode = details.barcode
+        elif existing is not None:
+            # Protect existing specs from being erased when page detail fetch fails
+            title = existing.title
+            specs = existing.current_specs
+            shop_sku = existing.shop_sku
+            vendor_sku = existing.vendor_sku
+            manufacturer_sku = existing.manufacturer_sku
+            vendor_name = existing.vendor_name
+            barcode = existing.barcode
+        else:
+            title = preview.title.strip()
+            specs = {}
+            shop_sku = None
+            vendor_sku = preview.vendor_sku
+            manufacturer_sku = None
+            vendor_name = None
+            barcode = None
 
         calculated_hash = Product.compute_content_hash(title, specs)
 

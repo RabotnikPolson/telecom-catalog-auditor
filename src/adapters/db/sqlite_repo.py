@@ -151,6 +151,22 @@ class SQLiteProductRepository:
             row = cursor.fetchone()
             return self._row_to_product(row) if row else None
 
+    def get_products_by_ids(self, product_ids: Sequence[int]) -> dict[int, Product]:
+        if not product_ids:
+            return {}
+        unique_ids = list({int(pid) for pid in product_ids})
+        placeholders = ",".join("?" for _ in unique_ids)
+        sql = f"SELECT * FROM products WHERE product_id IN ({placeholders});"
+        with get_sqlite_connection(self.db_path) as conn:
+            cursor = conn.execute(sql, unique_ids)
+            rows = cursor.fetchall()
+            result: dict[int, Product] = {}
+            for row in rows:
+                p = self._row_to_product(row)
+                if p and p.product_id:
+                    result[p.product_id] = p
+            return result
+
     def get_product_by_shop_sku(self, shop_sku: str) -> Product | None:
         sql = "SELECT * FROM products WHERE shop_sku = ? LIMIT 1;"
         with get_sqlite_connection(self.db_path) as conn:

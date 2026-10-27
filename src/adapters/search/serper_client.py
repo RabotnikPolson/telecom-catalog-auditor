@@ -48,6 +48,7 @@ class SerperClient:
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._external_client = client
         self._client: httpx.AsyncClient | None = client
+        self.last_error: str | None = None
 
     def _create_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -82,8 +83,11 @@ class SerperClient:
         return False
 
     async def search(self, query: str, num_results: int = 10) -> list[dict[str, Any]]:
+        self.last_error = None
         if not self.api_key:
-            logger.warning("SerperClient: SERPER_API_KEY is not configured.")
+            msg = "SerperClient: SERPER_API_KEY is not configured."
+            logger.warning(msg)
+            self.last_error = msg
             return []
 
         clean_query = query.strip()
@@ -122,10 +126,14 @@ class SerperClient:
                     if attempt < 2:
                         await asyncio.sleep(0.5 * (attempt + 1))
                         continue
-                    logger.error(f"Serper API search error for '{clean_query}': {exc}")
+                    err_msg = f"Serper API search error for '{clean_query}': {exc}"
+                    logger.error(err_msg)
+                    self.last_error = err_msg
                     return []
                 except Exception as exc:
-                    logger.error(f"Serper API unexpected error for '{clean_query}': {exc}")
+                    err_msg = f"Serper API unexpected error for '{clean_query}': {exc}"
+                    logger.error(err_msg)
+                    self.last_error = err_msg
                     return []
             return []
 

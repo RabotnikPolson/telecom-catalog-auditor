@@ -627,7 +627,10 @@ class OpenAIJudge:
                 output.details = "Ответ модели не содержит проверяемых цитат из эталона."
             elif not valid_discrepancies and audit_status == AuditStatus.MISMATCH:
                 audit_status = AuditStatus.VERIFIED
-                output.details = f"Все заявленные характеристики витрины подтверждены эталоном; выявлено {len(output.missing_specs)} характеристик для обогащения."
+                if output.discrepancies:
+                    output.details = f"Заявленные моделью расхождения не подтвердились при проверке; выявлено {len(output.missing_specs)} характеристик для обогащения."
+                else:
+                    output.details = f"Все заявленные характеристики витрины подтверждены эталоном; выявлено {len(output.missing_specs)} характеристик для обогащения."
             elif (
                 had_proposed_findings
                 and not valid_discrepancies
