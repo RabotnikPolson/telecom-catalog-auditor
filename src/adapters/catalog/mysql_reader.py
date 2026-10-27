@@ -1,6 +1,7 @@
+import asyncio
 import logging
 from collections import defaultdict
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from types import TracebackType
 from typing import TypedDict
 
@@ -35,6 +36,18 @@ class GroupSummaryDict(TypedDict):
 
 class MySQLReaderError(DomainError):
     """Raised when an error occurs during MySQL catalog reading."""
+
+
+class MySQLConfigurationError(MySQLReaderError):
+    """Required connection settings are missing."""
+
+
+class MySQLConnectionError(MySQLReaderError):
+    """The catalog connection could not be opened or was lost."""
+
+
+class MySQLQueryError(MySQLReaderError):
+    """The catalog query could not be completed."""
 
 
 class MySQLCatalogReader:
@@ -72,8 +85,8 @@ class MySQLCatalogReader:
             return
 
         if not self.host or not self.user or not self.password:
-            raise MySQLReaderError(
-                "MySQL credentials not configured. Please set MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD in .env"
+            raise MySQLConfigurationError(
+                "MySQL не настроен: необходимы MYSQL_HOST, MYSQL_USER и MYSQL_PASSWORD."
             )
 
         try:
@@ -98,7 +111,7 @@ class MySQLCatalogReader:
             logger.info("Connected to MySQL catalog at %s:%s/%s (READ-ONLY)", self.host, self.port, self.database)
         except Exception as e:
             logger.error("Failed to connect to MySQL database: %s", e)
-            raise MySQLReaderError(f"Database connection error: {e}") from e
+            raise MySQLConnectionError("Не удалось подключиться к MySQL.") from e
 
     async def close(self) -> None:
         """Close connection pool."""
@@ -459,7 +472,36 @@ class MySQLCatalogReader:
         category_id: int | None = None,
         main_category_id: int | None = None,
         only_active: bool = True,
-    ) -> AsyncIterator[list[Product]]:
+    ) -> AsyncGenerator[list[Product]]:
+        """Keep transport failures distinct from a successful empty selection."""
+        if batch_size <= 0 or offset < 0 or (limit is not None and limit < 0):
+            raise ValueError("batch_size must be positive; offset and limit must be nonnegative")
+        stream = self._stream_products(
+            batch_size, limit, offset, last_seen_id, category_id, main_category_id, only_active,
+        )
+        try:
+            async for batch in stream:
+                yield batch
+        except MySQLReaderError:
+            raise
+        except (OSError, aiomysql.Error) as exc:
+            code = exc.args[0] if exc.args else None
+            if isinstance(exc, OSError) or code in (2003, 2006, 2013, 2055):
+                raise MySQLConnectionError("Потеряно соединение с MySQL при чтении каталога.") from exc
+            raise MySQLQueryError("Не удалось выполнить запрос каталога MySQL.") from exc
+        finally:
+            await stream.aclose()
+
+    async def _stream_products(
+        self,
+        batch_size: int = 500,
+        limit: int | None = None,
+        offset: int = 0,
+        last_seen_id: int = 0,
+        category_id: int | None = None,
+        main_category_id: int | None = None,
+        only_active: bool = True,
+    ) -> AsyncGenerator[list[Product]]:
         """
         Stream products in batches using O(N) Keyset Pagination (p.id > last_seen_id)
         with batch attribute fetching. Yields list[Product] per batch.
@@ -527,7 +569,7 @@ class MySQLCatalogReader:
                 {pagination_clause};
             """
 
-            async with pool.acquire() as conn:
+            async with asyncio.timeout(30), pool.acquire() as conn:
                 async with conn.cursor() as cur:
                     await self._init_session(cur)
                     await cur.execute(query, tuple(params))

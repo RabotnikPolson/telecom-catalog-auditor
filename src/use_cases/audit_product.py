@@ -1,13 +1,17 @@
 import asyncio
 import json
+import sqlite3
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
+
+import httpx
 
 from src.adapters.crawler.web_crawler import WebCrawler
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
 from src.adapters.llm.gemini_judge import GeminiJudge
 from src.domain.entities import AuditResult, AuditStatus, Product
+from src.domain.exceptions import DomainError
 from src.use_cases.resolve_reference import ResolveReferenceUseCase
 
 
@@ -68,6 +72,48 @@ class AuditProductUseCase:
         prior_result: AuditResult | None = None,
         prior_loaded: bool = False,
     ) -> AuditResult:
+        previous = prior_result if prior_loaded else self.product_repo.get_latest_audit_result(product.product_id)
+        photos_handled = False
+        try:
+            result = await self._audit_product(
+                product, reference_url, force_refresh, skip_desc, skip_tech, photos_only,
+                previous, True,
+            )
+            photos_handled = photos_only
+        except (DomainError, httpx.HTTPError, TimeoutError, ValueError) as exc:
+            result = AuditResult(
+                product_id=product.product_id,
+                status=AuditStatus.ERROR,
+                details=f"Не удалось проверить товар: {exc}",
+                total_specs_count=len(product.current_specs),
+                photos_only_run=photos_only,
+                photos_error=str(exc) if photos_only else None,
+            )
+        if photos_handled:
+            return result
+        if result.status in (AuditStatus.ERROR, AuditStatus.NOT_FOUND):
+            retained = previous.model_copy(deep=True) if previous else result
+            attempted_parts = ["photos"]
+            if not photos_only and not skip_tech:
+                attempted_parts.append("specs")
+            if not photos_only and not skip_desc and product.description is not None:
+                attempted_parts.append("description")
+            for part in attempted_parts:
+                retained.audit_parts.pop(part, None)
+            self._persist_audit(product, retained)
+        return result
+
+    async def _audit_product(
+        self,
+        product: Product,
+        reference_url: str | None = None,
+        force_refresh: bool = False,
+        skip_desc: bool = False,
+        skip_tech: bool = False,
+        photos_only: bool = False,
+        prior_result: AuditResult | None = None,
+        prior_loaded: bool = False,
+    ) -> AuditResult:
         t_audit_start = time.perf_counter()
         crawler_time_sec = 0.0
         previous = prior_result if prior_loaded else self.product_repo.get_latest_audit_result(product.product_id)
@@ -113,9 +159,6 @@ class AuditProductUseCase:
                     images_count=product.images_count,
                     images_status=evaluate_photos_status(product.images_count, 0),
                 )
-                if previous:
-                    return result
-                self._persist_audit(product, result)
                 return result
             urls_to_try = candidates
 
@@ -269,9 +312,6 @@ class AuditProductUseCase:
             search_trace.append("[Evaluation] All candidate URLs exhausted without a verified match.")
             last_result.product_id = product.product_id
             last_result.search_trace = search_trace
-            if previous:
-                return last_result
-            self._persist_audit(product, last_result)
             return last_result
 
         search_trace.append(f"[Evaluation] All candidates failed. Crawler error: {crawl_error or 'No candidates accessible'}")
@@ -291,9 +331,6 @@ class AuditProductUseCase:
             images_count=product.images_count,
             images_status=evaluate_photos_status(product.images_count, 0),
         )
-        if previous:
-            return result
-        self._persist_audit(product, result)
         return result
 
     async def _audit_photos(
@@ -314,6 +351,8 @@ class AuditProductUseCase:
                 resolver_fn = getattr(self.reference_resolver, "execute", None) or getattr(self.reference_resolver, "resolve", None)
                 try:
                     resolved = await resolver_fn(product, force_refresh=force_refresh) if resolver_fn else None
+                except sqlite3.Error:
+                    raise
                 except Exception as exc:
                     resolved = None
                     error = f"Поиск эталона завершился ошибкой: {exc}"
@@ -335,6 +374,8 @@ class AuditProductUseCase:
                 else:
                     try:
                         crawled = await self.crawler.crawl(url)
+                    except sqlite3.Error:
+                        raise
                     except Exception as exc:
                         error = f"Эталон не удалось открыть: {exc}"
                         continue
@@ -349,6 +390,8 @@ class AuditProductUseCase:
                     )
                 try:
                     matches = await self.judge.matches_model(product, url, markdown)
+                except sqlite3.Error:
+                    raise
                 except Exception as exc:
                     error = f"Проверка модели эталона завершилась ошибкой: {exc}"
                     continue

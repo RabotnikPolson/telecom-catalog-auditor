@@ -1,10 +1,13 @@
 import argparse
 import asyncio
 import io
+import logging
 import os
+import sqlite3
 import sys
 import time
 import warnings
+from collections.abc import AsyncGenerator
 from pathlib import Path
 
 warnings.filterwarnings("ignore", message=".*urllib3.*or chardet.*doesn't match a supported version.*")
@@ -15,7 +18,7 @@ from rich.markup import escape
 from rich.panel import Panel
 
 from config.settings import get_settings
-from src.adapters.catalog.mysql_reader import MySQLCatalogReader
+from src.adapters.catalog.mysql_reader import MySQLCatalogReader, MySQLReaderError
 from src.adapters.catalog.telecom_crawler import TelecomShopCrawler
 from src.adapters.crawler.web_crawler import WebCrawler
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
@@ -23,6 +26,7 @@ from src.adapters.llm.openai_judge import OpenAIJudge
 from src.adapters.search.serper_client import SerperClient
 from src.adapters.search.vendor_direct import VendorDirectResolver
 from src.domain.entities import AuditResult, AuditStatus, Product
+from src.domain.exceptions import GroupingError
 from src.domain.services import ParentChildGrouper
 from src.use_cases.audit_product import AuditProductUseCase
 from src.use_cases.crawl_shop_catalog import CrawlShopCatalogUseCase
@@ -504,8 +508,9 @@ class AuditTUI:
         filled = int((pct / 100) * bar_len)
         bar = "█" * filled + "░" * (bar_len - filled)
 
+        progress = f"\\[{self.completed:02d}/{self.total:02d}] \\[{bar}] {pct}%" if self.total else f"Обработано: {self.completed}"
         lines = [
-            f"[bold cyan]Progress:[/bold cyan] \\[{self.completed:02d}/{self.total:02d}] \\[{bar}] {pct}% | "
+            f"[bold cyan]Progress:[/bold cyan] {progress} | "
             f"[bold green]Verified: {self.verified_count}[/bold green] | "
             f"[bold red]Mismatch: {self.mismatch_count}[/bold red] | "
             f"[bold yellow]Missing: {self.missing_specs_count}[/bold yellow] | "
@@ -514,7 +519,7 @@ class AuditTUI:
         ]
         if self.photos_only:
             lines = [
-                f"[bold cyan]Progress:[/bold cyan] \\[{self.completed:02d}/{self.total:02d}] \\[{bar}] {pct}% | "
+                f"[bold cyan]Progress:[/bold cyan] {progress} | "
                 f"[bold green]Photos checked: {self.photo_checked_count}[/bold green] | "
                 f"[bold yellow]Photo issues: {self.photo_issue_count}[/bold yellow] | "
                 f"[bold red]Errors: {self.error_count}[/bold red]"
@@ -535,9 +540,10 @@ class AuditTUI:
         )
 
 
-def format_audit_card(idx: int, total_count: int, prod: Product, result: AuditResult) -> str:
+def format_audit_card(idx: int, total_count: int | None, prod: Product, result: AuditResult) -> str:
     lines = []
-    lines.append(f"\\[{idx:02d}/{total_count}] Product ID #{prod.product_id} | {escape(prod.title[:150])}")
+    position = f"{idx:02d}/{total_count}" if total_count is not None else f"{idx:04d}"
+    lines.append(f"\\[{position}] Product ID #{prod.product_id} | {escape(prod.title[:150])}")
     lines.append(f"      Shop SKU: {escape(prod.shop_sku or 'N/A')} | Vendor SKU: {escape(prod.vendor_sku or 'N/A')} | Barcode: {escape(prod.barcode or 'N/A')}")
     lines.append(f"      Shop URL: https://shop.telecom.kz/product/{prod.product_id}")
     if result.photos_only_run:
@@ -626,301 +632,289 @@ def _audit_is_current(product: Product, result: AuditResult | None, photos_only:
     return True
 
 
+async def _audit_catalog_batches(
+    args: argparse.Namespace,
+    repo: SQLiteProductRepository,
+    group_id: int | None,
+    main_cat_id: int | None,
+) -> AsyncGenerator[list[Product]]:
+    if args.source == "mysql":
+        async with MySQLCatalogReader() as reader:
+            stream = reader.stream_products(
+                batch_size=100,
+                offset=args.offset,
+                category_id=group_id,
+                main_category_id=main_cat_id,
+                only_active=True,
+            )
+            try:
+                async for batch in stream:
+                    for product in batch:
+                        product.images_count_known = True
+                    yield batch
+            finally:
+                await stream.aclose()
+    else:
+        offset = args.offset
+        while True:
+            batch = repo.get_auditable_products(limit=100, offset=offset)
+            if not batch:
+                break
+            yield batch
+            offset += len(batch)
+            if len(batch) < 100:
+                break
+
+
 async def run_audit_command(args: argparse.Namespace) -> int:
     setup_utf8_terminal()
-
-    db_path = Path(args.db)
-    repo = SQLiteProductRepository(db_path)
+    processed = skipped = unsuccessful = findings = 0
+    total_time = 0.0
+    total_tokens = 0
+    total_cost = 0.0
+    started = time.perf_counter()
+    aborted = False
+    reason = "выборка закончилась"
+    exit_code = 0
+    crawler: WebCrawler | None = None
+    judge: OpenAIJudge | None = None
     settings = get_settings()
-
-    target_keys = _extract_target_keys(args)
-    previous_results: dict[int, AuditResult] = {}
-
-    if target_keys:
-        source_mode = getattr(args, "source", "mysql")
-        products = await _live_sync_products(target_keys, repo, source=source_mode)
-        if not products:
-            print(f"[!] Error: None of the specified products {target_keys} were found.")
-            return 1
-        grouper = ParentChildGrouper()
-        for p in products:
-            if not p.master_key:
-                try:
-                    p.master_key = grouper.extract_master_key(p.title, p.current_specs)
-                except Exception:
-                    p.master_key = f"pid_{p.product_id}"
-    else:
-        source_mode = getattr(args, "source", "mysql")
-        products = []
-        skip_audited = getattr(args, "skip_audited", True) and not getattr(args, "force_refresh", False)
-
-        main_cat_id = getattr(args, "main_cat", None)
-        group_id = getattr(args, "group", None)
-        cat_arg = getattr(args, "category", None)
-        if cat_arg and str(cat_arg).isdigit():
-            group_id = int(cat_arg)
-
-        target_limit = args.limit or 5
-        grouper = ParentChildGrouper()
-        seen_batch_master_keys: set[str] = set()
-        skipped_count = 0
-        mysql_stream_succeeded = False
-        has_category_filter = bool(group_id or main_cat_id)
-
-        if source_mode == "mysql" and settings.MYSQL_HOST:
-            filter_desc = []
-            if main_cat_id:
-                filter_desc.append(f"Main Cat #{main_cat_id}")
-            if group_id:
-                filter_desc.append(f"Group #{group_id}")
-            desc_str = f" ({', '.join(filter_desc)})" if filter_desc else ""
-            print(f"[*] Streaming active products directly from shop MySQL (READ-ONLY, limit={target_limit}{desc_str})...")
-            try:
-                async with MySQLCatalogReader() as mysql_reader:
-                    async for batch in mysql_reader.stream_products(
-                        batch_size=min(500, max(50, target_limit * 4)),
-                        offset=getattr(args, "offset", 0) or 0,
-                        category_id=group_id,
-                        main_category_id=main_cat_id,
-                        only_active=True,
-                    ):
-                        grouper.group_products(batch)
-                        batch_results = repo.get_latest_audit_results_for_ids([p.product_id for p in batch])
-                        previous_results.update(batch_results)
-                        for prod in batch:
-                            prod.images_count_known = True
-                            if not prod.is_master:
-                                skipped_count += 1
-                                continue
-                            if skip_audited:
-                                if _audit_is_current(prod, batch_results.get(prod.product_id), getattr(args, "photos_only", False), getattr(args, "skip_desc", False)):
-                                    print(f"[*] Пропущен товар #{prod.product_id}: нужные проверки уже выполнены, данные магазина не изменились.")
-                                    skipped_count += 1
-                                    continue
-                            if prod.master_key:
-                                if prod.master_key in seen_batch_master_keys:
-                                    skipped_count += 1
-                                    continue
-                                seen_batch_master_keys.add(prod.master_key)
-
-                            products.append(prod)
-                            if len(products) >= target_limit:
-                                break
-                        if len(products) >= target_limit:
-                            break
-                mysql_stream_succeeded = True
-            except Exception as e:
-                print(f"[!] MySQL streaming error: {e}. Falling back to local DB.")
-
-        if has_category_filter and not products:
-            category_label = desc_str.strip(" ()") if desc_str else "specified category"
-            if mysql_stream_succeeded:
-                print(f"[*] No un-audited master products found for {category_label} (all audited or none match filter).")
-                return 0
-            print(f"[!] Cannot fallback to local DB for {category_label}: local SQLite does not store category mappings.")
-            return 1
-
-        if not products and not mysql_stream_succeeded:
-            cur_db_offset = getattr(args, "offset", 0) or 0
-            chunk_size = max(100, target_limit * 4)
-            while len(products) < target_limit:
-                db_candidates = repo.get_auditable_products(limit=chunk_size, offset=cur_db_offset)
-                if not db_candidates:
-                    break
-                cur_db_offset += len(db_candidates)
-                grouper.group_products(db_candidates)
-                batch_results = repo.get_latest_audit_results_for_ids([p.product_id for p in db_candidates])
-                previous_results.update(batch_results)
-                for prod in db_candidates:
-                    if not prod.is_master:
-                        continue
-                    if skip_audited:
-                        if _audit_is_current(prod, batch_results.get(prod.product_id), getattr(args, "photos_only", False), getattr(args, "skip_desc", False)):
-                            print(f"[*] Пропущен товар #{prod.product_id}: нужные проверки уже выполнены, данные магазина не изменились.")
-                            continue
-                    if prod.master_key:
-                        if prod.master_key in seen_batch_master_keys:
-                            continue
-                        seen_batch_master_keys.add(prod.master_key)
-                    products.append(prod)
-                    if len(products) >= target_limit:
-                        break
-                if len(db_candidates) < chunk_size:
-                    break
-
-        if not products:
-            print("[*] No un-audited master products found (all audited or none match filter).")
-            return 0
-
-    if products and not previous_results:
-        previous_results = repo.get_latest_audit_results_for_ids([p.product_id for p in products])
-
-    settings = get_settings()
-    openai_key = (
-        getattr(args, "openai_key", None)
-        or getattr(args, "gemini_key", None)
-        or settings.OPENAI_API_KEY
-        or os.environ.get("OPENAI_API_KEY")
-    )
-    if not openai_key:
-        print("[!] WARNING: OPENAI_API_KEY is not set. Arbitration calls will return ERROR status.")
-        print("    Pass --openai-key <KEY> or set OPENAI_API_KEY in .env.")
-
-    judge = OpenAIJudge(api_key=openai_key)
-    vendor_resolver = VendorDirectResolver()
-    serper_client = SerperClient(api_key=settings.SERPER_API_KEY)
-    ref_resolver = ResolveReferenceUseCase(
-        repository=repo,
-        vendor_resolver=vendor_resolver,
-        serper_client=serper_client,
-        verify_direct_urls=True,
-        judge=judge,
-    )
-
-    raw_concurrency = getattr(args, "concurrency", 1) or 1
-    effective_concurrency = max(1, min(raw_concurrency, len(products)))
-
-    crawler = WebCrawler(
-        max_concurrent=effective_concurrency,
-        headless=not args.no_headless,
-        timeout_ms=30000,
-    )
-    audit_use_case = AuditProductUseCase(
-        product_repo=repo,
-        reference_resolver=ref_resolver,
-        crawler=crawler,
-        judge=judge,
-    )
-
     console = Console()
-    tui = AuditTUI(console=console, total_products=len(products), concurrency=effective_concurrency, photos_only=getattr(args, "photos_only", False))
-
-    print("=" * 80)
-    print("TELECOM CATALOG AUDITOR :: STAGE 4 FACTUAL ARBITER")
-    print("=" * 80)
-    print(f"Target DB     : {db_path.resolve()}")
-    print(f"Products Count: {len(products)}")
-    print(f"LLM Engine    : OpenAI (model: {settings.OPENAI_MODEL})")
-    print(f"Workers       : {effective_concurrency}")
-    print(f"Headless      : {not args.no_headless}")
-    print(f"Force Refresh : {args.force_refresh}")
-    print("=" * 80)
+    workers: list[asyncio.Task[None]] = []
+    live: Live | None = None
+    tui: AuditTUI | None = None
 
     try:
-        await crawler.start()
+        keys = _extract_target_keys(args)
+        group_id = getattr(args, "group", None)
+        main_cat_id = getattr(args, "main_cat", None)
+        category = getattr(args, "category", None)
+        if category:
+            if not str(category).isdigit():
+                raise ValueError("--category должен содержать числовой ID группы.")
+            if group_id is not None and group_id != int(category):
+                raise ValueError("--category и --group указывают разные группы.")
+            group_id = int(category)
+        filtered = group_id is not None or main_cat_id is not None
+        if keys and filtered:
+            raise ValueError("Укажите товары по ID/SKU/URL или фильтр группы/категории, без их сочетания.")
+        if args.limit < 0 or args.offset < 0:
+            raise ValueError("--limit и --offset не могут быть отрицательными.")
+        if filtered and args.source != "mysql":
+            raise ValueError("Для группы или категории необходим источник MySQL: SQLite не хранит связи категорий.")
 
-        queue: asyncio.Queue[tuple[int, Product]] = asyncio.Queue()
-        for idx, prod in enumerate(products, 1):
-            await queue.put((idx, prod))
+        db_path = Path(args.db)
+        repo = SQLiteProductRepository(db_path)
+        photos_only = getattr(args, "photos_only", False)
+        skip_desc = getattr(args, "skip_desc", False)
+        skip_audited = getattr(args, "skip_audited", True) and not args.force_refresh
+        limit = 0 if keys else args.limit
+        concurrency = max(1, getattr(args, "concurrency", 1))
+        grouper = ParentChildGrouper()
+        seen_master_keys: set[str] = set()
+        explicit_products: list[Product] = []
+        if keys:
+            explicit_products = await _live_sync_products(keys, repo, source=args.source)
+            # Each missing requested key is an unsuccessful lookup, not a skip.
+            missing = max(0, len(keys) - len(explicit_products))
+            processed += missing
+            unsuccessful += missing
+        else:
+            label = f"группа #{group_id}" if group_id is not None else "общий каталог"
+            if main_cat_id is not None:
+                label += f", категория #{main_cat_id}"
+            print(f"[*] Выборка: {label}. Лимит попыток: {limit or 'до конца выборки'}.")
 
-        print_lock = asyncio.Lock()
-        completed_cards: dict[int, str] = {}
-        next_to_print = 1
-        total_time_all = 0.0
-        total_tokens_all = 0
-        total_cost_all = 0.0
-        start_time_all = time.perf_counter()
-        total_products_count = len(products)
-
-        async def worker_loop(worker_id: int, live_ctx: Live | None) -> None:
-            nonlocal total_time_all, total_tokens_all, total_cost_all, next_to_print
-            while not queue.empty():
+        async def batches() -> AsyncGenerator[list[Product]]:
+            if keys:
+                yield explicit_products
+            else:
+                stream = _audit_catalog_batches(args, repo, group_id, main_cat_id)
                 try:
-                    idx, prod = queue.get_nowait()
-                except asyncio.QueueEmpty:
+                    async for batch in stream:
+                        yield batch
+                finally:
+                    await stream.aclose()
+
+        stream = batches()
+        try:
+            async for batch in stream:
+                if not keys:
+                    grouper.group_products(batch)
+                else:
+                    for product in batch:
+                        if not product.master_key:
+                            try:
+                                product.master_key = grouper.extract_master_key(product.title, product.current_specs)
+                            except GroupingError:
+                                product.master_key = f"pid_{product.product_id}"
+                previous = repo.get_latest_audit_results_for_ids([p.product_id for p in batch])
+                selected: list[Product] = []
+                for product in batch:
+                    if limit and processed + len(selected) >= limit:
+                        break
+                    if not keys and (not product.is_master or product.master_key in seen_master_keys):
+                        skipped += 1
+                        continue
+                    if not keys and skip_audited and _audit_is_current(product, previous.get(product.product_id), photos_only, skip_desc):
+                        print(f"[*] Пропущен товар #{product.product_id}: нужные проверки уже выполнены, данные магазина не изменились.")
+                        skipped += 1
+                        continue
+                    if not keys and product.master_key:
+                        seen_master_keys.add(product.master_key)
+                    selected.append(product)
+                if selected:
+                    if judge is None:
+                        key = getattr(args, "openai_key", None) or getattr(args, "gemini_key", None) or settings.OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY")
+                        if not key:
+                            raise ValueError("Не задан OPENAI_API_KEY: проверку моделью невозможно начать.")
+                        judge = OpenAIJudge(api_key=key)
+                        resolver = ResolveReferenceUseCase(
+                            repository=repo, vendor_resolver=VendorDirectResolver(),
+                            serper_client=SerperClient(api_key=settings.SERPER_API_KEY),
+                            verify_direct_urls=True, judge=judge,
+                        )
+                        crawler = WebCrawler(max_concurrent=concurrency, headless=not args.no_headless, timeout_ms=30000)
+                        audit = AuditProductUseCase(product_repo=repo, reference_resolver=resolver, crawler=crawler, judge=judge)
+                        print("=" * 80)
+                        print("TELECOM CATALOG AUDITOR :: STAGE 4 FACTUAL ARBITER")
+                        print(f"Target DB     : {db_path.resolve()}")
+                        print(f"LLM Engine    : OpenAI (model: {settings.OPENAI_MODEL})")
+                        print(f"Workers       : {concurrency}")
+                        print("=" * 80)
+                        await crawler.start()
+                        tui = AuditTUI(console, 0, concurrency, photos_only)
+                        if console.is_terminal:
+                            live = Live(tui.render_live_panel(), console=console, refresh_per_second=4, transient=True)
+                            live.start()
+
+                    queue: asyncio.Queue[Product] = asyncio.Queue()
+                    for product in selected:
+                        queue.put_nowait(product)
+                    completed_cards: dict[int, str] = {}
+                    next_to_print = processed + 1
+                    fatal: Exception | None = None
+
+                    async def worker(worker_id: int) -> None:
+                        nonlocal processed, unsuccessful, findings, fatal, next_to_print
+                        nonlocal total_time, total_tokens, total_cost
+                        while not queue.empty() and fatal is None:
+                            product = queue.get_nowait()
+                            processed += 1
+                            index = processed
+                            if tui is not None:
+                                tui.set_worker_status(worker_id, f"Auditing #{product.product_id} | {product.title[:150]}")
+                                if live is not None:
+                                    live.update(tui.render_live_panel())
+                            try:
+                                result = await audit.audit_product(
+                                    product=product,
+                                    reference_url=args.reference_url if keys and len(explicit_products) == 1 else None,
+                                    force_refresh=args.force_refresh,
+                                    skip_desc=skip_desc,
+                                    skip_tech=getattr(args, "skip_tech", False),
+                                    photos_only=photos_only,
+                                    prior_result=previous.get(product.product_id),
+                                    prior_loaded=True,
+                                )
+                            except asyncio.CancelledError:
+                                unsuccessful += 1
+                                raise
+                            except Exception as exc:
+                                unsuccessful += 1
+                                fatal = exc
+                                if settings.DEBUG:
+                                    logging.getLogger(__name__).exception("Audit worker stopped")
+                                completed_cards[index] = f"[!] Товар #{product.product_id}: обработка прервана общей ошибкой."
+                            else:
+                                if tui is not None:
+                                    tui.record_completed(result.status, photos_only, bool(result.photos_error), result.images_status)
+                                failed = bool(result.photos_error) if photos_only else result.status in (AuditStatus.ERROR, AuditStatus.NOT_FOUND)
+                                unsuccessful += int(failed)
+                                has_findings = (result.images_status not in ("OK", "UNKNOWN")) if photos_only else bool(
+                                    result.status in (AuditStatus.MISMATCH, AuditStatus.MISSING_SPECS)
+                                    or result.description_discrepancies
+                                    or result.images_status not in ("OK", "UNKNOWN")
+                                )
+                                findings += int(not failed and has_findings)
+                                total_time += result.execution_time_sec or 0.0
+                                total_tokens += result.input_tokens + result.output_tokens
+                                total_cost += result.estimated_cost_usd or 0.0
+                                completed_cards[index] = format_audit_card(index, None, product, result)
+                                if failed:
+                                    completed_cards[index] += "\n[!] Товар не удалось проверить. Продолжаю проверку остальных товаров."
+                            while next_to_print in completed_cards:
+                                console.print(completed_cards.pop(next_to_print))
+                                next_to_print += 1
+                            queue.task_done()
+                            if tui is not None:
+                                tui.set_worker_status(worker_id, "Idle")
+                                if live is not None:
+                                    live.update(tui.render_live_panel())
+
+                    workers = [asyncio.create_task(worker(worker_id)) for worker_id in range(1, min(concurrency, len(selected)) + 1)]
+                    try:
+                        await asyncio.gather(*workers)
+                    finally:
+                        for task in workers:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*workers, return_exceptions=True)
+                    if fatal is not None:
+                        raise fatal
+                if limit and processed >= limit:
+                    reason = f"достигнут лимит {limit} товаров; остаток выборки не проверялся"
                     break
-
-                tui.set_worker_status(worker_id, f"Auditing #{prod.product_id} | {prod.title[:150]}...")
-                if live_ctx:
-                    live_ctx.update(tui.render_live_panel())
-
-                try:
-                    result = await audit_use_case.audit_product(
-                        product=prod,
-                        reference_url=args.reference_url if len(products) == 1 else None,
-                        force_refresh=args.force_refresh,
-                        skip_desc=getattr(args, "skip_desc", False),
-                        skip_tech=getattr(args, "skip_tech", False),
-                        photos_only=getattr(args, "photos_only", False),
-                        prior_result=previous_results.get(prod.product_id),
-                        prior_loaded=True,
-                    )
-                except Exception as exc:
-                    result = AuditResult(
-                        product_id=prod.product_id,
-                        status=AuditStatus.ERROR,
-                        confidence_score=0.0,
-                        reference_url=None,
-                        discrepancies=[],
-                        matched_specs_count=0,
-                        total_specs_count=len(prod.current_specs),
-                        details=f"Unexpected error: {exc}",
-                        execution_time_sec=0.0,
-                    )
-
-                tui.record_completed(
-                    result.status,
-                    photos_only=getattr(args, "photos_only", False),
-                    photos_error=bool(result.photos_error),
-                    images_status=result.images_status,
-                )
-                if result.execution_time_sec:
-                    total_time_all += result.execution_time_sec
-                if result.input_tokens:
-                    total_tokens_all += (result.input_tokens + result.output_tokens)
-                if result.estimated_cost_usd:
-                    total_cost_all += result.estimated_cost_usd
-
-                card_str = format_audit_card(idx, total_products_count, prod, result)
-                async with print_lock:
-                    completed_cards[idx] = card_str
-                    while next_to_print in completed_cards:
-                        card_to_emit = completed_cards.pop(next_to_print)
-                        if live_ctx:
-                            live_ctx.console.print(card_to_emit)
-                        else:
-                            console.print(card_to_emit)
-                        next_to_print += 1
-
-                queue.task_done()
-                tui.set_worker_status(worker_id, "Idle")
-                if live_ctx:
-                    live_ctx.update(tui.render_live_panel())
-
-        if console.is_terminal:
-            with Live(tui.render_live_panel(), console=console, refresh_per_second=4, transient=True) as live:
-                tasks = [
-                    asyncio.create_task(worker_loop(w_id, live))
-                    for w_id in range(1, effective_concurrency + 1)
-                ]
-                await asyncio.gather(*tasks)
-        else:
-            tasks = [
-                asyncio.create_task(worker_loop(w_id, None))
-                for w_id in range(1, effective_concurrency + 1)
-            ]
-            await asyncio.gather(*tasks)
-
-        # Flush any remaining cards if sequence had any gaps
-        async with print_lock:
-            for rem_idx in sorted(completed_cards.keys()):
-                card_to_emit = completed_cards.pop(rem_idx)
-                console.print(card_to_emit)
-
-        wall_time = time.perf_counter() - start_time_all
-        speedup = (total_time_all / wall_time) if wall_time > 0 else 1.0
-        print("-" * 80)
-        if getattr(args, "photos_only", False):
-            print(f"PHOTO SUMMARY: Total: {len(products)} | Checked: {tui.photo_checked_count} | Photo issues: {tui.photo_issue_count} | Errors: {tui.error_count}")
-        else:
-            print(f"AUDIT SUMMARY: Total: {len(products)} | Verified: {tui.verified_count} | Mismatches: {tui.mismatch_count} | Missing Specs: {tui.missing_specs_count} | Not Found: {tui.not_found_count} | Errors: {tui.error_count}")
-        if len(products) > 1 and total_tokens_all > 0:
-            print(f"BATCH METRICS: Wall Time: {wall_time:.2f}s | Total Time: {total_time_all:.2f}s | Speedup: {speedup:.1f}x | Total Tokens: {total_tokens_all:,} | Total Est. Cost: ~${total_cost_all:.5f}")
-        print("=" * 80)
-        return 0
+        finally:
+            await stream.aclose()
+        if processed == 0:
+            print("[*] Выборка закончилась. Новых товаров для проверки нет.")
+        exit_code = 1 if unsuccessful else 0
+    except asyncio.CancelledError:
+        aborted = True
+        reason = "остановлен пользователем; выборка не закончена"
+        exit_code = 130
+    except (MySQLReaderError, sqlite3.Error, OSError, ValueError) as exc:
+        aborted = True
+        reason = str(exc)
+        exit_code = 2
+        print(f"[!] Запуск прерван: {reason}")
+        if settings.DEBUG:
+            logging.getLogger(__name__).exception("Audit run stopped")
+    except Exception as exc:
+        aborted = True
+        reason = f"невозможно продолжить обработку: {exc}"
+        exit_code = 2
+        print(f"[!] Запуск прерван: {reason}")
+        if settings.DEBUG:
+            logging.getLogger(__name__).exception("Audit run stopped unexpectedly")
     finally:
-        await crawler.close()
-        await judge.aclose()
+        if live is not None:
+            live.stop()
+        try:
+            if crawler is not None:
+                await crawler.close()
+        except Exception as exc:
+            aborted = True
+            exit_code = 2
+            reason = f"ошибка закрытия браузера: {exc}"
+        finally:
+            if judge is not None:
+                try:
+                    await judge.aclose()
+                except Exception as exc:
+                    aborted = True
+                    exit_code = 2
+                    reason = f"ошибка закрытия клиента модели: {exc}"
+        state = "прерван" if aborted else "завершён"
+        print(f"Итог: запуск {state} — {reason}.")
+        print(f"Обработано: {processed} | Пропущено: {skipped} | Не удалось проверить: {unsuccessful} | С замечаниями: {findings}.")
+        if aborted:
+            print("Уже сохранённые отчёты сохранены. Выборка не закончена.")
+        if processed > 1 and total_tokens > 0:
+            wall = time.perf_counter() - started
+            print(f"BATCH METRICS: Wall Time: {wall:.2f}s | Total Time: {total_time:.2f}s | Total Tokens: {total_tokens:,} | Total Est. Cost: ~${total_cost:.5f}")
+    return exit_code
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1134,7 +1128,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit",
         type=int,
         default=5,
-        help="Max products to audit (default: 5)",
+        help="Max audit attempts (default: 5; 0: all selected products)",
     )
     audit_parser.add_argument(
         "--concurrency",
@@ -1189,7 +1183,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit_parser.add_argument(
         "--source",
         choices=["mysql", "crawler"],
-        default="mysql" if get_settings().MYSQL_HOST else "crawler",
+        default="mysql",
         help="Live sync source: mysql or crawler",
     )
     audit_parser.add_argument(
@@ -1219,7 +1213,10 @@ def main() -> None:
         exit_code = asyncio.run(run_live_test_command(args))
         sys.exit(exit_code)
     elif args.subcommand == "audit":
-        exit_code = asyncio.run(run_audit_command(args))
+        try:
+            exit_code = asyncio.run(run_audit_command(args))
+        except KeyboardInterrupt:
+            exit_code = 130
         sys.exit(exit_code)
     else:
         parser.print_help()
