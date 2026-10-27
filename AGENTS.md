@@ -4,7 +4,7 @@ Autonomous Python 3.13+ microservice for factual auditing of `shop.telecom.kz` (
 
 ## CODEX CONTEXT & AUTOMATIC ROUTING
 - These instructions apply only to `telecom_catalog_auditor`. `core` is a separate PHP/Laravel repository with different rules and checks; do not read, edit or run it during this migration. Moving to it requires a separate discussion.
-- At task start read this file, `AGREED_REQUIREMENTS.md`, the current introduction in `Handoff.md`, and the applicable approved plan. Historical handoff claims require verification and do not grant authorization. Preserve business rules and raise disputed requirements with the user.
+- At task start read this file, `AGREED_REQUIREMENTS.md`, and `plans/current.md`. Read only the current plan linked there. Use `Handoff.md` only when resuming interrupted work or when the current pointer says it is needed. Files under `plans/archive/` are history: do not read them unless a concrete conflict requires it. Historical claims require verification and do not grant authorization.
 - Select and read skills automatically by task; users need not invoke them manually:
   - `.agents/skills/clean-arch-scaffold/SKILL.md` before editing `src/use_cases/`, `src/adapters/`, or `config/vendor_profiles.py`.
   - `.agents/skills/cli-ops-runner/SKILL.md` before CLI operations or product debugging.
@@ -13,9 +13,10 @@ Autonomous Python 3.13+ microservice for factual auditing of `shop.telecom.kz` (
 - Optional role entry points are `.codex/agents/implementer.toml` and `.codex/agents/auditor.toml`; detailed instructions live in `.agents/agents/`. The main agent does not spawn them automatically. Use a subagent only after the user explicitly authorizes that specific delegation; do not invent `invoke_subagent`.
 - Human involvement is for approving plans and material decisions; automatic routing does not bypass those boundaries. Do not change the application's judge model to match the Codex agent model.
 - Do not change the shop or write to production without separate explicit approval. Do not change or stage secrets, databases, local `.env`, or `Dockerfile-local`; no GitLab push is authorized by this migration.
+- Keep context lean: use `rg`, targeted line ranges, `git diff --stat` and diffs of approved files. Do not dump complete large source files, archived plans, full databases, search traces or an unbounded repository diff when a focused read answers the question.
 
 ## 0. ORCHESTRATION & STOP-POINT PROTOCOL
-1. **Plan First (`>1 file` or architecture change)**: **STOP**. Create an Implementation Plan Artifact (or write to `plans/active_plan.md`) with affected files, data flow, risks, and **WAIT** for explicit user confirmation ("Proceed", "OK").
+1. **Plan First (`>1 file` or architecture change)**: **STOP**. Create a focused plan under `plans/`, update `plans/current.md` to point to it, include affected files, data flow, risks and expected user-visible output, then **WAIT** for explicit user confirmation ("Proceed", "OK"). Never overwrite a completed or archived plan.
 2. **Hard Locks**: **NEVER** proceed to Stage 5 (Excel) or Stage 6 (FastAPI) and **NEVER** modify `config/whitelist_domains.py` without explicit user approval.
 3. **Single-Agent Delivery by Default**:
   - The main agent in the active chat owns the approved plan, implementation, full-diff self-review, testing, final report and manual acceptance instructions. Do not spawn an `implementer`, `auditor` or other subagent automatically.

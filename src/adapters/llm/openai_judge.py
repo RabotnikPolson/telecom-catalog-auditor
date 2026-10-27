@@ -527,12 +527,14 @@ class OpenAIJudge:
             placeholder_markers = ("нет данных", "не указано", "-", "n/a", "none", "null")
             evidence_text = _normalize_evidence_text(external_markdown[:25000])
             invalid_evidence_count = 0
+            had_proposed_findings = bool(output.discrepancies or output.missing_specs)
             valid_discrepancies: list[LLMDiscrepancy] = []
             for d in output.discrepancies:
                 ref_val = (d.reference_value or "").strip().lower()
                 shop_val = (d.shop_value or "").strip().lower()
                 quote_val = (d.proof_quote or "").strip().lower()
                 if ref_val in placeholder_markers or quote_val in placeholder_markers:
+                    invalid_evidence_count += 1
                     continue
                 if not quote_val or _normalize_evidence_text(d.proof_quote) not in evidence_text:
                     invalid_evidence_count += 1
@@ -595,6 +597,7 @@ class OpenAIJudge:
                 m_name = (m.spec_name or "").strip().lower()
                 m_val = (m.reference_value or "").strip().lower()
                 if not m_name or not m_val:
+                    invalid_evidence_count += 1
                     continue
                 if _normalize_evidence_text(m.spec_name) in current_spec_names:
                     continue
@@ -625,6 +628,14 @@ class OpenAIJudge:
             elif not valid_discrepancies and audit_status == AuditStatus.MISMATCH:
                 audit_status = AuditStatus.VERIFIED
                 output.details = f"Все заявленные характеристики витрины подтверждены эталоном; выявлено {len(output.missing_specs)} характеристик для обогащения."
+            elif (
+                had_proposed_findings
+                and not valid_discrepancies
+                and not output.missing_specs
+                and audit_status == AuditStatus.MISSING_SPECS
+            ):
+                audit_status = AuditStatus.VERIFIED
+                output.details = "Проверяемые расхождения и важные недостающие характеристики не найдены."
             elif valid_discrepancies and len(valid_discrepancies) < len(output.discrepancies):
                 spec_names = ", ".join(f"'{d.spec_name}'" for d in valid_discrepancies[:3])
                 output.details = f"Обнаружено расхождение по характеристикам: {spec_names}; выявлено {len(output.missing_specs)} недостающих характеристик."

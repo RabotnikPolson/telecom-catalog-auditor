@@ -476,6 +476,63 @@ class TestOpenAIJudge:
             await judge.aclose()
 
     @pytest.mark.anyio
+    async def test_placeholder_quote_cannot_support_verified_result(self) -> None:
+        product = Product(product_id=2008, title="Model X", current_specs={})
+        judge = OpenAIJudge(api_key="test-key")
+        output = LLMJudgeOutput(
+            status="VERIFIED",
+            missing_specs=[
+                LLMMissingSpec(
+                    spec_name="NFC",
+                    reference_value="нет",
+                    proof_quote="нет данных",
+                )
+            ],
+            details="Verified",
+        )
+        response = _make_openai_resp(output.model_dump_json())
+        try:
+            with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)):
+                result = await judge.judge(
+                    product,
+                    "https://example.com/item",
+                    "NFC не поддерживается",
+                )
+            assert result.status == AuditStatus.ERROR
+            assert result.missing_specs == []
+        finally:
+            await judge.aclose()
+
+    @pytest.mark.anyio
+    async def test_filtered_subjective_missing_spec_does_not_leave_empty_missing_status(
+        self,
+    ) -> None:
+        product = Product(product_id=2009, title="Model X", current_specs={})
+        judge = OpenAIJudge(api_key="test-key")
+        output = LLMJudgeOutput(
+            status="MISSING_SPECS",
+            missing_specs=[
+                LLMMissingSpec(
+                    spec_name="Качество",
+                    reference_value="очень высокое",
+                    proof_quote="Очень высокое качество",
+                )
+            ],
+        )
+        response = _make_openai_resp(output.model_dump_json())
+        try:
+            with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=response)):
+                result = await judge.judge(
+                    product,
+                    "https://example.com/item",
+                    "Очень высокое качество",
+                )
+            assert result.status == AuditStatus.VERIFIED
+            assert result.missing_specs == []
+        finally:
+            await judge.aclose()
+
+    @pytest.mark.anyio
     async def test_valid_evidence_survives_alongside_invented_missing_spec(self) -> None:
         product = Product(product_id=2007, title="Model X", current_specs={})
         judge = OpenAIJudge(api_key="test-key")

@@ -1,80 +1,16 @@
 ---
 name: clean-arch-scaffold
-description: Domain contracts for Reference Resolution (5 scenarios), OpenAI NLI Judge, Two-Level Caching, and scaffolding new UseCases, Adapters, or Vendor Profiles. Use when editing use_cases/, adapters/, or vendor_profiles.py.
+description: Project contracts for changes to use cases, adapters, database persistence, reference resolution, the OpenAI judge, or vendor profiles. Use only when editing those areas.
 ---
 
-# Domain Contracts & Scaffolding Guide
+# Clean Architecture Contracts
 
-## 1. Reference Resolution Cascade (`resolve_reference.py`)
-- **5 Scenarios**: `SCENARIO_1_VENDOR_DIRECT` through `SCENARIO_5_INSUFFICIENT_DATA`.
-- **Cascade Order (Scenarios 2–4)**: 1) Clean model query → 2) Quoted `"<barcode>"` (NO `barcode:` operator) → 3) Scoped marketplace (`site:kaspi.kz OR site:dns-shop.kz ...`).
-- **Concurrency & Timeouts**: Run vendor check (`timeout=2.0s`, cache in `_last_checked_response`) and Serper cascade in parallel via `asyncio.gather`. Return full sorted `candidate_urls` pool (`Kaspi -> DNS -> Official -> Whitelisted`).
+Preserve constructor dependency injection, domain entities at boundaries, Python 3.13 typing and the invariants in `AGENTS.md`. Make the smallest cohesive change in the approved files.
 
-## 2. Semantic NLI Arbitrage (`openai_judge.py`)
-- **Model**: OpenAI `gpt-6-luna` (configured via `config/settings.py`) via `httpx`, `reasoning_effort="low"`, `response_format={"type": "json_object"}` (NO custom `temperature`). Rates: $0.10/1M input, $0.01/1M cached input, $0.50/1M output ([official model documentation](https://developers.openai.com/api/docs/models/gpt-6-luna), checked 24.10.2026). Price updates do not authorize model changes.
-- **No Regex Heuristics**: Never filter sub-modifications via regex; require exact `proof_quote` from LLM NLI prompt. Print CLI output sequentially.
+Read only the reference needed for the current edit:
 
-## 3. SQLite Persistence & Two-Level Caching
-- **Connections**: Always `with get_sqlite_connection(db_path) as conn:` (auto commit/rollback/close). Per-connection PRAGMAs: `busy_timeout = 15000` first, then `foreign_keys`, `synchronous = NORMAL`, `temp_store`, `cache_size`, `mmap_size`.
-- **WAL**: `journal_mode = WAL` and `wal_autocheckpoint` are set once in `init_db`, NOT per connection.
-- **Schema Versioning**: `PRAGMA user_version` (`LATEST_SCHEMA_VERSION` in `schema.py`); migrations run conditionally in `init_db`.
-- **Atomic JIT Write**: `repo.save_product_and_audit_result(product, result)` — one transaction, `RETURNING audit_id`.
-- `url_cache`: Key = `SHA256("ref:{product_id}:{normalized_query}")` → `resolved_url`.
-- `specs_cache`: Key = `resolved_url` → extracted specs JSON.
+- Reference resolution, search cascade, judge or vendor profile: [references/reference-and-judge.md](references/reference-and-judge.md).
+- SQLite, cache, migrations or MySQL streaming: [references/persistence.md](references/persistence.md).
+- Creating a new use case or adapter: [references/scaffolding.md](references/scaffolding.md).
 
-## 4. MySQL Streaming (`mysql_reader.py`)
-- **Keyset Pagination**: `p.id > %s ORDER BY p.id ASC LIMIT %s` (no deep OFFSET).
-- **Per-Batch Connection**: acquire from pool per batch and release BEFORE `yield`.
-
-## 5. Scaffolding New Components
-- **New UseCase (`src/use_cases/<name>.py`)**: Inject repos/gateways via `__init__`, implement `async def`, return Domain Entities, add test in `tests/test_stage_N.py`.
-- **New Adapter (`src/adapters/<name>/`)**: Use `asyncio.Semaphore` for rate limits, close clients in `try...finally`, raise the existing `DomainError` or a relevant subtype from `src/domain/exceptions.py`.
-- **New Vendor Profile**: Add entry with `search_url_template` to `config/vendor_profiles.py` and verify via `python main.py resolve --product-id <ID> --limit 1 --db <verification-copy.db>` after reading `cli-ops-runner`; this does not authorize whitelist changes.
-
-### Starter UseCase Template:
-```python
-from src.adapters.db.sqlite_repo import SQLiteProductRepository
-from src.domain.entities import AuditResult, AuditStatus
-
-
-class SampleUseCase:
-    def __init__(self, repository: SQLiteProductRepository) -> None:
-        self.repository = repository
-
-    async def execute(self, product_id: int) -> AuditResult:
-        return AuditResult(
-            product_id=product_id,
-            status=AuditStatus.PENDING,
-        )
-```
-
-### Starter Adapter Template:
-```python
-import asyncio
-import httpx
-from src.domain.entities import Product
-from src.domain.exceptions import DomainError
-
-
-class SampleApiAdapter:
-    def __init__(self, max_concurrency: int = 5) -> None:
-        self._semaphore = asyncio.Semaphore(max_concurrency)
-        self._client: httpx.AsyncClient | None = None
-
-    async def fetch_product(self, url: str) -> Product:
-        should_close = False
-        client = self._client
-        if client is None:
-            client = httpx.AsyncClient(timeout=5.0)
-            should_close = True
-        try:
-            async with self._semaphore:
-                response = await client.get(url)
-                response.raise_for_status()
-                return Product.model_validate(response.json())
-        except Exception as e:
-            raise DomainError(f"Adapter fetch failed: {e}") from e
-        finally:
-            if should_close:
-                await client.aclose()
-```
+Do not load unrelated references. This skill does not authorize whitelist, model, dependency, schema, shop or production changes.

@@ -42,7 +42,7 @@ try {
 
     Write-Host "`n[2/4] Running full pytest suite, including live tests..." -ForegroundColor Yellow
     try {
-        python -m pytest "--junitxml=$PytestReport"
+        python -m pytest -q --tb=short "--junitxml=$PytestReport"
         if ($LASTEXITCODE -ne 0) { $Failures.Add("pytest exited $LASTEXITCODE") }
     } catch { $Failures.Add("pytest could not run: $($_.Exception.Message)") }
 
