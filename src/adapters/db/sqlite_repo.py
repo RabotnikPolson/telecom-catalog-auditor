@@ -1,9 +1,11 @@
 import json
 import sqlite3
 from collections.abc import Sequence
+from contextlib import closing
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 from src.domain.entities import (
     AuditResult,
@@ -18,6 +20,79 @@ from .schema import get_sqlite_connection, init_db
 
 DEFAULT_CACHE_TTL_DAYS: int = 14
 DEFAULT_CACHE_MAX_RECORDS: int = 30000
+
+AuditSortField = Literal["audited_at", "confidence_score", "discrepancies_count", "title"]
+SortDirection = Literal["asc", "desc"]
+
+
+@dataclass(frozen=True)
+class AuditListFilters:
+    page: int = 1
+    per_page: int = 25
+    statuses: tuple[AuditStatus, ...] = ()
+    attention_required: bool | None = None
+    query: str | None = None
+    vendor: str | None = None
+    audited_from: datetime | None = None
+    audited_to: datetime | None = None
+    sort: AuditSortField = "audited_at"
+    direction: SortDirection = "desc"
+
+
+@dataclass(frozen=True)
+class AuditReadRecord:
+    audit_id: int
+    product_id: int
+    shop_sku: str | None
+    barcode: str | None
+    title: str
+    vendor_name: str | None
+    vendor_sku: str | None
+    manufacturer_sku: str | None
+    audit_status: AuditStatus
+    confidence_score: float
+    reference_url: str | None
+    discrepancies: tuple[DiscrepancyItem, ...]
+    missing_specs: tuple[MissingSpecItem, ...]
+    matched_specs_count: int
+    total_specs_count: int
+    images_count: int
+    reference_images_count: int
+    images_status: str
+    description_discrepancies: tuple[DescriptionDiscrepancyItem, ...]
+    description_quality: str
+    audited_at: datetime
+    audit_parts: dict[str, str]
+
+
+@dataclass(frozen=True)
+class AuditReadPage:
+    items: tuple[AuditReadRecord, ...]
+    total_items: int
+    page: int
+    per_page: int
+
+
+def _load_json_list(raw: str | None) -> list[dict[str, object]]:
+    if not raw:
+        return []
+    value = json.loads(raw)
+    if not isinstance(value, list):
+        raise ValueError("Expected a JSON array in audit result")
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _load_json_object(raw: str | None) -> dict[str, str]:
+    if not raw:
+        return {}
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("Expected a JSON object in audit result")
+    return {str(key): str(item) for key, item in value.items()}
+
+
+def _casefold(value: str | None) -> str:
+    return value.casefold() if value else ""
 
 
 class CrawlerStateDict(TypedDict):
@@ -706,5 +781,225 @@ class SQLiteProductRepository:
                 ).fetchall()
                 results.update({int(row["product_id"]): self._row_to_audit_result(row) for row in rows})
         return results
+
+
+class SQLiteAuditReadRepository:
+    """Read-only audit projection for the internal manager API."""
+
+    _ATTENTION_SQL = """
+        (
+            CASE WHEN json_valid(a.discrepancies_json)
+                THEN json_array_length(a.discrepancies_json) ELSE 0 END > 0
+            OR CASE WHEN json_valid(a.missing_specs_json)
+                THEN json_array_length(a.missing_specs_json) ELSE 0 END > 0
+            OR CASE WHEN json_valid(a.description_discrepancies_json)
+                THEN json_array_length(a.description_discrepancies_json) ELSE 0 END > 0
+            OR (
+                json_valid(a.audit_parts_json)
+                AND json_type(a.audit_parts_json, '$.photos') IS NOT NULL
+                AND a.images_status NOT IN ('OK', 'UNKNOWN')
+            )
+            OR a.status IN ('MISMATCH', 'MISSING_SPECS', 'NOT_FOUND', 'ERROR')
+        )
+    """
+
+    _SELECT_SQL = """
+        SELECT
+            a.audit_id,
+            a.product_id,
+            a.status,
+            a.confidence_score,
+            a.reference_url,
+            a.discrepancies_json,
+            a.missing_specs_json,
+            a.matched_specs_count,
+            a.total_specs_count,
+            a.images_count,
+            a.reference_images_count,
+            a.images_status,
+            a.description_discrepancies_json,
+            a.description_quality,
+            a.audited_at,
+            a.audit_parts_json,
+            p.shop_sku,
+            p.barcode,
+            p.title,
+            p.vendor_name,
+            p.vendor_sku,
+            p.manufacturer_sku
+        FROM audit_results a
+        JOIN products p ON p.product_id = a.product_id
+    """
+
+    _SORT_COLUMNS: dict[AuditSortField, str] = {
+        "audited_at": "a.audited_at",
+        "confidence_score": "a.confidence_score",
+        "discrepancies_count": (
+            "CASE WHEN json_valid(a.discrepancies_json) "
+            "THEN json_array_length(a.discrepancies_json) ELSE 0 END"
+        ),
+        "title": "CASEFOLD(p.title)",
+    }
+
+    def __init__(self, db_path: str | Path) -> None:
+        self.db_path = Path(db_path)
+
+    def _connect(self) -> sqlite3.Connection:
+        absolute_path = self.db_path.resolve().as_posix()
+        conn = sqlite3.connect(
+            f"file:{absolute_path}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.create_function("CASEFOLD", 1, _casefold, deterministic=True)
+        conn.execute("PRAGMA query_only = ON;")
+        conn.execute("PRAGMA busy_timeout = 5000;")
+        return conn
+
+    def check_health(self) -> None:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name IN ('products', 'audit_results')"
+            ).fetchall()
+        if {str(row["name"]) for row in rows} != {"products", "audit_results"}:
+            raise sqlite3.OperationalError("Required audit tables are missing")
+
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    @classmethod
+    def _where_clause(cls, filters: AuditListFilters) -> tuple[str, list[str | int | float]]:
+        conditions: list[str] = []
+        params: list[str | int | float] = []
+
+        if filters.statuses:
+            placeholders = ",".join("?" for _ in filters.statuses)
+            conditions.append(f"a.status IN ({placeholders})")
+            params.extend(status.value for status in filters.statuses)
+
+        if filters.attention_required is not None:
+            conditions.append(cls._ATTENTION_SQL if filters.attention_required else f"NOT {cls._ATTENTION_SQL}")
+
+        if filters.query:
+            clean_query = filters.query.strip()
+            pattern = f"%{cls._escape_like(clean_query)}%"
+            query_conditions = [
+                "p.shop_sku LIKE ? ESCAPE '\\'",
+                "p.barcode LIKE ? ESCAPE '\\'",
+                "CASEFOLD(p.title) LIKE CASEFOLD(?) ESCAPE '\\'",
+            ]
+            params.extend((pattern, pattern, pattern))
+            if clean_query.isdigit():
+                query_conditions.insert(0, "a.product_id = ?")
+                params.insert(len(params) - 3, int(clean_query))
+            conditions.append(f"({' OR '.join(query_conditions)})")
+
+        if filters.vendor:
+            conditions.append("CASEFOLD(p.vendor_name) LIKE CASEFOLD(?) ESCAPE '\\'")
+            params.append(f"%{cls._escape_like(filters.vendor.strip())}%")
+
+        if filters.audited_from:
+            conditions.append("a.audited_at >= ?")
+            params.append(filters.audited_from.isoformat())
+
+        if filters.audited_to:
+            conditions.append("a.audited_at <= ?")
+            params.append(filters.audited_to.isoformat())
+
+        return (f" WHERE {' AND '.join(conditions)}" if conditions else "", params)
+
+    @staticmethod
+    def _row_to_record(row: sqlite3.Row) -> AuditReadRecord:
+        discrepancies = tuple(
+            DiscrepancyItem.model_validate(item) for item in _load_json_list(row["discrepancies_json"])
+        )
+        missing_specs = tuple(
+            MissingSpecItem.model_validate(item) for item in _load_json_list(row["missing_specs_json"])
+        )
+        description_discrepancies = tuple(
+            DescriptionDiscrepancyItem.model_validate(item)
+            for item in _load_json_list(row["description_discrepancies_json"])
+        )
+        audited_at = datetime.fromisoformat(str(row["audited_at"]))
+        return AuditReadRecord(
+            audit_id=int(row["audit_id"]),
+            product_id=int(row["product_id"]),
+            shop_sku=str(row["shop_sku"]) if row["shop_sku"] is not None else None,
+            barcode=str(row["barcode"]) if row["barcode"] is not None else None,
+            title=str(row["title"]),
+            vendor_name=str(row["vendor_name"]) if row["vendor_name"] is not None else None,
+            vendor_sku=str(row["vendor_sku"]) if row["vendor_sku"] is not None else None,
+            manufacturer_sku=(
+                str(row["manufacturer_sku"]) if row["manufacturer_sku"] is not None else None
+            ),
+            audit_status=AuditStatus(str(row["status"])),
+            confidence_score=float(row["confidence_score"]),
+            reference_url=str(row["reference_url"]) if row["reference_url"] is not None else None,
+            discrepancies=discrepancies,
+            missing_specs=missing_specs,
+            matched_specs_count=int(row["matched_specs_count"]),
+            total_specs_count=int(row["total_specs_count"]),
+            images_count=int(row["images_count"]),
+            reference_images_count=int(row["reference_images_count"]),
+            images_status=str(row["images_status"]),
+            description_discrepancies=description_discrepancies,
+            description_quality=str(row["description_quality"]),
+            audited_at=audited_at,
+            audit_parts=_load_json_object(row["audit_parts_json"]),
+        )
+
+    @staticmethod
+    def attention_required(record: AuditReadRecord) -> bool:
+        photos_checked = "photos" in record.audit_parts
+        return bool(
+            record.discrepancies
+            or record.missing_specs
+            or record.description_discrepancies
+            or (photos_checked and record.images_status not in ("OK", "UNKNOWN"))
+            or record.audit_status
+            in (
+                AuditStatus.MISMATCH,
+                AuditStatus.MISSING_SPECS,
+                AuditStatus.NOT_FOUND,
+                AuditStatus.ERROR,
+            )
+        )
+
+    def get_paginated_results(self, filters: AuditListFilters) -> AuditReadPage:
+        where_sql, params = self._where_clause(filters)
+        sort_column = self._SORT_COLUMNS[filters.sort]
+        direction = filters.direction.upper()
+        offset = (filters.page - 1) * filters.per_page
+
+        with closing(self._connect()) as conn:
+            total_row = conn.execute(
+                f"SELECT COUNT(*) FROM audit_results a "
+                f"JOIN products p ON p.product_id = a.product_id{where_sql}",
+                params,
+            ).fetchone()
+            total_items = int(total_row[0]) if total_row else 0
+            rows = conn.execute(
+                f"{self._SELECT_SQL}{where_sql} "
+                f"ORDER BY {sort_column} {direction}, a.product_id ASC LIMIT ? OFFSET ?",
+                (*params, filters.per_page, offset),
+            ).fetchall()
+
+        return AuditReadPage(
+            items=tuple(self._row_to_record(row) for row in rows),
+            total_items=total_items,
+            page=filters.page,
+            per_page=filters.per_page,
+        )
+
+    def get_audit_card_details(self, product_id: int) -> AuditReadRecord | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                f"{self._SELECT_SQL} WHERE a.product_id = ? LIMIT 1",
+                (product_id,),
+            ).fetchone()
+        return self._row_to_record(row) if row else None
 
 

@@ -12,6 +12,7 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore", message=".*urllib3.*or chardet.*doesn't match a supported version.*")
 
+import uvicorn
 from rich.console import Console
 from rich.live import Live
 from rich.markup import escape
@@ -28,6 +29,7 @@ from src.adapters.search.vendor_direct import VendorDirectResolver
 from src.domain.entities import AuditResult, AuditStatus, Product
 from src.domain.exceptions import GroupingError
 from src.domain.services import ParentChildGrouper
+from src.entrypoints.api import create_app
 from src.use_cases.audit_product import AuditProductUseCase
 from src.use_cases.crawl_shop_catalog import CrawlShopCatalogUseCase
 from src.use_cases.resolve_reference import ResolveReferenceUseCase
@@ -37,6 +39,32 @@ def setup_utf8_terminal() -> None:
     if sys.platform == "win32" and hasattr(sys.stdout, "buffer") and hasattr(sys.stderr, "buffer"):
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+
+def _api_port(value: str) -> int:
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
+def run_serve_command(args: argparse.Namespace) -> int:
+    setup_utf8_terminal()
+    settings = get_settings().model_copy(update={"DATABASE_PATH": str(args.db)})
+    try:
+        app = create_app(settings=settings)
+        print(f"[*] Audit API: http://{args.host}:{args.port}")
+        print(f"[*] SQLite (read-only): {settings.db_file_path.resolve()}")
+        uvicorn.run(
+            app,
+            host=str(args.host),
+            port=int(args.port),
+            log_level=settings.LOG_LEVEL.lower(),
+        )
+        return 0
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        print(f"[!] Не удалось запустить Audit API: {exc}")
+        return 2
 
 
 async def run_crawl_command(args: argparse.Namespace) -> int:
@@ -927,6 +955,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
 
+    serve_parser = subparsers.add_parser("serve", help="Run the internal read-only audit API")
+    serve_parser.add_argument(
+        "--host",
+        type=str,
+        default=get_settings().AUDIT_API_HOST,
+        help="Bind host (default: 127.0.0.1)",
+    )
+    serve_parser.add_argument(
+        "--port",
+        type=_api_port,
+        default=get_settings().AUDIT_API_PORT,
+        help="Bind port (default: 8000)",
+    )
+    serve_parser.add_argument(
+        "--db",
+        type=str,
+        default=get_settings().DATABASE_PATH,
+        help="Path to the existing SQLite database (opened read-only)",
+    )
+
     crawl_parser = subparsers.add_parser("crawl", help="Run catalog crawler")
     crawl_parser.add_argument(
         "--category",
@@ -1203,7 +1251,10 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.subcommand == "categories":
+    if args.subcommand == "serve":
+        exit_code = run_serve_command(args)
+        sys.exit(exit_code)
+    elif args.subcommand == "categories":
         exit_code = asyncio.run(run_categories_command(args))
         sys.exit(exit_code)
     elif args.subcommand == "crawl":

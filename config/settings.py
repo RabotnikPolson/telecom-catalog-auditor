@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
-from pydantic import Field
+
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +19,10 @@ class Settings(BaseSettings):
 
     DATABASE_PATH: str = "catalog_audit.db"
 
+    AUDIT_API_HOST: str = "127.0.0.1"
+    AUDIT_API_PORT: int = Field(default=8000, ge=1, le=65535)
+    AUDIT_API_TOKEN: SecretStr | None = Field(default=None)
+
     SERPER_API_KEY: str | None = Field(default=None)
     OPENAI_API_KEY: str | None = Field(default=None)
     OPENAI_MODEL: str = Field(default="gpt-6-luna")
@@ -34,6 +39,6 @@ class Settings(BaseSettings):
         return Path(self.DATABASE_PATH)
 
 
-@lru_cache()
+@lru_cache
 def get_settings() -> Settings:
     return Settings()
