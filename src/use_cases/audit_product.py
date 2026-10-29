@@ -81,6 +81,19 @@ class AuditProductUseCase:
             )
             photos_handled = photos_only
         except (DomainError, httpx.HTTPError, TimeoutError, ValueError) as exc:
+            if photos_only:
+                retained = previous.model_copy(deep=True) if previous else AuditResult(
+                    product_id=product.product_id,
+                    status=AuditStatus.PENDING,
+                    details="Проверены только фото.",
+                )
+                retained.photos_only_run = True
+                retained.photos_error = str(exc)
+                retained.audit_parts.pop("photos", None)
+                retained.audit_parts.pop("photos_url", None)
+                retained.audited_at = datetime.now(UTC)
+                self._persist_audit(product, retained)
+                return retained
             result = AuditResult(
                 product_id=product.product_id,
                 status=AuditStatus.ERROR,
@@ -92,7 +105,17 @@ class AuditProductUseCase:
         if photos_handled:
             return result
         if result.status in (AuditStatus.ERROR, AuditStatus.NOT_FOUND):
-            retained = previous.model_copy(deep=True) if previous else result
+            invalid_legacy_verified = bool(
+                previous
+                and previous.status == AuditStatus.VERIFIED
+                and previous.confidence_score == 0
+                and not previous.audit_parts
+            )
+            retained = (
+                previous.model_copy(deep=True)
+                if previous is not None and not invalid_legacy_verified
+                else result
+            )
             attempted_parts = ["photos"]
             if not photos_only and not skip_tech:
                 attempted_parts.append("specs")
@@ -474,8 +497,8 @@ class AuditProductUseCase:
         if accepted_url is None or reference_count is None:
             result = previous.model_copy(deep=True) if previous else AuditResult(
                 product_id=product.product_id,
-                status=AuditStatus.ERROR,
-                details=error,
+                status=AuditStatus.PENDING,
+                details="Проверены только фото.",
             )
             result.photos_only_run = True
             result.photos_error = error

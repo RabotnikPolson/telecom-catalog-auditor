@@ -4,12 +4,16 @@ Autonomous Python 3.13+ microservice for factual auditing of `shop.telecom.kz` (
 
 ## CODEX CONTEXT & AUTOMATIC ROUTING
 - These instructions apply only to `telecom_catalog_auditor`. `core` is a separate PHP/Laravel repository with different rules and checks; do not read, edit or run it during this migration. Moving to it requires a separate discussion.
-- At task start read this file, `AGREED_REQUIREMENTS.md`, and `plans/current.md`. Read only the current plan linked there. Use `Handoff.md` only when resuming interrupted work or when the current pointer says it is needed. Files under `plans/archive/` are history: do not read them unless a concrete conflict requires it. Historical claims require verification and do not grant authorization.
-- Select and read skills automatically by task; users need not invoke them manually:
-  - `.agents/skills/clean-arch-scaffold/SKILL.md` before editing `src/use_cases/`, `src/adapters/`, or `config/vendor_profiles.py`.
-  - `.agents/skills/cli-ops-runner/SKILL.md` before CLI operations or product debugging.
-  - `.agents/skills/verify-gate/SKILL.md` before completing code changes or when asked to validate the project. The acting agent runs the full gate once on the final diff, including live tests; report skipped or unavailable checks and never call incomplete live verification a full success.
-- For `main.py`, `src/entrypoints/**/*.py`, or `tests/**/*.py`, read `.agents/rules/cli-and-tests.md`. Its applicability comes from this instruction, not Antigravity glob metadata or Codex command-permission `.rules` files.
+- Lean JIT Context Loading: Do NOT preload external docs. At task start, read ONLY this file and the immediate target code files.
+  - Read `plans/current.md` (and only the specific section of the plan it points to) ONLY when the user's prompt explicitly asks to implement, review, or verify an agreed project stage.
+  - Read `AGREED_REQUIREMENTS.md` ONLY if resolving domain entity requirements or database schema contracts.
+  - Read `Handoff.md` ONLY when explicitly resuming interrupted work or when the current pointer says it is needed. Files under `plans/archive/` are history: do not read them unless a concrete conflict requires it. Historical claims require verification and do not grant authorization.
+  - Never dump or read full plan files, archived plans, search traces or whole databases into context; use `rg`, targeted line ranges, `git diff --stat` and focused diffs of approved files.
+- Select and read skills strictly on-demand (JIT):
+  - Read `.agents/skills/clean-arch-scaffold/SKILL.md` ONLY right before modifying `src/use_cases/`, `src/adapters/`, or `config/vendor_profiles.py`.
+  - Read `.agents/skills/cli-ops-runner/SKILL.md` ONLY when preparing a CLI command or product debug session.
+  - Read `.agents/skills/verify-gate/SKILL.md` ONLY before the single final verification gate.
+  - Read `.agents/rules/cli-and-tests.md` ONLY when authoring or modifying `main.py`, `src/entrypoints/**/*.py`, or `tests/**/*.py`. Its applicability comes from this instruction, not Antigravity glob metadata or Codex command-permission `.rules` files.
 - Optional role entry points are `.codex/agents/implementer.toml` and `.codex/agents/auditor.toml`; detailed instructions live in `.agents/agents/`. The main agent does not spawn them automatically. Use a subagent only after the user explicitly authorizes that specific delegation; do not invent `invoke_subagent`.
 - Human involvement is for approving plans and material decisions; automatic routing does not bypass those boundaries. Do not change the application's judge model to match the Codex agent model.
 - Do not change the shop or write to production without separate explicit approval. Do not change or stage secrets, databases, local `.env`, or `Dockerfile-local`; no GitLab push is authorized by this migration.
@@ -20,7 +24,12 @@ Autonomous Python 3.13+ microservice for factual auditing of `shop.telecom.kz` (
 2. **Hard Locks**: **NEVER** proceed to Stage 5 (Excel) or Stage 6 (FastAPI) and **NEVER** modify `config/whitelist_domains.py` without explicit user approval.
 3. **Single-Agent Delivery by Default**:
   - The main agent in the active chat owns the approved plan, implementation, full-diff self-review, testing, final report and manual acceptance instructions. Do not spawn an `implementer`, `auditor` or other subagent automatically.
-  - Before reporting a code change complete, inspect the complete `git diff` against the approved plan and the release checklist in `.agents/skills/verify-gate/SKILL.md`, then run the canonical full gate once on the final state. Focused tests during development do not replace that gate. Correct in-scope failures and rerun the affected checks and final gate; report unrelated failures without expanding scope.
+  - During development, run ONLY fast targeted unit tests (`python -m pytest tests/test_<target>.py -q --tb=short`) to verify changes in seconds without terminal polling overhead.
+  - Before reporting completion, inspect the complete `git diff` and run the canonical verification gate (`.agents/skills/verify-gate/scripts/verify.ps1`) strictly ONCE on the final diff.
+  - PROHIBITED: Running repeated cycles of the full `verify.ps1` in an automated loop. If `verify.ps1` fails:
+    1. Identify the failing check from output.
+    2. Fix it and verify ONLY that test with `python -m pytest tests/test_<failing>.py -k "<name>" -q --tb=short`.
+    3. Re-run `verify.ps1` at most ONCE. If it fails a second time, STOP immediately and report findings to the user without burning additional context.
   - Subagents are optional and require the user's explicit approval for a named, bounded task. Consider requesting an independent `auditor` only for high-risk work such as schema migrations, security or whitelist changes, FastAPI/core integration, permissions, MySQL/production writes, recovery protocols or major architecture changes. Risk alone is not authorization to spawn one.
   - If the user explicitly requests an `auditor`, it is the Codex code reviewer, not the product-auditing service. It may run checks and create their temporary outputs but must never edit source files. Roles inherit execution permissions; these instructions do not create an isolated sandbox.
 4. **Zero Overengineering**: Smallest possible diff. Modify ONLY target files. **PROHIBITED**: `# TODO`, `pass`, `...`, `NotImplementedError`, or root debug scripts (`test_foo.py`). Debug via CLI with `--limit 1`.

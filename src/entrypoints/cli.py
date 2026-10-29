@@ -33,6 +33,7 @@ from src.entrypoints.api import create_app
 from src.use_cases.audit_product import AuditProductUseCase
 from src.use_cases.crawl_shop_catalog import CrawlShopCatalogUseCase
 from src.use_cases.resolve_reference import ResolveReferenceUseCase
+from src.use_cases.sync_audited_brands import SyncAuditedBrandsUseCase
 
 
 def setup_utf8_terminal() -> None:
@@ -65,6 +66,33 @@ def run_serve_command(args: argparse.Namespace) -> int:
     except (OSError, RuntimeError, sqlite3.Error) as exc:
         print(f"[!] Не удалось запустить Audit API: {exc}")
         return 2
+
+
+async def run_sync_audited_brands_command(args: argparse.Namespace) -> int:
+    setup_utf8_terminal()
+    db_path = Path(args.db)
+    try:
+        repo = SQLiteProductRepository(db_path)
+        async with MySQLCatalogReader() as reader:
+            result = await SyncAuditedBrandsUseCase(
+                get_current=repo.get_audited_product_brands,
+                fetch_source=reader.fetch_brands_by_product_ids,
+                apply_updates=repo.update_audited_brands,
+            ).execute(apply=bool(args.apply))
+    except (MySQLReaderError, OSError, sqlite3.Error) as exc:
+        print(f"[!] Не удалось синхронизировать бренды: {exc}")
+        return 2
+
+    mode = "APPLY" if result.applied else "DRY-RUN"
+    print(f"Brand sync mode : {mode}")
+    print(f"SQLite          : {db_path.resolve()}")
+    print(f"Audited products: {result.audited_products}")
+    print(f"MySQL products  : {result.mysql_products}")
+    print(f"Brands found    : {result.brands_found}")
+    print(f"Missing in MySQL: {result.missing_products}")
+    print(f"Changes         : {result.changes}")
+    print(f"Updated         : {result.updated}")
+    return 0
 
 
 async def run_crawl_command(args: argparse.Namespace) -> int:
@@ -975,6 +1003,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the existing SQLite database (opened read-only)",
     )
 
+    sync_brands_parser = subparsers.add_parser(
+        "sync-audited-brands",
+        help="Sync brand.name from read-only MySQL for products already present in audit results",
+    )
+    sync_brands_parser.add_argument(
+        "--db",
+        type=str,
+        default=get_settings().DATABASE_PATH,
+        help="Path to the existing SQLite audit database",
+    )
+    sync_brands_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the reported updates; without this flag the command is a dry-run",
+    )
+
     crawl_parser = subparsers.add_parser("crawl", help="Run catalog crawler")
     crawl_parser.add_argument(
         "--category",
@@ -1253,6 +1297,9 @@ def main() -> None:
 
     if args.subcommand == "serve":
         exit_code = run_serve_command(args)
+        sys.exit(exit_code)
+    elif args.subcommand == "sync-audited-brands":
+        exit_code = asyncio.run(run_sync_audited_brands_command(args))
         sys.exit(exit_code)
     elif args.subcommand == "categories":
         exit_code = asyncio.run(run_categories_command(args))

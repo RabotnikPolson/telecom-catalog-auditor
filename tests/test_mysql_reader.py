@@ -1,6 +1,7 @@
 import pytest
-from src.adapters.catalog.mysql_reader import MySQLCatalogReader
+
 from config.settings import get_settings
+from src.adapters.catalog.mysql_reader import MySQLCatalogReader
 
 
 @pytest.mark.anyio
@@ -27,6 +28,7 @@ async def test_mysql_reader_fetch_by_sku_and_specs():
         assert product.product_id == 90363
         assert "TP-Link" in product.title or "Tp-Link" in product.title
         assert product.barcode == "4897098686928"
+        assert product.brand_name is not None
         assert len(product.current_specs) > 0, "Product should have specs loaded from MySQL"
         assert product.content_hash != "", "Content hash should be auto-computed"
 
@@ -53,6 +55,7 @@ async def test_mysql_reader_streaming():
 @pytest.mark.anyio
 async def test_mysql_configuration_and_connection_errors_are_distinct(monkeypatch):
     from unittest.mock import AsyncMock
+
     from config.settings import Settings
     from src.adapters.catalog.mysql_reader import MySQLConfigurationError, MySQLConnectionError
 
@@ -73,6 +76,7 @@ async def test_mysql_configuration_and_connection_errors_are_distinct(monkeypatc
 @pytest.mark.parametrize("connection_lost", [False, True])
 async def test_mysql_stream_distinguishes_query_failure_from_connection_loss(monkeypatch, connection_lost):
     import aiomysql
+
     from src.adapters.catalog.mysql_reader import MySQLConnectionError, MySQLQueryError
     from src.domain.entities import Product
 
@@ -99,6 +103,7 @@ async def test_mysql_stream_distinguishes_query_failure_from_connection_loss(mon
 @pytest.mark.anyio
 async def test_mysql_keyset_keeps_filters_and_releases_connection_before_yield(monkeypatch):
     from unittest.mock import AsyncMock
+
     from src.domain.entities import Product
 
     reader = MySQLCatalogReader()
@@ -150,3 +155,54 @@ async def test_mysql_keyset_keeps_filters_and_releases_connection_before_yield(m
     assert [params for _, params in queries] == [(78, 11, 1, 2), (5, 78, 11, 1), (9, 78, 11, 1)]
     assert all("p.category_id = %s" in query and "sc.categories_id = %s" in query for query, _ in queries)
     assert "OFFSET" not in queries[1][0]
+
+
+@pytest.mark.anyio
+async def test_brand_lookup_uses_one_parameterized_query_and_fetchmany(monkeypatch):
+    reader = MySQLCatalogReader()
+    select_calls = []
+    row_sets = [
+        [
+            {"product_id": 1, "brand_name": " Apple "},
+            {"product_id": 2, "brand_name": None},
+        ],
+        [],
+    ]
+
+    class Cursor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, query, params=()):
+            if "SELECT p.id AS product_id" in query:
+                select_calls.append((query, params))
+
+        async def fetchmany(self, size):
+            assert size == 2
+            return row_sets.pop(0)
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    class Acquisition:
+        async def __aenter__(self):
+            return Connection()
+
+        async def __aexit__(self, *args):
+            return False
+
+    class Pool:
+        def acquire(self):
+            return Acquisition()
+
+    monkeypatch.setattr(reader, "_ensure_connected", lambda: Pool())
+
+    result = await reader.fetch_brands_by_product_ids([1, 2, 1], batch_size=2)
+
+    assert result == {1: "Apple", 2: None}
+    assert len(select_calls) == 1
+    assert select_calls[0][1] == (1, 2)

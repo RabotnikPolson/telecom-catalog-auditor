@@ -6,7 +6,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-LATEST_SCHEMA_VERSION: int = 4
+LATEST_SCHEMA_VERSION: int = 5
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS products (
@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS products (
     shop_sku TEXT,
     title TEXT NOT NULL,
     barcode TEXT,
+    brand_name TEXT,
     vendor_name TEXT,
     vendor_sku TEXT,
     manufacturer_sku TEXT,
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS products (
 
 CREATE INDEX IF NOT EXISTS idx_products_shop_sku ON products(shop_sku);
 CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode);
+CREATE INDEX IF NOT EXISTS idx_products_brand_name ON products(brand_name);
 CREATE INDEX IF NOT EXISTS idx_products_content_hash ON products(content_hash);
 CREATE INDEX IF NOT EXISTS idx_products_master_key ON products(master_key);
 CREATE INDEX IF NOT EXISTS idx_products_parent_sku ON products(parent_sku);
@@ -153,6 +155,8 @@ def init_db(db_path: str | Path) -> None:
                 columns = [row["name"] for row in col_cursor.fetchall()]
                 if "barcode" not in columns:
                     _try_add_column(conn, "products", "barcode TEXT")
+                if "brand_name" not in columns:
+                    _try_add_column(conn, "products", "brand_name TEXT")
                 if "shop_sku" not in columns:
                     _try_add_column(conn, "products", "shop_sku TEXT")
                 if "description" not in columns:

@@ -199,7 +199,7 @@ def test_atomic_jit_save_product_and_audit_result(temp_repo: SQLiteProductReposi
 def test_cache_indexes_and_user_version_exist(temp_repo: SQLiteProductRepository) -> None:
     with get_sqlite_connection(temp_repo.db_path) as conn:
         ver = conn.execute("PRAGMA user_version;").fetchone()[0]
-        assert ver == 4
+        assert ver == 5
 
         idx_rows = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index';"
@@ -209,6 +209,7 @@ def test_cache_indexes_and_user_version_exist(temp_repo: SQLiteProductRepository
         assert "idx_url_cache_created_at" in idx_names
         assert "idx_specs_cache_fetched_at" in idx_names
         assert "idx_audit_results_product_unique" in idx_names
+        assert "idx_products_brand_name" in idx_names
 
 
 def test_v3_audit_migration_keeps_report_and_unique_index(tmp_path: Path) -> None:

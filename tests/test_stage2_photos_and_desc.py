@@ -1,14 +1,13 @@
-from datetime import datetime, timezone
-import json
 from pathlib import Path
-import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from src.adapters.db.schema import init_db, get_sqlite_connection
+import pytest
+
+from src.adapters.db.schema import get_sqlite_connection, init_db
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
 from src.adapters.llm.description_evaluator import (
-    clean_html_description,
     build_description_prompt_section,
+    clean_html_description,
     parse_description_audit,
 )
 from src.domain.entities import (
@@ -18,6 +17,7 @@ from src.domain.entities import (
     Product,
 )
 from src.use_cases.audit_product import AuditProductUseCase, evaluate_photos_status
+from src.use_cases.resolve_reference import ResolvedReference
 
 
 def test_clean_html_description() -> None:
@@ -202,6 +202,67 @@ async def test_photos_only_mode_in_use_case(tmp_path: Path) -> None:
     assert mock_crawler.crawl.await_count == 2
     assert mock_judge.matches_model.await_count == 2
     assert not mock_judge.judge.called
+
+
+@pytest.mark.anyio
+async def test_photos_only_failure_without_full_audit_stays_pending(tmp_path: Path) -> None:
+    repo = SQLiteProductRepository(tmp_path / "photo-failure.db")
+    product = Product(
+        product_id=6003,
+        title="Camera without known image count",
+        images_count=0,
+        images_count_known=False,
+    )
+
+    result = await AuditProductUseCase(repo, MagicMock(), MagicMock(), MagicMock()).audit_product(
+        product,
+        photos_only=True,
+    )
+
+    assert result.status == AuditStatus.PENDING
+    assert result.confidence_score == 0
+    assert result.photos_error == "Нет достоверного количества фото магазина."
+    assert "specs" not in result.audit_parts
+    assert "description" not in result.audit_parts
+
+
+@pytest.mark.anyio
+async def test_full_failure_replaces_invalid_legacy_verified_zero(tmp_path: Path) -> None:
+    repo = SQLiteProductRepository(tmp_path / "legacy-verified.db")
+    product = Product(product_id=6004, title="Xiaomi 12 Pro")
+    repo.save_product_and_audit_result(
+        product,
+        AuditResult(
+            product_id=product.product_id,
+            status=AuditStatus.VERIFIED,
+            confidence_score=0,
+            details="Invalid legacy photos-only result",
+            audit_parts={},
+        ),
+    )
+    resolver = MagicMock()
+    resolver.execute = AsyncMock(
+        return_value=ResolvedReference(
+            product_id=product.product_id,
+            status="NOT_FOUND",
+            scenario_applied="NONE",
+            candidate_urls=[],
+            reference_url=None,
+            search_trace=[],
+            source_type=None,
+            query_used=None,
+        )
+    )
+
+    result = await AuditProductUseCase(repo, resolver, MagicMock(), MagicMock()).audit_product(
+        product,
+        force_refresh=True,
+    )
+
+    persisted = repo.get_latest_audit_result(product.product_id)
+    assert result.status == AuditStatus.NOT_FOUND
+    assert persisted is not None and persisted.status == AuditStatus.NOT_FOUND
+    assert persisted.details != "Invalid legacy photos-only result"
 
 
 @pytest.mark.anyio

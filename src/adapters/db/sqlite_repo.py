@@ -32,6 +32,7 @@ class AuditListFilters:
     statuses: tuple[AuditStatus, ...] = ()
     attention_required: bool | None = None
     query: str | None = None
+    brand: str | None = None
     vendor: str | None = None
     audited_from: datetime | None = None
     audited_to: datetime | None = None
@@ -46,6 +47,7 @@ class AuditReadRecord:
     shop_sku: str | None
     barcode: str | None
     title: str
+    brand_name: str | None
     vendor_name: str | None
     vendor_sku: str | None
     manufacturer_sku: str | None
@@ -123,6 +125,7 @@ class SQLiteProductRepository:
             else datetime.now(UTC)
         )
         barcode = row["barcode"] if "barcode" in row.keys() else None
+        brand_name = row["brand_name"] if "brand_name" in row.keys() else None
         shop_sku = row["shop_sku"] if "shop_sku" in row.keys() else None
         description = row["description"] if "description" in row.keys() else None
         images_count = int(row["images_count"]) if "images_count" in row.keys() and row["images_count"] is not None else 0
@@ -132,6 +135,7 @@ class SQLiteProductRepository:
             shop_sku=shop_sku,
             title=row["title"],
             barcode=barcode,
+            brand_name=brand_name,
             vendor_name=row["vendor_name"],
             vendor_sku=row["vendor_sku"],
             manufacturer_sku=row["manufacturer_sku"],
@@ -159,12 +163,12 @@ class SQLiteProductRepository:
 
         sql = """
         INSERT INTO products (
-            product_id, shop_sku, title, barcode, vendor_name, vendor_sku, manufacturer_sku,
+            product_id, shop_sku, title, barcode, brand_name, vendor_name, vendor_sku, manufacturer_sku,
             description, images_count,
             current_specs, content_hash, parent_sku, master_key, is_master,
             status, created_at, updated_at
         ) VALUES (
-            :product_id, :shop_sku, :title, :barcode, :vendor_name, :vendor_sku, :manufacturer_sku,
+            :product_id, :shop_sku, :title, :barcode, :brand_name, :vendor_name, :vendor_sku, :manufacturer_sku,
             :description, :images_count,
             :current_specs, :content_hash, :parent_sku, :master_key, :is_master,
             :status, :created_at, :updated_at
@@ -173,6 +177,7 @@ class SQLiteProductRepository:
             shop_sku = excluded.shop_sku,
             title = excluded.title,
             barcode = excluded.barcode,
+            brand_name = excluded.brand_name,
             vendor_name = excluded.vendor_name,
             vendor_sku = excluded.vendor_sku,
             manufacturer_sku = excluded.manufacturer_sku,
@@ -196,6 +201,7 @@ class SQLiteProductRepository:
                 "shop_sku": p.shop_sku,
                 "title": p.title,
                 "barcode": p.barcode,
+                "brand_name": p.brand_name,
                 "vendor_name": p.vendor_name,
                 "vendor_sku": p.vendor_sku,
                 "manufacturer_sku": p.manufacturer_sku,
@@ -607,12 +613,12 @@ class SQLiteProductRepository:
     def _execute_upsert_product(self, conn: sqlite3.Connection, product: Product) -> None:
         sql = """
         INSERT INTO products (
-            product_id, shop_sku, title, barcode, vendor_name, vendor_sku, manufacturer_sku,
+            product_id, shop_sku, title, barcode, brand_name, vendor_name, vendor_sku, manufacturer_sku,
             description, images_count,
             current_specs, content_hash, parent_sku, master_key, is_master,
             status, created_at, updated_at
         ) VALUES (
-            :product_id, :shop_sku, :title, :barcode, :vendor_name, :vendor_sku, :manufacturer_sku,
+            :product_id, :shop_sku, :title, :barcode, :brand_name, :vendor_name, :vendor_sku, :manufacturer_sku,
             :description, :images_count,
             :current_specs, :content_hash, :parent_sku, :master_key, :is_master,
             :status, :created_at, :updated_at
@@ -621,6 +627,7 @@ class SQLiteProductRepository:
             shop_sku = excluded.shop_sku,
             title = excluded.title,
             barcode = excluded.barcode,
+            brand_name = excluded.brand_name,
             vendor_name = excluded.vendor_name,
             vendor_sku = excluded.vendor_sku,
             manufacturer_sku = excluded.manufacturer_sku,
@@ -642,6 +649,7 @@ class SQLiteProductRepository:
             "shop_sku": product.shop_sku,
             "title": product.title,
             "barcode": product.barcode,
+            "brand_name": product.brand_name,
             "vendor_name": product.vendor_name,
             "vendor_sku": product.vendor_sku,
             "manufacturer_sku": product.manufacturer_sku,
@@ -782,6 +790,48 @@ class SQLiteProductRepository:
                 results.update({int(row["product_id"]): self._row_to_audit_result(row) for row in rows})
         return results
 
+    def get_audited_product_brands(self) -> dict[int, str | None]:
+        with get_sqlite_connection(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT p.product_id, p.brand_name
+                FROM products p
+                JOIN audit_results a ON a.product_id = p.product_id
+                ORDER BY p.product_id
+                """
+            ).fetchall()
+        return {
+            int(row["product_id"]): (
+                str(row["brand_name"]).strip() if row["brand_name"] is not None else None
+            )
+            for row in rows
+        }
+
+    def update_audited_brands(self, updates: dict[int, str | None]) -> int:
+        if not updates:
+            return 0
+        values = [
+            ((brand.strip() or None) if brand is not None else None, product_id)
+            for product_id, brand in updates.items()
+        ]
+        with get_sqlite_connection(self.db_path) as conn:
+            before = conn.total_changes
+            conn.executemany(
+                """
+                UPDATE products
+                SET brand_name = ?
+                WHERE product_id = ?
+                  AND EXISTS (
+                      SELECT 1 FROM audit_results a
+                      WHERE a.product_id = products.product_id
+                  )
+                """,
+                values,
+            )
+            changed = conn.total_changes - before
+            conn.commit()
+        return changed
+
 
 class SQLiteAuditReadRepository:
     """Read-only audit projection for the internal manager API."""
@@ -824,6 +874,7 @@ class SQLiteAuditReadRepository:
             p.shop_sku,
             p.barcode,
             p.title,
+            p.brand_name,
             p.vendor_name,
             p.vendor_sku,
             p.manufacturer_sku
@@ -901,6 +952,10 @@ class SQLiteAuditReadRepository:
             conditions.append("CASEFOLD(p.vendor_name) LIKE CASEFOLD(?) ESCAPE '\\'")
             params.append(f"%{cls._escape_like(filters.vendor.strip())}%")
 
+        if filters.brand:
+            conditions.append("p.brand_name = ?")
+            params.append(filters.brand.strip())
+
         if filters.audited_from:
             conditions.append("a.audited_at >= ?")
             params.append(filters.audited_from.isoformat())
@@ -930,6 +985,7 @@ class SQLiteAuditReadRepository:
             shop_sku=str(row["shop_sku"]) if row["shop_sku"] is not None else None,
             barcode=str(row["barcode"]) if row["barcode"] is not None else None,
             title=str(row["title"]),
+            brand_name=str(row["brand_name"]) if row["brand_name"] is not None else None,
             vendor_name=str(row["vendor_name"]) if row["vendor_name"] is not None else None,
             vendor_sku=str(row["vendor_sku"]) if row["vendor_sku"] is not None else None,
             manufacturer_sku=(
@@ -993,6 +1049,36 @@ class SQLiteAuditReadRepository:
             page=filters.page,
             per_page=filters.per_page,
         )
+
+    def list_audited_vendors(self) -> tuple[str, ...]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT MIN(TRIM(p.vendor_name)) AS vendor_name
+                FROM audit_results a
+                JOIN products p ON p.product_id = a.product_id
+                WHERE p.vendor_name IS NOT NULL AND TRIM(p.vendor_name) <> ''
+                GROUP BY CASEFOLD(TRIM(p.vendor_name))
+                ORDER BY CASEFOLD(MIN(TRIM(p.vendor_name))) ASC,
+                         MIN(TRIM(p.vendor_name)) ASC
+                """
+            ).fetchall()
+        return tuple(str(row["vendor_name"]) for row in rows)
+
+    def list_audited_brands(self) -> tuple[str, ...]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT MIN(TRIM(p.brand_name)) AS brand_name
+                FROM audit_results a
+                JOIN products p ON p.product_id = a.product_id
+                WHERE p.brand_name IS NOT NULL AND TRIM(p.brand_name) <> ''
+                GROUP BY CASEFOLD(TRIM(p.brand_name))
+                ORDER BY CASEFOLD(MIN(TRIM(p.brand_name))) ASC,
+                         MIN(TRIM(p.brand_name)) ASC
+                """
+            ).fetchall()
+        return tuple(str(row["brand_name"]) for row in rows)
 
     def get_audit_card_details(self, product_id: int) -> AuditReadRecord | None:
         with closing(self._connect()) as conn:

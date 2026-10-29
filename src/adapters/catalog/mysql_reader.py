@@ -170,6 +170,44 @@ class MySQLCatalogReader:
 
         return await self._fetch_single_by_condition("p.barcode = %s", (clean_id,))
 
+    async def fetch_brands_by_product_ids(
+        self,
+        product_ids: Sequence[int],
+        batch_size: int = 500,
+    ) -> dict[int, str | None]:
+        unique_ids = tuple(dict.fromkeys(int(product_id) for product_id in product_ids))
+        if not unique_ids:
+            return {}
+        placeholders = ",".join("%s" for _ in unique_ids)
+        query = f"""
+            SELECT p.id AS product_id, b.name AS brand_name
+            FROM products p
+            LEFT JOIN brand b ON p.brand_id = b.id
+            WHERE p.id IN ({placeholders})
+            ORDER BY p.id
+        """
+        pool = self._ensure_connected()
+        try:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await self._init_session(cur)
+                    await cur.execute(query, unique_ids)
+                    brands: dict[int, str | None] = {}
+                    while True:
+                        rows = await cur.fetchmany(batch_size)
+                        if not rows:
+                            break
+                        for row in rows:
+                            raw_brand = row.get("brand_name")
+                            brands[int(row["product_id"])] = (
+                                str(raw_brand).strip() or None if raw_brand is not None else None
+                            )
+                    return brands
+        except MySQLReaderError:
+            raise
+        except Exception as exc:
+            raise MySQLQueryError("Не удалось получить бренды аудированных товаров.") from exc
+
     async def _fetch_single_by_condition(
         self, condition: str, params: Sequence[str | int]
     ) -> Product | None:
@@ -205,14 +243,13 @@ class MySQLCatalogReader:
                 title = (row["title"] or "").strip() or f"Product #{pid}"
                 vendor_name = partner_info.get("vendor_name")
                 brand_name = (row.get("brand_name") or "").strip() or None
-                if (not vendor_name or "склад" in vendor_name.lower()) and brand_name:
-                    vendor_name = brand_name
 
                 return Product(
                     product_id=pid,
                     shop_sku=str(row["shop_sku"]).strip() if row["shop_sku"] else str(pid),
                     title=title,
                     barcode=str(row["barcode"]).strip() if row["barcode"] else None,
+                    brand_name=brand_name,
                     vendor_name=vendor_name,
                     vendor_sku=partner_info.get("vendor_sku"),
                     manufacturer_sku=None,
@@ -591,14 +628,13 @@ class MySQLCatalogReader:
                 partner_info = partners.get(pid, {})
                 vendor_name = partner_info.get("vendor_name")
                 brand_name = (r.get("brand_name") or "").strip() or None
-                if (not vendor_name or "склад" in vendor_name.lower()) and brand_name:
-                    vendor_name = brand_name
 
                 prod = Product(
                     product_id=pid,
                     shop_sku=str(r["shop_sku"]).strip() if r["shop_sku"] else str(pid),
                     title=title,
                     barcode=str(r["barcode"]).strip() if r["barcode"] else None,
+                    brand_name=brand_name,
                     vendor_name=vendor_name,
                     vendor_sku=partner_info.get("vendor_sku"),
                     manufacturer_sku=None,

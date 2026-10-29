@@ -1,11 +1,48 @@
 import hashlib
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 
 from src.adapters.db.sqlite_repo import SQLiteProductRepository
-from src.domain.entities import AuditStatus, Product
+from src.domain.entities import AuditResult, AuditStatus, Product
 from src.domain.services import ParentChildGrouper
+from src.use_cases.sync_audited_brands import SyncAuditedBrandsUseCase
+
+
+@pytest.mark.anyio
+async def test_sync_audited_brands_is_dry_run_then_idempotent_apply(tmp_path: Path) -> None:
+    repo = SQLiteProductRepository(tmp_path / "brand-sync.db")
+    repo.save_product_and_audit_result(
+        Product(product_id=1, title="iPhone", brand_name=None),
+        AuditResult(product_id=1, status=AuditStatus.PENDING),
+    )
+    repo.save_product_and_audit_result(
+        Product(product_id=2, title="Galaxy", brand_name="Samsung"),
+        AuditResult(product_id=2, status=AuditStatus.PENDING),
+    )
+    calls: list[tuple[int, ...]] = []
+
+    async def fetch(product_ids: Sequence[int]) -> dict[int, str | None]:
+        calls.append(tuple(product_ids))
+        return {1: " Apple ", 2: "Samsung"}
+
+    use_case = SyncAuditedBrandsUseCase(
+        get_current=repo.get_audited_product_brands,
+        fetch_source=fetch,
+        apply_updates=repo.update_audited_brands,
+    )
+
+    dry_run = await use_case.execute()
+    applied = await use_case.execute(apply=True)
+    repeated = await use_case.execute(apply=True)
+
+    assert dry_run.changes == 1 and dry_run.updated == 0
+    assert applied.changes == 1 and applied.updated == 1
+    assert repeated.changes == 0 and repeated.updated == 0
+    assert calls == [(1, 2), (1, 2), (1, 2)]
+    synced = repo.get_product_by_id(1)
+    assert synced is not None and synced.brand_name == "Apple"
 
 
 class TestContentHash:
@@ -226,6 +263,7 @@ class TestSQLiteRepository:
         product = Product(
             product_id=5001,
             title="Samsung Galaxy S23 8/256GB Phantom Black",
+            brand_name="Samsung",
             vendor_name="Al-Style",
             vendor_sku="AL-SAM-S23-256",
             manufacturer_sku="SM-S911BZKDCAZ",
@@ -239,6 +277,7 @@ class TestSQLiteRepository:
         retrieved = test_repo.get_product_by_id(5001)
         assert retrieved is not None
         assert retrieved.title == "Samsung Galaxy S23 8/256GB Phantom Black"
+        assert retrieved.brand_name == "Samsung"
         assert retrieved.vendor_sku == "AL-SAM-S23-256"
         assert retrieved.manufacturer_sku == "SM-S911BZKDCAZ"
         assert retrieved.current_specs["память"] == "256 гб"

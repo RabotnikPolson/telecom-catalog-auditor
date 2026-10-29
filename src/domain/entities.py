@@ -95,6 +95,7 @@ class Product(BaseModel):
     shop_sku: str | None = Field(default=None)
     title: str = Field(..., min_length=1)
     barcode: str | None = Field(default=None)
+    brand_name: str | None = Field(default=None)
     vendor_name: str | None = Field(default=None)
     vendor_sku: str | None = Field(default=None)
     manufacturer_sku: str | None = Field(default=None)
@@ -138,6 +139,7 @@ class Product(BaseModel):
             "title": self.title,
             "shop_sku": self.shop_sku,
             "barcode": self.barcode,
+            "brand_name": self.brand_name,
             "vendor_name": self.vendor_name,
             "vendor_sku": self.vendor_sku,
             "manufacturer_sku": self.manufacturer_sku,
