@@ -6,7 +6,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-LATEST_SCHEMA_VERSION: int = 5
+LATEST_SCHEMA_VERSION: int = 6
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS products (
@@ -69,6 +69,8 @@ CREATE TABLE IF NOT EXISTS audit_results (
     status TEXT NOT NULL,
     confidence_score REAL NOT NULL,
     reference_url TEXT,
+    reference_title TEXT,
+    reference_sku TEXT,
     discrepancies_json TEXT,
     missing_specs_json TEXT,
     matched_specs_count INTEGER NOT NULL,
@@ -179,6 +181,8 @@ def init_db(db_path: str | Path) -> None:
             if audit_cursor.fetchone():
                 a_cols = [row["name"] for row in conn.execute("PRAGMA table_info(audit_results);").fetchall()]
                 migrations = [
+                    ("reference_title", "reference_title TEXT"),
+                    ("reference_sku", "reference_sku TEXT"),
                     ("missing_specs_json", "missing_specs_json TEXT"),
                     ("execution_time_sec", "execution_time_sec REAL DEFAULT 0.0"),
                     ("crawler_time_sec", "crawler_time_sec REAL DEFAULT 0.0"),

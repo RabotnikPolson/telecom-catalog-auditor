@@ -92,6 +92,8 @@ def _audit_revision(record: AuditReadRecord) -> str:
         "audit_status": record.audit_status.value,
         "confidence_score": record.confidence_score,
         "reference_url": record.reference_url,
+        "reference_title": record.reference_title,
+        "reference_sku": record.reference_sku,
         "discrepancies": [item.model_dump(mode="json") for item in record.discrepancies],
         "missing_specs": [item.model_dump(mode="json") for item in record.missing_specs],
         "matched_specs_count": record.matched_specs_count,
@@ -213,6 +215,8 @@ def _detail(record: AuditReadRecord) -> AuditCardResponse:
             attention_required=SQLiteAuditReadRepository.attention_required(record),
             confidence_score=record.confidence_score,
             reference_url=record.reference_url,
+            reference_title=record.reference_title,
+            reference_sku=record.reference_sku,
             audited_at=_as_utc(record.audited_at),
             specs=SpecsResponse(
                 coverage=_coverage(record, "specs"),

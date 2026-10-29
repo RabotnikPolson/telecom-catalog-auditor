@@ -54,6 +54,8 @@ class AuditReadRecord:
     audit_status: AuditStatus
     confidence_score: float
     reference_url: str | None
+    reference_title: str | None
+    reference_sku: str | None
     discrepancies: tuple[DiscrepancyItem, ...]
     missing_specs: tuple[MissingSpecItem, ...]
     matched_specs_count: int
@@ -589,6 +591,16 @@ class SQLiteProductRepository:
             status=AuditStatus(row["status"]),
             confidence_score=row["confidence_score"],
             reference_url=row["reference_url"],
+            reference_title=(
+                str(row["reference_title"])
+                if "reference_title" in keys and row["reference_title"] is not None
+                else None
+            ),
+            reference_sku=(
+                str(row["reference_sku"])
+                if "reference_sku" in keys and row["reference_sku"] is not None
+                else None
+            ),
             discrepancies=discrepancies,
             missing_specs=missing_specs,
             matched_specs_count=row["matched_specs_count"],
@@ -669,17 +681,19 @@ class SQLiteProductRepository:
     def _execute_upsert_audit_result(self, conn: sqlite3.Connection, result: AuditResult) -> int:
         sql = """
         INSERT INTO audit_results (
-            product_id, status, confidence_score, reference_url,
+            product_id, status, confidence_score, reference_url, reference_title, reference_sku,
             discrepancies_json, missing_specs_json, matched_specs_count, total_specs_count,
             images_count, reference_images_count, images_status,
             description_discrepancies_json, description_quality,
             audited_at, details, execution_time_sec, crawler_time_sec, llm_time_sec,
             input_tokens, output_tokens, estimated_cost_usd, search_trace_json, audit_parts_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(product_id) DO UPDATE SET
             status = excluded.status,
             confidence_score = excluded.confidence_score,
             reference_url = excluded.reference_url,
+            reference_title = excluded.reference_title,
+            reference_sku = excluded.reference_sku,
             discrepancies_json = excluded.discrepancies_json,
             missing_specs_json = excluded.missing_specs_json,
             matched_specs_count = excluded.matched_specs_count,
@@ -722,6 +736,8 @@ class SQLiteProductRepository:
                 result.status.value,
                 result.confidence_score,
                 result.reference_url,
+                result.reference_title,
+                result.reference_sku,
                 disc_json,
                 missing_json,
                 result.matched_specs_count,
@@ -860,6 +876,8 @@ class SQLiteAuditReadRepository:
             a.status,
             a.confidence_score,
             a.reference_url,
+            a.reference_title,
+            a.reference_sku,
             a.discrepancies_json,
             a.missing_specs_json,
             a.matched_specs_count,
@@ -994,6 +1012,10 @@ class SQLiteAuditReadRepository:
             audit_status=AuditStatus(str(row["status"])),
             confidence_score=float(row["confidence_score"]),
             reference_url=str(row["reference_url"]) if row["reference_url"] is not None else None,
+            reference_title=(
+                str(row["reference_title"]) if row["reference_title"] is not None else None
+            ),
+            reference_sku=str(row["reference_sku"]) if row["reference_sku"] is not None else None,
             discrepancies=discrepancies,
             missing_specs=missing_specs,
             matched_specs_count=int(row["matched_specs_count"]),

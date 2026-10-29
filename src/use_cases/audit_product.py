@@ -1,9 +1,11 @@
 import asyncio
 import json
+import re
 import sqlite3
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from urllib.parse import urlparse
 
 import httpx
 
@@ -37,6 +39,15 @@ def evaluate_photos_status(shop_count: int, reference_count: int) -> str:
         if shop_count < 2:
             return "LOW_COUNT"
         return "OK"
+
+
+def reference_sku_from_url(reference_url: str) -> str | None:
+    parsed = urlparse(reference_url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname != "kaspi.kz" and not hostname.endswith(".kaspi.kz"):
+        return None
+    match = re.search(r"(?:-|/)(\d{5,})$", parsed.path.rstrip("/"))
+    return match.group(1) if match else None
 
 
 class AuditProductUseCase:
@@ -230,6 +241,7 @@ class AuditProductUseCase:
             for cand_idx, cand_url in enumerate(to_test, 1):
                 target_url = cand_url
                 external_markdown: str | None = None
+                reference_title: str | None = None
                 ref_images_cnt = 0
                 search_trace.append(f"[{label_prefix} {cand_idx}/{len(to_test)}] Fetching specs: {cand_url}")
 
@@ -240,6 +252,10 @@ class AuditProductUseCase:
                             parsed = json.loads(cached_raw)
                             if isinstance(parsed, dict):
                                 external_markdown = parsed.get("markdown", cached_raw)
+                                cached_title = parsed.get("title")
+                                reference_title = (
+                                    str(cached_title).strip() if cached_title else None
+                                )
                                 ref_images_cnt = int(parsed.get("images_count", 0))
                             else:
                                 external_markdown = cached_raw
@@ -253,6 +269,7 @@ class AuditProductUseCase:
                     crawler_time_sec += (time.perf_counter() - t_crawl_start)
                     if crawl_res.success and crawl_res.markdown and len(crawl_res.markdown.strip()) > 0:
                         external_markdown = crawl_res.markdown
+                        reference_title = crawl_res.title.strip() or None
                         ref_images_cnt = getattr(crawl_res, "images_count", 0)
                         cache_payload = json.dumps(
                             {
@@ -307,6 +324,8 @@ class AuditProductUseCase:
                     search_trace.append(f"[{label_prefix} {cand_idx}] Rejected as non-matching ({result.details or result.status.value}), cascading to next candidate...")
                     continue
 
+                result.reference_title = reference_title
+                result.reference_sku = reference_sku_from_url(target_url)
                 search_trace.append(f"[{label_prefix} {cand_idx}] Accepted as authoritative reference ({result.status.value})")
                 return result
 

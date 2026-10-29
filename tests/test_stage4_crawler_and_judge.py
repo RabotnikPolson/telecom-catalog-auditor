@@ -10,13 +10,24 @@ from src.adapters.llm.openai_judge import LLMDiscrepancy, LLMJudgeOutput, LLMMis
 from src.domain.entities import AuditResult, AuditStatus, DiscrepancyItem, Product
 from src.domain.exceptions import DomainError
 from src.entrypoints.cli import _audit_is_current
-from src.use_cases.audit_product import AuditProductUseCase
+from src.use_cases.audit_product import AuditProductUseCase, reference_sku_from_url
 from src.use_cases.resolve_reference import ResolvedReference
 
 
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+def test_reference_sku_from_url_only_accepts_explicit_kaspi_product_id() -> None:
+    assert (
+        reference_sku_from_url(
+            "https://kaspi.kz/shop/p/tp-link-archer-ax10-chernyi-100589998/"
+        )
+        == "100589998"
+    )
+    assert reference_sku_from_url("https://www.al-style.kz/item/63450") is None
+    assert reference_sku_from_url("https://kaspi.kz/shop/p/no-product-id/") is None
 
 
 @pytest.fixture
@@ -805,6 +816,8 @@ class TestAuditProductUseCase:
 
         res1 = await use_case.audit_product(sample_product)
         assert res1.status == AuditStatus.VERIFIED
+        assert res1.reference_title == "Camelion UB-AA2200"
+        assert res1.reference_sku is None
         assert mock_crawler.crawl.call_count == 1
 
         cached_specs = temp_db.get_specs_cache("https://www.al-style.kz/item/63450")
@@ -819,9 +832,11 @@ class TestAuditProductUseCase:
         assert latest_audit is not None
         assert latest_audit.status == AuditStatus.VERIFIED
         assert latest_audit.confidence_score == 0.99
+        assert latest_audit.reference_title == "Camelion UB-AA2200"
 
         res2 = await use_case.audit_product(sample_product)
         assert res2.status == AuditStatus.VERIFIED
+        assert res2.reference_title == "Camelion UB-AA2200"
         assert mock_crawler.crawl.call_count == 1
 
     @pytest.mark.anyio

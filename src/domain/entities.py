@@ -63,6 +63,8 @@ class AuditResult(BaseModel):
     status: AuditStatus = Field(...)
     confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
     reference_url: str | None = Field(default=None)
+    reference_title: str | None = Field(default=None)
+    reference_sku: str | None = Field(default=None)
     discrepancies: list[DiscrepancyItem] = Field(default_factory=list)
     missing_specs: list[MissingSpecItem] = Field(default_factory=list)
     matched_specs_count: int = Field(default=0, ge=0)

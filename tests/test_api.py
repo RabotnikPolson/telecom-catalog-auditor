@@ -38,7 +38,9 @@ def api_db(tmp_path: Path) -> Path:
         product_id=product.product_id,
         status=AuditStatus.MISMATCH,
         confidence_score=0.95,
-        reference_url="https://kaspi.kz/shop/p/example",
+        reference_url="https://kaspi.kz/shop/p/samsung-galaxy-a54-110012345/",
+        reference_title="Samsung Galaxy A54 8/256GB",
+        reference_sku="110012345",
         discrepancies=[
             DiscrepancyItem(
                 spec_name="RAM",
@@ -188,6 +190,8 @@ def test_detail_has_stable_revision_and_finding_ids(client: TestClient) -> None:
     assert first_audit["description"]["discrepancies"][0]["finding_id"].startswith("sha256:")
     assert first.json()["product"]["vendor_sku"] == "SM-A546ELVD"
     assert first.json()["product"]["brand_name"] == "Samsung"
+    assert first_audit["reference_title"] == "Samsung Galaxy A54 8/256GB"
+    assert first_audit["reference_sku"] == "110012345"
     assert "shop_url" not in first.text
 
 

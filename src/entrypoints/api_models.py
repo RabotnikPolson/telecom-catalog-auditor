@@ -208,6 +208,8 @@ class AuditDetailResponse(ApiModel):
     attention_required: bool
     confidence_score: float = Field(ge=0.0, le=1.0)
     reference_url: str | None
+    reference_title: str | None
+    reference_sku: str | None
     audited_at: datetime
     specs: SpecsResponse
     photos: PhotosResponse
